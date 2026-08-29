@@ -31,6 +31,8 @@ pub const Error = error{
     TypeMismatch,
     /// The server reported an error; see `last_error`.
     QueryFailed,
+    /// A model hook aborted the operation.
+    HookAborted,
     OutOfMemory,
 
     // Mapped SQLSTATE classes:
@@ -84,15 +86,22 @@ pub const Config = struct {
 };
 
 /// A query parameter in its driver-level form. The ORM layer converts
-/// comptime-typed values into this union.
-pub const Param = union(enum) {
-    null_,
-    boolean: bool,
-    int: i64,
-    uint: u64,
-    float: f64,
-    text: []const u8,
-    bytea: []const u8,
+/// comptime-typed values into this struct, pre-encoding binary formats and
+/// declaring the parameter type OID through Parse so the server never has to
+/// infer (or mis-infer) it.
+pub const Param = struct {
+    /// PostgreSQL type OID declared in the Parse message.
+    oid: u32 = proto.Oid.text,
+    /// 0 = text format, 1 = binary format.
+    format: u16 = 0,
+    is_null: bool = false,
+    /// Encoded value: raw bytes for binary format, server-parseable text for
+    /// text format.
+    data: []const u8 = "",
+
+    pub fn nullParam(oid: u32) Param {
+        return .{ .oid = oid, .format = 1, .is_null = true };
+    }
 };
 
 pub const Result = struct {
@@ -149,7 +158,6 @@ pub const Conn = struct {
 
     wbuf: std.ArrayList(u8) = .empty,
     msg: std.ArrayList(u8) = .empty, // payload scratch of the message being read
-    bytea_scratch: std.ArrayList(u8) = .empty,
     err_arena_state: std.heap.ArenaAllocator,
     last_error: ?PgError = null,
     scram_state: scram.Client = .{},
@@ -567,6 +575,11 @@ pub const Conn = struct {
         try c.wbuf.appendNTimes(c.gpa, 0, 4);
         try c.writeCStr(sql);
         try c.frameEndAt(pos);
+        if (debug_traffic) {
+            std.debug.print(">> Q '{s}' hex:", .{sql});
+            for (c.wbuf.items) |b| std.debug.print(" {x:0>2}", .{b});
+            std.debug.print("\n", .{});
+        }
         try c.send();
         return c.collectResults();
     }
@@ -577,19 +590,22 @@ pub const Conn = struct {
         c.last_error = null;
         c.wbuf.clearRetainingCapacity();
 
-        // Parse (unnamed statement, server infers parameter types).
-        // Layout: statement-name \0 query \0 i16 param-type-count.
+        // Parse (unnamed statement) with explicit parameter type OIDs.
+        // Layout: statement-name \0 query \0 i16 count ++ i32 oid per param.
         var pos = try c.frameStart('P');
         try c.writeCStr(""); // statement name: unnamed
         try c.writeCStr(sql);
-        try c.writeU16(0);
+        try c.writeU16(@intCast(params.len));
+        for (params) |p| try c.writeU32(p.oid);
         try c.frameEndAt(pos);
 
-        // Bind
+        // Bind with per-parameter format codes (binary for scalars, text for
+        // complex types); results stay in text format.
         pos = try c.frameStart('B');
         try c.writeCStr(""); // portal
         try c.writeCStr(""); // statement
-        try c.writeU16(0); // parameter format codes: all text
+        try c.writeU16(@intCast(params.len));
+        for (params) |p| try c.writeU16(p.format);
         try c.writeU16(@intCast(params.len));
         for (params) |p| try c.writeParam(p);
         try c.writeU16(0); // result format codes: all text
@@ -620,31 +636,12 @@ pub const Conn = struct {
     }
 
     fn writeParam(c: *Conn, p: Param) Error!void {
-        var num_buf: [40]u8 = undefined;
-        const value: ?[]const u8 = switch (p) {
-            .null_ => null,
-            .boolean => |b| if (b) "t" else "f",
-            .int => |v| std.fmt.bufPrint(&num_buf, "{d}", .{v}) catch unreachable,
-            .uint => |v| std.fmt.bufPrint(&num_buf, "{d}", .{v}) catch unreachable,
-            .float => |v| formatFloat(&num_buf, v),
-            .text => |s| s,
-            .bytea => |b| blk: {
-                // Text-format bytea: "\x" ++ hex
-                const hex_len = 2 + b.len * 2;
-                try c.bytea_scratch.ensureTotalCapacity(c.gpa, hex_len);
-                c.bytea_scratch.items.len = hex_len;
-                c.bytea_scratch.items[0] = '\\';
-                c.bytea_scratch.items[1] = 'x';
-                hexInto(c.bytea_scratch.items[2..], b);
-                break :blk c.bytea_scratch.items;
-            },
-        };
-        const s = value orelse {
+        if (p.is_null) {
             try c.writeI32(-1);
             return;
-        };
-        try c.writeI32(@intCast(s.len));
-        try c.wbuf.appendSlice(c.gpa, s);
+        }
+        try c.writeI32(@intCast(p.data.len));
+        try c.wbuf.appendSlice(c.gpa, p.data);
     }
 
     fn collectResults(c: *Conn) Error!Result {
@@ -712,6 +709,11 @@ pub const Conn = struct {
                 },
                 proto.Tag.error_response => {
                     try c.storeError(m.data);
+                    if (debug_traffic) {
+                        if (c.last_error) |e| {
+                            std.debug.print("<< PG ERROR {s}: {s} | {s}\n", .{ e.code, e.message, e.detail });
+                        }
+                    }
                     got_error = true;
                 },
                 proto.Tag.notice_response => {
@@ -767,7 +769,6 @@ pub const Conn = struct {
         c.gpa.free(c.sock_wr.interface.buffer);
         c.stream.close(c.io);
         c.msg.deinit(c.gpa);
-        c.bytea_scratch.deinit(c.gpa);
         c.wbuf.deinit(c.gpa);
         c.err_arena_state.deinit();
         c.gpa.destroy(c);
@@ -778,13 +779,6 @@ pub const Conn = struct {
         return !c.broken and !c.closed and c.txn_status == .idle;
     }
 };
-
-fn formatFloat(buf: *[40]u8, v: f64) []const u8 {
-    if (std.math.isNan(v)) return "NaN";
-    if (std.math.isPositiveInf(v)) return "Infinity";
-    if (std.math.isNegativeInf(v)) return "-Infinity";
-    return std.fmt.bufPrint(buf, "{d}", .{v}) catch unreachable;
-}
 
 fn hex(bytes: []const u8) [64]u8 {
     // Returns a fixed buffer; callers only use the first 32 bytes for MD5.

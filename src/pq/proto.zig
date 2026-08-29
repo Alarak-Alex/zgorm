@@ -86,6 +86,14 @@ pub const Oid = struct {
     pub const numeric = 1700;
     pub const uuid = 2950;
     pub const jsonb = 3802;
+    // Array types (1-D).
+    pub const bool_array = 1000;
+    pub const int2_array = 1005;
+    pub const int4_array = 1007;
+    pub const text_array = 1009;
+    pub const int8_array = 1016;
+    pub const float4_array = 1021;
+    pub const float8_array = 1022;
     pub const daterange = 3912;
 };
 

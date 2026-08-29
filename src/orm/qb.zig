@@ -35,7 +35,10 @@ pub fn Query(comptime T: type) type {
 
         cols: ?[]const []const u8 = null,
         is_distinct: bool = false,
+        /// Comptime-verified association field names to preload.
+        preloads: std.ArrayList([]const u8) = .empty,
         conds: std.ArrayList(Cond) = .empty,
+        freed: bool = false,
         args: std.ArrayList(pq.Param) = .empty,
         orders: std.ArrayList([]const u8) = .empty,
         groups: std.ArrayList([]const u8) = .empty,
@@ -49,6 +52,8 @@ pub fn Query(comptime T: type) type {
         }
 
         pub fn deinit(q: *Self) void {
+            if (q.freed) return;
+            q.freed = true;
             const gpa = q.sess.gpa;
             const arena = q.arena;
             const sess = q.sess;
@@ -61,13 +66,9 @@ pub fn Query(comptime T: type) type {
             gpa.destroy(q);
         }
 
-        /// Frees the builder if no error is pending, and returns the pending
-        /// error otherwise. Terminal operations call this first.
+        /// Surfaces a pending builder error. The caller must `q.deinit()`.
         fn startTerminal(q: *Self) Error!void {
-            if (q.err) |e| {
-                q.deinit();
-                return e;
-            }
+            if (q.err) |e| return e;
         }
 
         // ------------------------------------------------------------ chain
@@ -86,6 +87,18 @@ pub fn Query(comptime T: type) type {
         /// numbered starting at $1 for this condition's own args.
         pub fn where(q: *Self, frag: []const u8, args: anytype) *Self {
             return q.addCond(frag, args, false);
+        }
+
+        /// Eager-loads a declared association (`has_many` fills the slice
+        /// field; `belongs_to` fills the optional field). The name is checked
+        /// at compile time against the model's `zorm` declaration.
+        pub fn preload(q: *Self, comptime name: []const u8) *Self {
+            if (comptime table.assoc(name) == null) {
+                @compileError("zorm: preload('" ++ name ++ "') is not a declared association of " ++ @typeName(T) ++
+                    " (declare it via `pub const zorm = .{ .has_many = ... }` or `.belongs_to = ...`)");
+            }
+            q.preloads.append(q.a(), name) catch return q.errOut();
+            return q;
         }
 
         /// Adds a condition combined with OR with everything before it.
@@ -265,11 +278,12 @@ pub fn Query(comptime T: type) type {
 
         /// Executes the query and returns all matching rows.
         pub fn all(q: *Self, out_gpa: std.mem.Allocator) Error![]T {
-            try q.startTerminal();
-            const sql = q.buildSelectSql(false) catch {
+            q.startTerminal() catch |e| {
                 q.deinit();
-                return error.OutOfMemory;
+                return e;
             };
+            errdefer q.deinit();
+            const sql = q.buildSelectSql(false) catch return error.OutOfMemory;
             var res = try q.run(sql);
             defer res.deinit();
 
@@ -285,67 +299,275 @@ pub fn Query(comptime T: type) type {
                 value.freeSlice(T, rows[0..0], out_gpa);
                 return error.TypeMismatch;
             }
+            try q.applyPreloads(rows, out_gpa);
+            q.deinit();
             return rows;
         }
 
         /// Executes the query and returns the first row, if any.
         pub fn first(q: *Self) Error!?T {
-            try q.startTerminal();
-            if (q.limit_n == null) q.limit_n = 1;
-            const sql = q.buildSelectSql(false) catch {
+            q.startTerminal() catch |e| {
                 q.deinit();
-                return error.OutOfMemory;
+                return e;
             };
+            errdefer q.deinit();
+            if (q.limit_n == null) q.limit_n = 1;
+            const sql = q.buildSelectSql(false) catch return error.OutOfMemory;
             var res = try q.run(sql);
             defer res.deinit();
-            if (res.rows.len == 0) return null;
-            return try value.scanRow(T, table, &res, res.rows[0], q.sess.gpa);
+            if (res.rows.len == 0) {
+                q.deinit();
+                return null;
+            }
+            var one = [1]T{try value.scanRow(T, table, &res, res.rows[0], q.sess.gpa)};
+            try q.applyPreloads(&one, q.sess.gpa);
+            q.deinit();
+            return one[0];
         }
 
         /// `SELECT count(*)` with the configured conditions.
         pub fn count(q: *Self) Error!i64 {
-            try q.startTerminal();
-            const sql = q.buildSelectSql(true) catch {
+            q.startTerminal() catch |e| {
                 q.deinit();
-                return error.OutOfMemory;
+                return e;
             };
+            errdefer q.deinit();
+            const sql = q.buildSelectSql(true) catch return error.OutOfMemory;
             var res = try q.run(sql);
             defer res.deinit();
-            if (res.rows.len == 0 or res.rows[0][0] == null) return 0;
-            return std.fmt.parseInt(i64, res.rows[0][0].?, 10) catch 0;
+            const out: i64 = if (res.rows.len == 0 or res.rows[0][0] == null)
+                0
+            else
+                std.fmt.parseInt(i64, res.rows[0][0].?, 10) catch 0;
+            q.deinit();
+            return out;
         }
 
         /// True when at least one row matches.
         pub fn exists(q: *Self) Error!bool {
-            try q.startTerminal();
-            q.limit_n = 1;
-            const sql = q.buildSelectSql(false) catch {
+            q.startTerminal() catch |e| {
                 q.deinit();
-                return error.OutOfMemory;
+                return e;
             };
+            errdefer q.deinit();
+            q.limit_n = 1;
+            const sql = q.buildSelectSql(false) catch return error.OutOfMemory;
             var res = try q.run(sql);
             defer res.deinit();
-            return res.rows.len > 0;
+            const out = res.rows.len > 0;
+            q.deinit();
+            return out;
+        }
+
+        /// Fills preloaded association fields for the decoded rows.
+        fn applyPreloads(q: *Self, rows: []T, gpa: std.mem.Allocator) Error!void {
+            if (q.preloads.items.len == 0 or rows.len == 0) return;
+            inline for (table.assocs) |assoc| {
+                var requested = false;
+                for (q.preloads.items) |n| {
+                    if (std.mem.eql(u8, n, assoc.field_name)) requested = true;
+                }
+                if (requested) try q.preloadAssoc(rows, gpa, assoc);
+            }
+        }
+
+        fn asI64(comptime FT: type, v: FT) ?i64 {
+            return switch (@typeInfo(FT)) {
+                .int => @intCast(v),
+                .optional => |oi| if (v) |x| asI64(oi.child, x) else null,
+                else => null,
+            };
+        }
+
+        /// Reads the integer(-ish) key out of `field` of the model.
+        fn asIFieldOf(comptime M: type, comptime name: []const u8, field_value: FieldOfT(M, name)) ?i64 {
+            return asI64(FieldOfT(M, name), field_value);
+        }
+
+        fn preloadAssoc(q: *Self, rows: []T, gpa: std.mem.Allocator, comptime assoc: schema.Assoc) Error!void {
+            const Child = assoc.model;
+            const child_table = comptime schema.tableOf(Child);
+
+            switch (assoc.kind) {
+                .has_many => {
+                    const pkc = comptime table.pk() orelse
+                        @compileError("zorm: has_many requires the parent model to declare a primary key");
+                    // Collect parent keys.
+                    var ids: std.ArrayList(i64) = .empty;
+                    defer ids.deinit(gpa);
+                    for (rows) |*r| {
+                        if (asIFieldOf(T, pkc.field_name, @field(r, pkc.field_name))) |id| {
+                            ids.append(gpa, id) catch return error.OutOfMemory;
+                        }
+                    }
+                    if (ids.items.len == 0) return;
+
+                    // Children are decoded into a scratch arena and deep
+                    // copied into `gpa`; the originals die with the arena.
+                    var arena_state = std.heap.ArenaAllocator.init(gpa);
+                    defer arena_state.deinit();
+                    const arena = arena_state.allocator();
+
+                    var children = try q.queryChildren(Child, child_table, assoc.foreign_key, ids.items, arena);
+                    defer children.deinit(arena);
+
+                    // Bucket children by foreign key into per-parent slices.
+                    var counts = gpa.alloc(usize, rows.len) catch return error.OutOfMemory;
+                    defer gpa.free(counts);
+                    @memset(counts, 0);
+
+                    var owners = gpa.alloc(usize, children.items.len) catch return error.OutOfMemory;
+                    defer gpa.free(owners);
+
+                    for (children.items, 0..) |*c, ci| {
+                        const fk = asIFieldOf(Child, assoc.foreign_key, @field(c, assoc.foreign_key));
+                        var owner: ?usize = null;
+                        if (fk) |k| {
+                            for (ids.items, 0..) |id, pi| {
+                                if (id == k) {
+                                    owner = pi;
+                                    break;
+                                }
+                            }
+                        }
+                        owners[ci] = owner orelse std.math.maxInt(usize);
+                        if (owner) |pi| counts[pi] += 1;
+                    }
+                    // Per-parent slices are allocated independently so the
+                    // result owns a freeable slice per row.
+                    const ChildSliceT = @TypeOf(@field(@as(T, undefined), assoc.field_name));
+                    const slices = gpa.alloc(ChildSliceT, rows.len) catch return error.OutOfMemory;
+                    defer gpa.free(slices);
+                    var fill = gpa.alloc(usize, rows.len) catch return error.OutOfMemory;
+                    defer gpa.free(fill);
+                    for (rows, 0..) |_, pi| {
+                        slices[pi] = gpa.alloc(Child, counts[pi]) catch return error.OutOfMemory;
+                        fill[pi] = 0;
+                    }
+
+                    for (children.items, 0..) |*c, ci| {
+                        if (owners[ci] != std.math.maxInt(usize)) {
+                            const pi = owners[ci];
+                            slices[pi][fill[pi]] = try value.deepCopy(Child, c.*, gpa);
+                            fill[pi] += 1;
+                        }
+                    }
+                    for (rows, 0..) |*r, pi| {
+                        @field(r, assoc.field_name) = slices[pi];
+                    }
+                },
+                .belongs_to => {
+                    // Collect foreign keys from the rows.
+                    var ids: std.ArrayList(i64) = .empty;
+                    defer ids.deinit(gpa);
+                    for (rows) |*r| {
+                        if (asIFieldOf(T, assoc.foreign_key, @field(r, assoc.foreign_key))) |id| {
+                            ids.append(gpa, id) catch return error.OutOfMemory;
+                        }
+                    }
+                    if (ids.items.len == 0) return;
+
+                    var arena_state = std.heap.ArenaAllocator.init(gpa);
+                    defer arena_state.deinit();
+                    const arena = arena_state.allocator();
+
+                    var children = try q.queryChildren(Child, child_table, assoc.primary_key, ids.items, arena);
+                    defer children.deinit(arena);
+
+                    for (rows) |*r| {
+                        const fk = asIFieldOf(T, assoc.foreign_key, @field(r, assoc.foreign_key));
+                        if (fk == null) continue;
+                        @field(r, assoc.field_name) = null;
+                        for (children.items) |*c| {
+                            const pk = asIFieldOf(Child, assoc.primary_key, @field(c, assoc.primary_key));
+                            if (pk != null and pk.? == fk.?) {
+                                // Deep copy: several rows may reference the
+                                // same child, so each gets its own strings.
+                                @field(r, assoc.field_name) = try value.deepCopy(Child, c.*, gpa);
+                                break;
+                            }
+                        }
+                    }
+                },
+            }
+        }
+
+        /// Runs `SELECT * FROM child WHERE key_col IN (...)` and decodes rows.
+        fn queryChildren(
+            q: *Self,
+            comptime Child: type,
+            comptime child_table: schema.Table,
+            key_column: []const u8,
+            ids: []const i64,
+            gpa: std.mem.Allocator,
+        ) Error!std.ArrayList(Child) {
+            const s = q.sess;
+            var arena_state = std.heap.ArenaAllocator.init(s.gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            var aw: std.Io.Writer.Allocating = .init(arena);
+            const w = &aw.writer;
+            w.print("SELECT * FROM {s} WHERE {s} IN (", .{
+                try quoteIdent(arena, child_table.name),
+                try quoteIdent(arena, key_column),
+            }) catch return error.OutOfMemory;
+            for (ids, 0..) |_, i| {
+                if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
+                w.print("${d}", .{i + 1}) catch return error.OutOfMemory;
+            }
+            w.writeByte(')') catch return error.OutOfMemory;
+
+            const params = arena.alloc(pq.Param, ids.len) catch return error.OutOfMemory;
+            for (ids, 0..) |id, i| {
+                params[i] = try value.toParam(id, arena);
+            }
+
+            const conn = try s.acquire();
+            var res = conn.execParams(aw.writer.buffered(), params) catch |e| {
+                s.captureError(conn);
+                s.releaseConn(conn);
+                return e;
+            };
+            s.releaseConn(conn);
+            defer res.deinit();
+
+            var items: std.ArrayList(Child) = .empty;
+            for (res.rows) |row| {
+                var child = try value.scanRow(Child, child_table, &res, row, gpa);
+                db_mod.Session.callHook(Child, "afterFind", &child, s) catch {};
+                items.append(gpa, child) catch return error.OutOfMemory;
+            }
+            return items;
         }
 
         /// `DELETE FROM table WHERE ...`, returns affected rows.
         pub fn delete(q: *Self) Error!i64 {
-            try q.startTerminal();
+            q.startTerminal() catch |e| {
+                q.deinit();
+                return e;
+            };
+            errdefer q.deinit();
             var aw: std.Io.Writer.Allocating = .init(q.a());
             const w = &aw.writer;
-            w.print("DELETE FROM {s}", .{try quoteIdent(q.a(), table.name)}) catch {
-                q.deinit();
+            w.print("DELETE FROM {s}", .{try quoteIdent(q.a(), table.name)}) catch
                 return error.OutOfMemory;
-            };
-            q.buildWhere(w) catch {
-                q.deinit();
-                return error.OutOfMemory;
-            };
+            q.buildWhere(w) catch return error.OutOfMemory;
             var res = try q.run(aw.writer.buffered());
             defer res.deinit();
-            return res.affected;
+            const affected = res.affected;
+            q.deinit();
+            return affected;
         }
     };
+}
+
+/// Resolves the struct field type `name` on model `M`.
+pub fn FieldOfT(comptime M: type, comptime name: []const u8) type {
+    inline for (@typeInfo(M).@"struct".fields) |f| {
+        if (comptime std.mem.eql(u8, f.name, name)) return f.type;
+    }
+    @compileError("zorm: model " ++ @typeName(M) ++ " has no field " ++ name);
 }
 
 /// Quotes an SQL identifier, escaping embedded double quotes.

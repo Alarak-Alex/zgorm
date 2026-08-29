@@ -38,6 +38,16 @@ pub const FieldKind = enum {
     text,
     time,
     enum_,
+    /// 1-D PostgreSQL arrays, decoded from the array-literal text format.
+    int_array,
+    uint_array,
+    float_array,
+    bool_array,
+    text_array,
+    /// `zorm.Json` wrapper <-> `jsonb` column.
+    jsonb,
+    /// `zorm.Bytes` wrapper <-> `bytea` column.
+    bytes,
 };
 
 pub const Column = struct {
@@ -53,10 +63,27 @@ pub const Column = struct {
     is_auto: bool = false,
 };
 
+/// One declared association (`belongs_to` or `has_many`).
+pub const Assoc = struct {
+    pub const Kind = enum { has_many, belongs_to };
+
+    field_name: []const u8, // Zig field on this model
+    model: type, // the associated model
+    /// Column holding the foreign key:
+    ///   has_many   -> column on the *associated* model pointing at this pk
+    ///   belongs_to -> column on *this* model pointing at the associated pk
+    foreign_key: []const u8,
+    /// Field of the associated model used as the key (default `id`).
+    primary_key: []const u8 = "id",
+    kind: Kind,
+};
+
 pub const Table = struct {
     model: type,
     name: []const u8,
     columns: []const Column,
+    /// Declared associations, excluded from `columns`.
+    assocs: []const Assoc = &.{},
     pk_index: ?usize = null,
     created_at_index: ?usize = null,
     updated_at_index: ?usize = null,
@@ -75,6 +102,13 @@ pub const Table = struct {
             if (std.mem.eql(u8, c.name, name)) return true;
         }
         return false;
+    }
+
+    pub fn assoc(t: *const Table, comptime field_name: []const u8) ?Assoc {
+        inline for (t.assocs) |a| {
+            if (comptime std.mem.eql(u8, a.field_name, field_name)) return a;
+        }
+        return null;
     }
 };
 
@@ -97,6 +131,13 @@ fn ddlType(comptime kind: FieldKind, comptime T: type) []const u8 {
         .text => "text",
         .time => "timestamptz",
         .enum_ => "text",
+        .int_array => "bigint[]",
+        .uint_array => "bigint[]",
+        .float_array => "double precision[]",
+        .bool_array => "boolean[]",
+        .text_array => "text[]",
+        .jsonb => "jsonb",
+        .bytes => "bytea",
     };
 }
 
@@ -106,18 +147,35 @@ fn kindOf(comptime T: type) FieldKind {
         .float => FieldKind.float,
         .bool => FieldKind.boolean,
         .pointer => |ptr| blk: {
-            if (ptr.size == .slice and ptr.child == u8) break :blk FieldKind.text;
+            if (ptr.size == .slice) {
+                if (ptr.child == u8) break :blk FieldKind.text;
+                switch (@typeInfo(ptr.child)) {
+                    .int => |ci| break :blk if (ci.signedness == .signed)
+                        FieldKind.int_array
+                    else
+                        FieldKind.uint_array,
+                    .float => break :blk FieldKind.float_array,
+                    .bool => break :blk FieldKind.bool_array,
+                    .pointer => |inner| {
+                        if (inner.size == .slice and inner.child == u8) break :blk FieldKind.text_array;
+                        @compileError("zorm: unsupported array element type " ++ @typeName(ptr.child));
+                    },
+                    else => @compileError("zorm: unsupported array element type " ++ @typeName(ptr.child)),
+                }
+            }
             @compileError("zorm: unsupported field type " ++ @typeName(T) ++
                 " (only []const u8 / []u8 slices are supported for strings)");
         },
         .@"enum" => FieldKind.enum_,
         .@"struct" => blk: {
             if (@hasDecl(T, "__zorm_time")) break :blk FieldKind.time;
+            if (@hasDecl(T, "__zorm_json")) break :blk FieldKind.jsonb;
+            if (@hasDecl(T, "__zorm_bytes")) break :blk FieldKind.bytes;
             @compileError("zorm: unsupported struct field type " ++ @typeName(T) ++
-                " (zorm.Time is the only supported struct column type)");
+                " (zorm.Time / zorm.Json / zorm.Bytes are the supported struct column types)");
         },
         else => @compileError("zorm: unsupported field type " ++ @typeName(T) ++
-            " (supported: integers, floats, bool, []const u8, zorm.Time, enums, and optionals of those)"),
+            " (supported: integers, floats, bool, []const u8, arrays, zorm.Time/Json/Bytes, enums, and optionals of those)"),
     };
 }
 
@@ -143,6 +201,7 @@ pub fn tableOf(comptime T: type) Table {
     else if (@hasField(T, "id")) "id" else null;
 
     comptime var columns: []const Column = &.{};
+    comptime var assocs: []const Assoc = &.{};
     comptime var pk_index: ?usize = null;
     comptime var created_at_index: ?usize = null;
     comptime var updated_at_index: ?usize = null;
@@ -151,6 +210,40 @@ pub fn tableOf(comptime T: type) Table {
 
     inline for (info.fields) |field| {
         const fname = field.name;
+
+        // Association fields are handled by preload, not as columns.
+        comptime var is_assoc = false;
+        if (@hasField(@TypeOf(opts), "belongs_to")) {
+            inline for (@typeInfo(@TypeOf(opts.belongs_to)).@"struct".fields) |af| {
+                if (comptime std.mem.eql(u8, af.name, fname)) {
+                    const cfg = @field(opts.belongs_to, af.name);
+                    assocs = assocs ++ &[_]Assoc{.{
+                        .field_name = fname,
+                        .model = cfg.model,
+                        .foreign_key = cfg.foreign_key,
+                        .primary_key = if (@hasField(@TypeOf(cfg), "primary_key")) cfg.primary_key else "id",
+                        .kind = .belongs_to,
+                    }};
+                    is_assoc = true;
+                }
+            }
+        }
+        if (!is_assoc and @hasField(@TypeOf(opts), "has_many")) {
+            inline for (@typeInfo(@TypeOf(opts.has_many)).@"struct".fields) |af| {
+                if (comptime std.mem.eql(u8, af.name, fname)) {
+                    const cfg = @field(opts.has_many, af.name);
+                    assocs = assocs ++ &[_]Assoc{.{
+                        .field_name = fname,
+                        .model = cfg.model,
+                        .foreign_key = cfg.foreign_key,
+                        .primary_key = if (@hasField(@TypeOf(cfg), "primary_key")) cfg.primary_key else "id",
+                        .kind = .has_many,
+                    }};
+                    is_assoc = true;
+                }
+            }
+        }
+        if (is_assoc) continue;
 
         // Skip fields listed in `.ignore`.
         if (@hasField(@TypeOf(opts), "ignore")) {
@@ -212,6 +305,7 @@ pub fn tableOf(comptime T: type) Table {
         .model = T,
         .name = table_name,
         .columns = columns,
+        .assocs = assocs,
         .pk_index = pk_index,
         .created_at_index = created_at_index,
         .updated_at_index = updated_at_index,
@@ -257,6 +351,77 @@ test "table reflection with conventions" {
     try testing.expectEqualStrings("double precision", t.columns[3].ddl_type);
     try testing.expectEqualStrings("boolean", t.columns[4].ddl_type);
     try testing.expect(t.created_at_index == null);
+}
+
+const PostModel = struct {
+    id: ?i64 = null,
+    author_id: ?i64 = null,
+    title: []const u8 = "",
+};
+
+const Author = struct {
+    id: ?i64 = null,
+    name: []const u8 = "",
+    posts: []PostModel = &.{},
+
+    pub const zorm = .{
+        .has_many = .{ .posts = .{ .model = PostModel, .foreign_key = "author_id" } },
+    };
+};
+
+const Post2 = struct {
+    id: ?i64 = null,
+    author_id: ?i64 = null,
+    title: []const u8 = "",
+    author: ?Author = null,
+    tags: []const []const u8 = &.{},
+    meta: ?Json = null,
+
+    pub const Json = struct {
+        data: []const u8,
+        pub const __zorm_json = true;
+    };
+
+    pub const zorm = .{
+        .table = "posts",
+        .belongs_to = .{ .author = .{ .model = Author, .foreign_key = "author_id" } },
+    };
+};
+
+test "associations are excluded from columns and registered" {
+    const at = comptime tableOf(Author);
+    try testing.expectEqual(@as(usize, 2), at.columns.len); // id, name only
+    try testing.expectEqual(@as(usize, 1), at.assocs.len);
+    try testing.expectEqual(Assoc.Kind.has_many, at.assocs[0].kind);
+    try testing.expectEqualStrings("posts", at.assocs[0].field_name);
+    try testing.expectEqualStrings("author_id", at.assocs[0].foreign_key);
+    try testing.expect(at.assoc("posts") != null);
+    try testing.expect(at.assoc("name") == null);
+
+    const pt = comptime tableOf(Post2);
+    // id, author_id, title, tags (text[]), meta (jsonb)
+    try testing.expectEqual(@as(usize, 5), pt.columns.len);
+    try testing.expectEqualStrings("author", pt.assocs[0].field_name);
+    try testing.expectEqual(Assoc.Kind.belongs_to, pt.assocs[0].kind);
+    try testing.expectEqual(Author, pt.assocs[0].model);
+    try testing.expectEqualStrings("text[]", pt.columns[3].ddl_type);
+    try testing.expectEqualStrings("jsonb", pt.columns[4].ddl_type);
+}
+
+test "array and jsonb column kinds" {
+    const pt = comptime tableOf(Post2);
+    try testing.expectEqualStrings("text[]", pt.columns[3].ddl_type);
+    const WithArrays = struct {
+        id: ?i64 = null,
+        scores: []const i64 = &.{},
+        weights: ?[]const f64 = null,
+        flags: []const bool = &.{},
+    };
+    const wt = comptime tableOf(WithArrays);
+    try testing.expectEqual(@as(usize, 4), wt.columns.len);
+    try testing.expectEqualStrings("bigint[]", wt.columns[1].ddl_type);
+    try testing.expectEqualStrings("double precision[]", wt.columns[2].ddl_type);
+    try testing.expectEqualStrings("boolean[]", wt.columns[3].ddl_type);
 }
 
 test "table reflection with options" {

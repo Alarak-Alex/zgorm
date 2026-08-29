@@ -17,9 +17,27 @@ pub const User = struct {
     created_at: ?z.Time = null,
     updated_at: ?z.Time = null,
 
+    posts: []Post = &.{}, // has_many (filled by preload)
+
     pub const zorm = .{
         .unique = .{"email"},
         .indexes = .{"age"},
+        .has_many = .{ .posts = .{ .model = Post, .foreign_key = "author_id" } },
+    };
+};
+
+pub const Post = struct {
+    id: ?i64 = null,
+    author_id: ?i64 = null,
+    title: []const u8 = "",
+    tags: []const []const u8 = &.{}, // text[]
+    scores: []const i64 = &.{}, // bigint[]
+    meta: ?z.Json = null, // jsonb
+    attachment: ?z.Bytes = null, // bytea
+    author: ?User = null, // belongs_to (filled by preload)
+
+    pub const zorm = .{
+        .belongs_to = .{ .author = .{ .model = User, .foreign_key = "author_id" } },
     };
 };
 
@@ -34,7 +52,9 @@ pub fn main(init: std.process.Init) !void {
 
     var dropped = try db.execRaw("DROP TABLE IF EXISTS \"user\" CASCADE");
     dropped.deinit();
-    try db.autoMigrate(User);
+    var dropped2 = try db.execRaw("DROP TABLE IF EXISTS \"post\" CASCADE");
+    dropped2.deinit();
+    try db.autoMigrateAll(.{ User, Post });
 
     var u = User{ .name = "Alice", .email = "alice@example.com", .age = 30, .balance = 12.5 };
     try db.insert(&u);
@@ -98,6 +118,32 @@ pub fn main(init: std.process.Init) !void {
     if (one) |*b| {
         _ = try db.delete(b);
         std.debug.print("deleted Bob\n", .{});
+    }
+
+    var rich = Post{
+        .author_id = u.id,
+        .title = "rich post",
+        .tags = &.{ "zig", "orm" },
+        .scores = &.{ 5, 4, 5 },
+        .meta = z.Json{ .data = "{\"views\": 42}" },
+        .attachment = z.Bytes{ .data = "bin" },
+    };
+    try db.insert(&rich);
+
+    // Associations + preloading (posts rendered with arrays/jsonb columns).
+    const with_posts = try z.query(User, db).preload("posts").all(gpa);
+    defer z.freeSlice(User, with_posts, gpa);
+    for (with_posts) |usr| {
+        std.debug.print("{s} has {d} post(s)\n", .{ usr.name, usr.posts.len });
+        for (usr.posts) |p| {
+            std.debug.print("  - {s} tags={d} meta={s}\n", .{ p.title, p.tags.len, p.meta.?.data });
+        }
+    }
+
+    const preloaded = try z.query(Post, db).preload("author").whereEq("title", "rich post").first();
+    if (preloaded) |p| {
+        std.debug.print("preloaded post author: {s}\n", .{p.author.?.name});
+        z.free(Post, p, gpa);
     }
 
     const total = try z.query(User, db).count();

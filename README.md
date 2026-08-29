@@ -5,11 +5,17 @@
 ## 特性
 
 - **纯 Zig PostgreSQL 驱动**：协议 3.0，支持 `SCRAM-SHA-256`、`MD5`、明文认证；简单查询与扩展查询（Parse/Bind/Describe/Execute，参数化防注入）
+- **二进制格式参数**：标量（整数/浮点/布尔/时间）以二进制格式发送并显式声明类型 OID，`bytea` 原样收发，性能与精度更佳
+- **数组与 JSON 列**：`[]const i64`、`[]const f64`、`[]const bool`、`[]const []const u8`（text[]）与 `z.Json`（jsonb）、`z.Bytes`（bytea）
 - **comptime 模型反射**：普通 Zig 结构体即模型，无宏、无代码生成、运行时零注册
 - **约定优于配置**：驼峰转 snake_case、`id` 默认主键、`created_at`/`updated_at` 自动时间戳
 - **GORM 风格查询构建器**：`where` / `orWhere` / `whereEq` / `whereIn` / `order_by` / `limit` / `offset` / `group_by` / `having` / `for_update`，占位符 `$1,$2...` 跨条件自动重编号
 - **CRUD + 事务 + 连接池**：`insert`（自动回填自增主键）、`insertBatch`（自动分块、最多 65535 参数）、`update`、`save`、`delete`、`deleteWhere`、`updateWhere`、`find`、事务 `commit/rollback`
 - **autoMigrate**：建表、补列、创建索引（唯一/普通）
+- **关联与预加载**：`has_many` / `belongs_to` 声明 + `query.preload("posts")` 批量装配，避免 N+1
+- **模型 hook**：`beforeSave` / `beforeCreate` / `afterCreate` / `beforeUpdate` / `afterUpdate` / `beforeDelete` / `afterDelete` / `afterFind`
+- **Savepoint / 嵌套事务**：`tx.begin()` 创建 savepoint，`commit()` 释放、`rollback()` 回滚到保存点
+- **迁移版本管理**：`Migrator` 基于 `schema_migrations` 表按版本应用/回滚 SQL 迁移
 - **类型映射**：整数/浮点/`bool`/`[]const u8`(text)/`[]u8`/枚举(按名存储)/`zorm.Time`(timestamptz, 微秒精度) 及其可选版本
 - **错误携带上下文**：服务器错误映射为类型化错误（`UniqueViolation`、`ForeignKeyViolation`、`SerializationFailure`…），并可通过 `session.last_error` 读取 SQLSTATE、消息、约束名等明细
 
@@ -145,6 +151,74 @@ host=/var/run/postgresql user=pg dbname=app          # unix socket 目录
 参数：`host`、`port`、`user`、`password`、`dbname`/`database`、`sslmode`、`application_name`。
 `sslmode`：`disable`（默认）| `require`（加密、不校验证书）| `verify_ca` | `verify_full`（校验自签名/主机名）。
 
+### 关联与预加载
+
+```zig
+pub const Author = struct {
+    id: ?i64 = null,
+    name: []const u8 = "",
+    posts: []Post = &.{},                       // has_many 字段
+    pub const zorm = .{
+        .has_many = .{ .posts = .{ .model = Post, .foreign_key = "author_id" } },
+    };
+};
+
+pub const Post = struct {
+    id: ?i64 = null,
+    author_id: ?i64 = null,                     // belongs_to 外键
+    title: []const u8 = "",
+    author: ?Author = null,                     // belongs_to 字段
+    tags: []const []const u8 = &.{},            // text[]
+    meta: ?z.Json = null,                       // jsonb
+    pub const zorm = .{
+        .belongs_to = .{ .author = .{ .model = Author, .foreign_key = "author_id" } },
+    };
+};
+
+const authors = try z.query(Author, db).preload("posts").all(gpa);   // 批量装配，无 N+1
+const posts   = try z.query(Post, db).preload("author").all(gpa);
+```
+
+### 模型 hook
+
+```zig
+pub const User = struct {
+    // ...
+    pub fn beforeCreate(self: *User, s: *z.Session) z.Error!void {
+        self.name = std.fmt.allocPrint(...); // 修改字段
+    }
+    pub fn afterFind(self: *User, s: *z.Session) z.Error!void { ... }
+};
+```
+可用 hook：`beforeSave`、`beforeCreate`、`afterCreate`、`beforeUpdate`、`afterUpdate`、`beforeDelete`、`afterDelete`、`afterFind`（在模型上声明即可，可选实现；返回 `z.Error!void`，可用 `error.HookAborted` 中止操作）。
+
+### 嵌套事务（Savepoint）
+
+```zig
+var tx = try db.begin();
+defer tx.rollback();
+
+var sp = try tx.begin();     // SAVEPOINT zorm_sp_1
+var u2 = User{ .name = "maybe" };
+try sp.insert(&u2);
+try sp.rollback();           // 仅撤销 savepoint 内的操作；commit() 则 RELEASE
+try tx.commit();
+```
+
+### 迁移版本管理
+
+```zig
+var m = z.Migrator.init(db);
+defer m.deinit();
+m.add(&.{
+    .{ .version = 1, .name = "create_users", .up = "CREATE TABLE users (...)", .down = "DROP TABLE users" },
+    .{ .version = 2, .name = "add_email",    .up = "ALTER TABLE users ADD COLUMN email text" },
+});
+_ = try m.applyAll();        // 按版本升序应用待执行迁移，每个迁移一个事务
+try m.rollbackLast();        // 用 down 脚本回滚最近一个版本
+```
+记录表 `schema_migrations (version bigint PK, name text, applied_at timestamptz)`。
+
 ## 错误处理
 
 ```zig
@@ -183,11 +257,14 @@ zig build -Doptimize=ReleaseFast              # 发布构建
 
 ## 路线图
 
-- [ ] 二进制格式 + 数组/JSONB 列类型
-- [ ] 关联（belongs_to/has_many）与预加载
-- [ ] 模型 hook（BeforeSave 等）
-- [ ] Savepoint / 嵌套事务
-- [ ] 迁移版本管理（schema_migrations）
+- [x] 二进制格式 + 数组/JSONB 列类型（v0.2.0）
+- [x] 关联（belongs_to/has_many）与预加载（v0.2.0）
+- [x] 模型 hook（BeforeSave 等）（v0.2.0）
+- [x] Savepoint / 嵌套事务（v0.2.0）
+- [x] 迁移版本管理（schema_migrations）（v0.2.0）
+- [ ] 结果集二进制格式解码
+- [ ] 多维数组 / 数组元素的 NULL 完整支持
+- [ ] 嵌套预加载（preload 的 preload）
 - [ ] MySQL/SQLite 驱动
 
 ## License

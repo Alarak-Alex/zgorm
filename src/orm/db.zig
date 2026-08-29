@@ -42,10 +42,19 @@ pub const Session = struct {
     io: std.Io,
     /// Non-null while inside a transaction.
     pinned: ?*pq.Conn = null,
+    savepoint_depth: usize = 0,
     logger: ?*const fn (sql: []const u8, params: []const pq.Param) void = null,
 
     pub fn acquire(s: *Session) Error!*pq.Conn {
         return s.pinned orelse s.pool.acquire();
+    }
+
+    /// Invokes an optional model hook (`pub fn <name>(self: *T, s: *Session)
+    /// z.Error!void`) when the model declares one.
+    pub fn callHook(comptime T: type, comptime name: []const u8, m: *T, s: *Session) Error!void {
+        if (@hasDecl(T, name)) {
+            return @field(T, name)(m, s);
+        }
     }
 
     pub fn releaseConn(s: *Session, c: *pq.Conn) void {
@@ -105,6 +114,8 @@ pub const Session = struct {
         const T = MP.pointer.child;
         const table = comptime schema.tableOf(T);
 
+        try callHook(T, "beforeSave", m, s);
+        try callHook(T, "beforeCreate", m, s);
         try s.autoStamp(T, m, true);
 
         var arena_state = std.heap.ArenaAllocator.init(s.gpa);
@@ -160,6 +171,9 @@ pub const Session = struct {
                 s.gpa,
             );
         }
+
+        try callHook(T, "afterCreate", m, s);
+        try callHook(T, "afterSave", m, s);
     }
 
     /// Inserts many models in chunked multi-row statements.
@@ -204,7 +218,11 @@ pub const Session = struct {
 
     fn insertChunk(s: *Session, comptime T: type, models: []T, returning: bool) Error!void {
         const table = comptime schema.tableOf(T);
-        for (models) |*m| try s.autoStamp(T, m, true);
+        for (models) |*m| {
+            try callHook(T, "beforeSave", m, s);
+            try callHook(T, "beforeCreate", m, s);
+            try s.autoStamp(T, m, true);
+        }
 
         var arena_state = std.heap.ArenaAllocator.init(s.gpa);
         defer arena_state.deinit();
@@ -262,6 +280,11 @@ pub const Session = struct {
                 );
             }
         }
+
+        for (models) |*m| {
+            try callHook(T, "afterCreate", m, s);
+            try callHook(T, "afterSave", m, s);
+        }
     }
 
     /// Updates every column of the model (except the primary key) by primary
@@ -276,6 +299,8 @@ pub const Session = struct {
         const pkc = table.columns[table.pk_index.?];
         if (isZeroPk(T, m, pkc.field_name)) return error.NullValue;
 
+        try callHook(T, "beforeSave", m, s);
+        try callHook(T, "beforeUpdate", m, s);
         try s.autoStamp(T, m, false);
 
         var arena_state = std.heap.ArenaAllocator.init(s.gpa);
@@ -303,7 +328,11 @@ pub const Session = struct {
 
         var res = try s.runExec(b.slice(), params.items);
         defer res.deinit();
-        return res.affected;
+        const affected = res.affected;
+
+        try callHook(T, "afterUpdate", m, s);
+        try callHook(T, "afterSave", m, s);
+        return affected;
     }
 
     /// Insert when the primary key is empty, update otherwise.
@@ -333,6 +362,8 @@ pub const Session = struct {
         const pkc = table.columns[table.pk_index.?];
         if (isZeroPk(T, m, pkc.field_name)) return error.NullValue;
 
+        try callHook(T, "beforeDelete", m, s);
+
         var arena_state = std.heap.ArenaAllocator.init(s.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -347,7 +378,10 @@ pub const Session = struct {
 
         var res = try s.runExec(b.slice(), params);
         defer res.deinit();
-        return res.affected;
+        const affected = res.affected;
+
+        try callHook(T, "afterDelete", m, s);
+        return affected;
     }
 
     /// `DELETE FROM table WHERE (frag)`, returns affected rows.
@@ -431,7 +465,9 @@ pub const Session = struct {
         var res = try s.runExec(b.slice(), params);
         defer res.deinit();
         if (res.rows.len == 0) return null;
-        return try value.scanRow(T, table, &res, res.rows[0], s.gpa);
+        var out = try value.scanRow(T, table, &res, res.rows[0], s.gpa);
+        try callHook(T, "afterFind", &out, s);
+        return out;
     }
 
     // --------------------------------------------------------------- query
@@ -617,12 +653,49 @@ pub const Session = struct {
     }
 };
 
-/// A pinned-connection transaction.
+/// A pinned-connection transaction. A Tx created with `begin()` on another
+/// Tx represents a SAVEPOINT: `commit()` releases it, `rollback()` rolls back
+/// to it (and releases).
 pub const Tx = struct {
     sess: *Session,
     /// True when the Tx owns its (heap) session — `Db.begin`.
     owns_session: bool = false,
+    /// True when this Tx is a savepoint inside an outer transaction.
+    is_savepoint: bool = false,
+    sp_name_buf: [24]u8 = undefined,
+    sp_name_len: usize = 0,
     finished: bool = false,
+
+    fn spName(t: *const Tx) []const u8 {
+        return t.sp_name_buf[0..t.sp_name_len];
+    }
+
+    /// Starts a nested transaction (SAVEPOINT) inside this transaction.
+    pub fn begin(t: *Tx) Error!Tx {
+        if (t.sess.pinned == null) return error.ProtocolViolation;
+        t.sess.savepoint_depth += 1;
+        errdefer t.sess.savepoint_depth -= 1;
+
+        var sp = Tx{ .sess = t.sess, .is_savepoint = true };
+        const name = std.fmt.bufPrint(&sp.sp_name_buf, "zorm_sp_{d}", .{t.sess.savepoint_depth}) catch
+            unreachable;
+        sp.sp_name_len = name.len;
+
+        const sql = std.fmt.allocPrint(t.sess.gpa, "SAVEPOINT {s}", .{sp.spName()}) catch
+            return error.OutOfMemory;
+        defer t.sess.gpa.free(sql);
+        var res = try t.sess.execRaw(sql);
+        res.deinit();
+        return sp;
+    }
+
+    fn releaseSavepoint(t: *Tx, comptime action: []const u8) Error!void {
+        const sql = std.fmt.allocPrint(t.sess.gpa, "{s} SAVEPOINT {s}", .{ action, t.spName() }) catch
+            return error.OutOfMemory;
+        defer t.sess.gpa.free(sql);
+        var res = try t.sess.execRaw(sql);
+        res.deinit();
+    }
 
     fn finish(t: *Tx) void {
         if (t.owns_session) t.sess.gpa.destroy(t.sess);
@@ -631,6 +704,16 @@ pub const Tx = struct {
     pub fn commit(t: *Tx) Error!void {
         if (t.finished) return error.ConnectionClosed;
         t.finished = true;
+        if (t.is_savepoint) {
+            t.releaseSavepoint("RELEASE") catch |e| {
+                t.sess.savepoint_depth -= 1;
+                t.finish();
+                return e;
+            };
+            t.sess.savepoint_depth -= 1;
+            t.finish();
+            return;
+        }
         const conn = t.sess.pinned.?;
         var res = conn.execSimple("COMMIT") catch |e| {
             t.sess.captureError(conn);
@@ -649,6 +732,19 @@ pub const Tx = struct {
     pub fn rollback(t: *Tx) void {
         if (t.finished) return;
         t.finished = true;
+        if (t.is_savepoint) {
+            // Roll back to the savepoint, then release it so the name can be
+            // reused later in the same transaction.
+            t.releaseSavepoint("ROLLBACK TO") catch {
+                t.sess.savepoint_depth -= 1;
+                t.finish();
+                return;
+            };
+            t.releaseSavepoint("RELEASE") catch {};
+            t.sess.savepoint_depth -= 1;
+            t.finish();
+            return;
+        }
         const conn = t.sess.pinned.?;
         var res = conn.execSimple("ROLLBACK") catch {
             t.sess.pinned = null;
