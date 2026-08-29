@@ -215,17 +215,38 @@ const RichPost = struct {
     title: []const u8 = "",
     tags: []const []const u8 = &.{}, // text[]
     scores: []const i64 = &.{}, // bigint[]
-    weights: ?[]const f64 = null, // double precision[]
+    weights: ?[]const ?f64 = null, // double precision[] with NULL elements
     meta: ?z.Json = null, // jsonb
     attachment: ?z.Bytes = null, // bytea
     author: ?BlogAuthor = null, // preloaded belongs_to
-
-    // hook bookkeeping
-    pub var hook_log: []const u8 = "";
+    comments: []Comment = &.{}, // preloaded has_many
 
     pub const zorm = .{
         .table = "v2_posts",
         .belongs_to = .{ .author = .{ .model = BlogAuthor, .foreign_key = "author_id" } },
+        .has_many = .{ .comments = .{ .model = Comment, .foreign_key = "post_id" } },
+    };
+};
+
+const Matrix = struct {
+    id: ?i64 = null,
+    name: []const u8 = "",
+    cells: []const []const i64 = &.{}, // 2-D bigint[]
+    weights: ?[]const ?f64 = null, // double precision[] with NULL elements
+
+    pub const zorm = .{
+        .table = "v2_matrix",
+    };
+};
+
+const Comment = struct {
+    id: ?i64 = null,
+    post_id: ?i64 = null,
+    text: []const u8 = "",
+
+    pub const zorm = .{
+        .table = "v2_comments",
+        .belongs_to = .{ .post = .{ .model = RichPost, .foreign_key = "post_id" } },
     };
 };
 
@@ -309,6 +330,16 @@ test "v2: binary params, arrays, jsonb, bytea round trip" {
     try std.testing.expectEqualStrings("{\"k\": [1, 2], \"s\": \"v\"}", back.meta.?.data);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0xff, 0x7f }, back.attachment.?.data);
     z.free(RichPost, back, gpa);
+
+    // NULL array elements (optional f64 elements)
+    var pw = RichPost{ .title = "nulls", .weights = &[_]?f64{ 1.5, null, -2.5 }, .scores = &.{} };
+    try db.insert(&pw);
+    const pw_back = (try db.find(RichPost, pw.id.?)).?;
+    try std.testing.expectEqual(@as(usize, 3), pw_back.weights.?.len);
+    try std.testing.expectEqual(@as(?f64, 1.5), pw_back.weights.?[0]);
+    try std.testing.expectEqual(@as(?f64, null), pw_back.weights.?[1]);
+    try std.testing.expectEqual(@as(?f64, -2.5), pw_back.weights.?[2]);
+    z.free(RichPost, pw_back, gpa);
 
     // empty array round trip
     var p2 = RichPost{ .title = "empty", .scores = &.{}, .tags = &.{} };
@@ -429,6 +460,7 @@ test "v2: savepoints and nested transactions" {
     defer db.deinit();
 
     drop(try db.execRaw("DROP TABLE IF EXISTS v2_hooked CASCADE"));
+    drop(try db.execRaw("DROP TABLE IF EXISTS plain CASCADE"));
     try db.autoMigrate(Plain);
 
     // Outer txn keeps A; savepoint 1 rolled back drops B; savepoint 2 commits C.
@@ -474,6 +506,62 @@ test "v2: savepoints and nested transactions" {
     try std.testing.expectEqual(@as(i64, 0), d_count);
 
     _ = try db.deleteWhere(Plain, "true", .{});
+}
+
+test "v2: nested preloading and 2-D arrays" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    defer db.deinit();
+
+    drop(try db.execRaw("DROP TABLE IF EXISTS v2_comments CASCADE"));
+    drop(try db.execRaw("DROP TABLE IF EXISTS v2_posts CASCADE"));
+    drop(try db.execRaw("DROP TABLE IF EXISTS v2_authors2 CASCADE"));
+    try db.autoMigrateAll(.{ BlogAuthor, RichPost, Comment, Matrix });
+
+    var alice = BlogAuthor{ .name = "Alice" };
+    try db.insert(&alice);
+
+    var posts = [_]RichPost{
+        .{ .title = "p1", .author_id = alice.id, .scores = &.{ 1, 2 }, .tags = &.{"z"} },
+        .{ .title = "p2", .author_id = alice.id, .scores = &.{} },
+    };
+    try db.insertBatch(&posts);
+
+    var comments = [_]Comment{
+        .{ .post_id = posts[0].id, .text = "nice" },
+        .{ .post_id = posts[0].id, .text = "again" },
+        .{ .post_id = posts[1].id, .text = "meh" },
+    };
+    try db.insertBatch(&comments);
+
+    // two-level nested preload: author -> posts -> comments
+    const authors = try z.query(BlogAuthor, db).preload("posts.comments").all(gpa);
+    defer z.freeSlice(BlogAuthor, authors, gpa);
+    try std.testing.expectEqual(@as(usize, 1), authors.len);
+    try std.testing.expectEqual(@as(usize, 2), authors[0].posts.len);
+    try std.testing.expectEqual(@as(usize, 2), authors[0].posts[0].comments.len);
+    try std.testing.expectEqualStrings("nice", authors[0].posts[0].comments[0].text);
+    try std.testing.expectEqualStrings("again", authors[0].posts[0].comments[1].text);
+    try std.testing.expectEqual(@as(usize, 1), authors[0].posts[1].comments.len);
+    try std.testing.expectEqualStrings("meh", authors[0].posts[1].comments[0].text);
+
+    // 2-D array column (bigint[] holding {{1,2},{3,4}})
+    var m = Matrix{ .name = "m1", .cells = &.{ &.{ 1, 2 }, &.{ 3, 4 } } };
+    try db.insert(&m);
+    const m_back = (try db.find(Matrix, m.id.?)).?;
+    try std.testing.expectEqual(@as(usize, 2), m_back.cells.len);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, m_back.cells[0]);
+    try std.testing.expectEqualSlices(i64, &.{ 3, 4 }, m_back.cells[1]);
+    z.free(Matrix, m_back, gpa);
+
+    _ = try db.deleteWhere(Comment, "true", .{});
+    _ = try db.deleteWhere(RichPost, "true", .{});
+    _ = try db.deleteWhere(BlogAuthor, "true", .{});
+    _ = try db.deleteWhere(Matrix, "true", .{});
 }
 
 test "v2: migration versioning" {

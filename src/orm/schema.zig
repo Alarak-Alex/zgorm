@@ -149,19 +149,22 @@ fn kindOf(comptime T: type) FieldKind {
         .pointer => |ptr| blk: {
             if (ptr.size == .slice) {
                 if (ptr.child == u8) break :blk FieldKind.text;
-                switch (@typeInfo(ptr.child)) {
-                    .int => |ci| break :blk if (ci.signedness == .signed)
-                        FieldKind.int_array
-                    else
-                        FieldKind.uint_array,
-                    .float => break :blk FieldKind.float_array,
-                    .bool => break :blk FieldKind.bool_array,
-                    .pointer => |inner| {
-                        if (inner.size == .slice and inner.child == u8) break :blk FieldKind.text_array;
-                        @compileError("zorm: unsupported array element type " ++ @typeName(ptr.child));
-                    },
+                // Nested slices give multi-dimensional arrays; the DDL type
+                // follows the innermost scalar kind. Optional elements are
+                // unwrapped (NULL-able elements).
+                const ChildElem = if (@typeInfo(ptr.child) == .optional)
+                    @typeInfo(ptr.child).optional.child
+                else
+                    ptr.child;
+                const inner = comptime kindOf(ChildElem);
+                break :blk switch (inner) {
+                    .integer, .int_array => FieldKind.int_array,
+                    .unsigned, .uint_array => FieldKind.uint_array,
+                    .float, .float_array => FieldKind.float_array,
+                    .boolean, .bool_array => FieldKind.bool_array,
+                    .text, .text_array => FieldKind.text_array,
                     else => @compileError("zorm: unsupported array element type " ++ @typeName(ptr.child)),
-                }
+                };
             }
             @compileError("zorm: unsupported field type " ++ @typeName(T) ++
                 " (only []const u8 / []u8 slices are supported for strings)");

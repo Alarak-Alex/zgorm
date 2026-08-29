@@ -90,14 +90,12 @@ pub fn Query(comptime T: type) type {
         }
 
         /// Eager-loads a declared association (`has_many` fills the slice
-        /// field; `belongs_to` fills the optional field). The name is checked
-        /// at compile time against the model's `zorm` declaration.
-        pub fn preload(q: *Self, comptime name: []const u8) *Self {
-            if (comptime table.assoc(name) == null) {
-                @compileError("zorm: preload('" ++ name ++ "') is not a declared association of " ++ @typeName(T) ++
-                    " (declare it via `pub const zorm = .{ .has_many = ... }` or `.belongs_to = ...`)");
-            }
-            q.preloads.append(q.a(), name) catch return q.errOut();
+        /// field; `belongs_to` fills the optional field). Supports nested
+        /// paths: `preload("posts.comments")` preloads the comments of the
+        /// preloaded posts. The whole path is checked at compile time.
+        pub fn preload(q: *Self, comptime path: []const u8) *Self {
+            comptime validatePreloadPath(T, path);
+            q.preloads.append(q.a(), path) catch return q.errOut();
             return q;
         }
 
@@ -337,8 +335,13 @@ pub fn Query(comptime T: type) type {
             defer res.deinit();
             const out: i64 = if (res.rows.len == 0 or res.rows[0][0] == null)
                 0
-            else
-                std.fmt.parseInt(i64, res.rows[0][0].?, 10) catch 0;
+            else blk: {
+                const cell = res.rows[0][0].?;
+                if (res.columns[0].format == 1 and cell.len == 8) {
+                    break :blk std.mem.readInt(i64, cell[0..8], .big);
+                }
+                break :blk value.decodeBinary(i64, cell, res.columns[0].type_oid, q.sess.gpa) catch 0;
+            };
             q.deinit();
             return out;
         }
@@ -359,186 +362,11 @@ pub fn Query(comptime T: type) type {
             return out;
         }
 
-        /// Fills preloaded association fields for the decoded rows.
         fn applyPreloads(q: *Self, rows: []T, gpa: std.mem.Allocator) Error!void {
             if (q.preloads.items.len == 0 or rows.len == 0) return;
-            inline for (table.assocs) |assoc| {
-                var requested = false;
-                for (q.preloads.items) |n| {
-                    if (std.mem.eql(u8, n, assoc.field_name)) requested = true;
-                }
-                if (requested) try q.preloadAssoc(rows, gpa, assoc);
+            for (q.preloads.items) |path| {
+                try applyPreloadPath(T, rows, path, q.sess, gpa);
             }
-        }
-
-        fn asI64(comptime FT: type, v: FT) ?i64 {
-            return switch (@typeInfo(FT)) {
-                .int => @intCast(v),
-                .optional => |oi| if (v) |x| asI64(oi.child, x) else null,
-                else => null,
-            };
-        }
-
-        /// Reads the integer(-ish) key out of `field` of the model.
-        fn asIFieldOf(comptime M: type, comptime name: []const u8, field_value: FieldOfT(M, name)) ?i64 {
-            return asI64(FieldOfT(M, name), field_value);
-        }
-
-        fn preloadAssoc(q: *Self, rows: []T, gpa: std.mem.Allocator, comptime assoc: schema.Assoc) Error!void {
-            const Child = assoc.model;
-            const child_table = comptime schema.tableOf(Child);
-
-            switch (assoc.kind) {
-                .has_many => {
-                    const pkc = comptime table.pk() orelse
-                        @compileError("zorm: has_many requires the parent model to declare a primary key");
-                    // Collect parent keys.
-                    var ids: std.ArrayList(i64) = .empty;
-                    defer ids.deinit(gpa);
-                    for (rows) |*r| {
-                        if (asIFieldOf(T, pkc.field_name, @field(r, pkc.field_name))) |id| {
-                            ids.append(gpa, id) catch return error.OutOfMemory;
-                        }
-                    }
-                    if (ids.items.len == 0) return;
-
-                    // Children are decoded into a scratch arena and deep
-                    // copied into `gpa`; the originals die with the arena.
-                    var arena_state = std.heap.ArenaAllocator.init(gpa);
-                    defer arena_state.deinit();
-                    const arena = arena_state.allocator();
-
-                    var children = try q.queryChildren(Child, child_table, assoc.foreign_key, ids.items, arena);
-                    defer children.deinit(arena);
-
-                    // Bucket children by foreign key into per-parent slices.
-                    var counts = gpa.alloc(usize, rows.len) catch return error.OutOfMemory;
-                    defer gpa.free(counts);
-                    @memset(counts, 0);
-
-                    var owners = gpa.alloc(usize, children.items.len) catch return error.OutOfMemory;
-                    defer gpa.free(owners);
-
-                    for (children.items, 0..) |*c, ci| {
-                        const fk = asIFieldOf(Child, assoc.foreign_key, @field(c, assoc.foreign_key));
-                        var owner: ?usize = null;
-                        if (fk) |k| {
-                            for (ids.items, 0..) |id, pi| {
-                                if (id == k) {
-                                    owner = pi;
-                                    break;
-                                }
-                            }
-                        }
-                        owners[ci] = owner orelse std.math.maxInt(usize);
-                        if (owner) |pi| counts[pi] += 1;
-                    }
-                    // Per-parent slices are allocated independently so the
-                    // result owns a freeable slice per row.
-                    const ChildSliceT = @TypeOf(@field(@as(T, undefined), assoc.field_name));
-                    const slices = gpa.alloc(ChildSliceT, rows.len) catch return error.OutOfMemory;
-                    defer gpa.free(slices);
-                    var fill = gpa.alloc(usize, rows.len) catch return error.OutOfMemory;
-                    defer gpa.free(fill);
-                    for (rows, 0..) |_, pi| {
-                        slices[pi] = gpa.alloc(Child, counts[pi]) catch return error.OutOfMemory;
-                        fill[pi] = 0;
-                    }
-
-                    for (children.items, 0..) |*c, ci| {
-                        if (owners[ci] != std.math.maxInt(usize)) {
-                            const pi = owners[ci];
-                            slices[pi][fill[pi]] = try value.deepCopy(Child, c.*, gpa);
-                            fill[pi] += 1;
-                        }
-                    }
-                    for (rows, 0..) |*r, pi| {
-                        @field(r, assoc.field_name) = slices[pi];
-                    }
-                },
-                .belongs_to => {
-                    // Collect foreign keys from the rows.
-                    var ids: std.ArrayList(i64) = .empty;
-                    defer ids.deinit(gpa);
-                    for (rows) |*r| {
-                        if (asIFieldOf(T, assoc.foreign_key, @field(r, assoc.foreign_key))) |id| {
-                            ids.append(gpa, id) catch return error.OutOfMemory;
-                        }
-                    }
-                    if (ids.items.len == 0) return;
-
-                    var arena_state = std.heap.ArenaAllocator.init(gpa);
-                    defer arena_state.deinit();
-                    const arena = arena_state.allocator();
-
-                    var children = try q.queryChildren(Child, child_table, assoc.primary_key, ids.items, arena);
-                    defer children.deinit(arena);
-
-                    for (rows) |*r| {
-                        const fk = asIFieldOf(T, assoc.foreign_key, @field(r, assoc.foreign_key));
-                        if (fk == null) continue;
-                        @field(r, assoc.field_name) = null;
-                        for (children.items) |*c| {
-                            const pk = asIFieldOf(Child, assoc.primary_key, @field(c, assoc.primary_key));
-                            if (pk != null and pk.? == fk.?) {
-                                // Deep copy: several rows may reference the
-                                // same child, so each gets its own strings.
-                                @field(r, assoc.field_name) = try value.deepCopy(Child, c.*, gpa);
-                                break;
-                            }
-                        }
-                    }
-                },
-            }
-        }
-
-        /// Runs `SELECT * FROM child WHERE key_col IN (...)` and decodes rows.
-        fn queryChildren(
-            q: *Self,
-            comptime Child: type,
-            comptime child_table: schema.Table,
-            key_column: []const u8,
-            ids: []const i64,
-            gpa: std.mem.Allocator,
-        ) Error!std.ArrayList(Child) {
-            const s = q.sess;
-            var arena_state = std.heap.ArenaAllocator.init(s.gpa);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
-
-            var aw: std.Io.Writer.Allocating = .init(arena);
-            const w = &aw.writer;
-            w.print("SELECT * FROM {s} WHERE {s} IN (", .{
-                try quoteIdent(arena, child_table.name),
-                try quoteIdent(arena, key_column),
-            }) catch return error.OutOfMemory;
-            for (ids, 0..) |_, i| {
-                if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
-                w.print("${d}", .{i + 1}) catch return error.OutOfMemory;
-            }
-            w.writeByte(')') catch return error.OutOfMemory;
-
-            const params = arena.alloc(pq.Param, ids.len) catch return error.OutOfMemory;
-            for (ids, 0..) |id, i| {
-                params[i] = try value.toParam(id, arena);
-            }
-
-            const conn = try s.acquire();
-            var res = conn.execParams(aw.writer.buffered(), params) catch |e| {
-                s.captureError(conn);
-                s.releaseConn(conn);
-                return e;
-            };
-            s.releaseConn(conn);
-            defer res.deinit();
-
-            var items: std.ArrayList(Child) = .empty;
-            for (res.rows) |row| {
-                var child = try value.scanRow(Child, child_table, &res, row, gpa);
-                db_mod.Session.callHook(Child, "afterFind", &child, s) catch {};
-                items.append(gpa, child) catch return error.OutOfMemory;
-            }
-            return items;
         }
 
         /// `DELETE FROM table WHERE ...`, returns affected rows.
@@ -559,6 +387,257 @@ pub fn Query(comptime T: type) type {
             q.deinit();
             return affected;
         }
+    };
+}
+
+/// Compile-time validation of a (possibly dotted) preload path against
+/// model `M`: every segment must be a declared association of the previous
+/// segment's model.
+pub fn validatePreloadPath(comptime M: type, comptime path: []const u8) void {
+    comptime {
+        @setEvalBranchQuota(200_000);
+        var model = M;
+        var rest = path;
+        while (rest.len > 0) {
+            const dot = std.mem.indexOfScalar(u8, rest, '.');
+            const seg = if (dot) |d| rest[0..d] else rest;
+            const tbl = schema.tableOf(model);
+            var found: ?schema.Assoc = null;
+            for (tbl.assocs) |a| {
+                if (std.mem.eql(u8, a.field_name, seg)) found = a;
+            }
+            if (found == null) {
+                @compileError("zorm: preload('" ++ path ++ "'): '" ++ seg ++
+                    "' is not a declared association of " ++ @typeName(model) ++
+                    " (declare it via `pub const zorm = .{ .has_many = ... }` or `.belongs_to = ...`)");
+            }
+            model = found.?.model;
+            rest = if (dot) |d| rest[d + 1 ..] else "";
+        }
+    }
+}
+
+/// Applies a (possibly dotted) preload path to decoded rows of model `M`.
+/// Runs one query per association level (batched over all rows).
+pub fn applyPreloadPath(
+    comptime M: type,
+    rows: []M,
+    path: []const u8,
+    s: *db_mod.Session,
+    gpa: std.mem.Allocator,
+) Error!void {
+    const tbl = comptime schema.tableOf(M);
+    const dot = std.mem.indexOfScalar(u8, path, '.');
+    const seg = if (dot) |d| path[0..d] else path;
+    const nested: []const u8 = if (dot) |d| path[d + 1 ..] else "";
+    inline for (tbl.assocs) |assoc| {
+        if (std.mem.eql(u8, assoc.field_name, seg)) {
+            try loadAssoc(M, rows, assoc, nested, s, gpa);
+        }
+    }
+}
+
+fn loadAssoc(
+    comptime M: type,
+    rows: []M,
+    comptime assoc: schema.Assoc,
+    nested: []const u8,
+    s: *db_mod.Session,
+    gpa: std.mem.Allocator,
+) Error!void {
+    const Child = assoc.model;
+    const child_table = comptime schema.tableOf(Child);
+
+    switch (assoc.kind) {
+        .has_many => {
+            const pkc = comptime schema.tableOf(M).pk() orelse
+                @compileError("zorm: has_many requires the parent model to declare a primary key");
+            var ids: std.ArrayList(i64) = .empty;
+            defer ids.deinit(gpa);
+            for (rows) |*r| {
+                if (asIFieldOf(M, pkc.field_name, @field(r, pkc.field_name))) |id| {
+                    ids.append(gpa, id) catch return error.OutOfMemory;
+                }
+            }
+            if (ids.items.len == 0) return;
+
+            // Children are decoded into a scratch arena and deep copied into
+            // `gpa`; the originals die with the arena.
+            var arena_state = std.heap.ArenaAllocator.init(gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            var children = try queryChildren(Child, child_table, assoc.foreign_key, ids.items, s, arena);
+            defer children.deinit(arena);
+
+            // Per-parent slices are allocated independently so the result
+            // owns a freeable slice per row.
+            const ChildSliceT = @TypeOf(@field(@as(M, undefined), assoc.field_name));
+            const slices = gpa.alloc(ChildSliceT, rows.len) catch return error.OutOfMemory;
+            defer gpa.free(slices);
+            var fill = gpa.alloc(usize, rows.len) catch return error.OutOfMemory;
+            defer gpa.free(fill);
+            var counts = gpa.alloc(usize, rows.len) catch return error.OutOfMemory;
+            defer gpa.free(counts);
+            @memset(counts, 0);
+
+            var owners = gpa.alloc(usize, children.items.len) catch return error.OutOfMemory;
+            defer gpa.free(owners);
+            for (children.items, 0..) |*c, ci| {
+                const fk = asIFieldOf(Child, assoc.foreign_key, @field(c, assoc.foreign_key));
+                var owner: ?usize = null;
+                if (fk) |k| {
+                    for (ids.items, 0..) |id, pi| {
+                        if (id == k) {
+                            owner = pi;
+                            break;
+                        }
+                    }
+                }
+                owners[ci] = owner orelse std.math.maxInt(usize);
+                if (owner) |pi| counts[pi] += 1;
+            }
+            for (rows, 0..) |_, pi| {
+                slices[pi] = gpa.alloc(Child, counts[pi]) catch return error.OutOfMemory;
+                fill[pi] = 0;
+            }
+            for (children.items, 0..) |*c, ci| {
+                if (owners[ci] != std.math.maxInt(usize)) {
+                    const pi = owners[ci];
+                    slices[pi][fill[pi]] = try value.deepCopy(Child, c.*, gpa);
+                    fill[pi] += 1;
+                }
+            }
+            // Assign before applying nested preloads so they mutate the rows.
+            for (rows, 0..) |*r, pi| {
+                @field(r, assoc.field_name) = slices[pi];
+            }
+            if (nested.len > 0) {
+                for (slices, 0..) |child_rows, pi| {
+                    _ = pi;
+                    try applyPreloadPath(Child, child_rows, nested, s, gpa);
+                }
+            }
+        },
+        .belongs_to => {
+            var ids: std.ArrayList(i64) = .empty;
+            defer ids.deinit(gpa);
+            for (rows) |*r| {
+                if (asIFieldOf(M, assoc.foreign_key, @field(r, assoc.foreign_key))) |id| {
+                    ids.append(gpa, id) catch return error.OutOfMemory;
+                }
+            }
+            if (ids.items.len == 0) return;
+
+            var arena_state = std.heap.ArenaAllocator.init(gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            var children = try queryChildren(Child, child_table, assoc.primary_key, ids.items, s, arena);
+            defer children.deinit(arena);
+
+            // One deep copy per row; nested preloads mutate these copies.
+            const FieldT = FieldOfT(M, assoc.field_name);
+            const copies = gpa.alloc(FieldT, rows.len) catch return error.OutOfMemory;
+            defer gpa.free(copies);
+            var has = gpa.alloc(bool, rows.len) catch return error.OutOfMemory;
+            defer gpa.free(has);
+
+            for (rows, 0..) |*r, ri| {
+                const fk = asIFieldOf(M, assoc.foreign_key, @field(r, assoc.foreign_key));
+                has[ri] = false;
+                if (fk == null) continue;
+                @field(r, assoc.field_name) = null;
+                for (children.items) |*c| {
+                    const pk = asIFieldOf(Child, assoc.primary_key, @field(c, assoc.primary_key));
+                    if (pk != null and pk.? == fk.?) {
+                        // Deep copy: several rows may reference the same
+                        // child, so each gets its own strings.
+                        copies[ri] = try value.deepCopy(Child, c.*, gpa);
+                        has[ri] = true;
+                        break;
+                    }
+                }
+            }
+
+            if (nested.len > 0) {
+                var selected: std.ArrayList(Child) = .empty;
+                defer selected.deinit(gpa);
+                var index = gpa.alloc(usize, rows.len) catch return error.OutOfMemory;
+                defer gpa.free(index);
+                for (rows, 0..) |_, ri| {
+                    if (has[ri]) {
+                        index[ri] = selected.items.len;
+                        selected.append(gpa, copies[ri].?) catch return error.OutOfMemory;
+                    }
+                }
+                try applyPreloadPath(Child, selected.items, nested, s, gpa);
+                for (rows, 0..) |*r, ri| {
+                    if (has[ri]) @field(r, assoc.field_name) = selected.items[index[ri]];
+                }
+                return;
+            }
+            for (rows, 0..) |*r, ri| {
+                if (has[ri]) @field(r, assoc.field_name) = copies[ri];
+            }
+        },
+    }
+}
+
+/// Runs `SELECT * FROM child WHERE key_col IN (...)` and decodes rows into
+/// `arena`.
+fn queryChildren(
+    comptime Child: type,
+    comptime child_table: schema.Table,
+    key_column: []const u8,
+    ids: []const i64,
+    s: *db_mod.Session,
+    arena: std.mem.Allocator,
+) Error!std.ArrayList(Child) {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    w.print("SELECT * FROM {s} WHERE {s} IN (", .{
+        try quoteIdent(arena, child_table.name),
+        try quoteIdent(arena, key_column),
+    }) catch return error.OutOfMemory;
+    for (ids, 0..) |_, i| {
+        if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
+        w.print("${d}", .{i + 1}) catch return error.OutOfMemory;
+    }
+    w.writeByte(')') catch return error.OutOfMemory;
+
+    const params = arena.alloc(pq.Param, ids.len) catch return error.OutOfMemory;
+    for (ids, 0..) |id, i| {
+        params[i] = try value.toParam(id, arena);
+    }
+
+    const conn = try s.acquire();
+    var res = conn.execParams(aw.writer.buffered(), params) catch |e| {
+        s.captureError(conn);
+        s.releaseConn(conn);
+        return e;
+    };
+    s.releaseConn(conn);
+    defer res.deinit();
+
+    var items: std.ArrayList(Child) = .empty;
+    for (res.rows) |row| {
+        var child = try value.scanRow(Child, child_table, &res, row, arena);
+        db_mod.Session.callHook(Child, "afterFind", &child, s) catch {};
+        items.append(arena, child) catch return error.OutOfMemory;
+    }
+    return items;
+}
+
+fn asIFieldOf(comptime M: type, comptime name: []const u8, field_value: FieldOfT(M, name)) ?i64 {
+    return asI64(FieldOfT(M, name), field_value);
+}
+
+fn asI64(comptime FT: type, v: FT) ?i64 {
+    return switch (@typeInfo(FT)) {
+        .int => @intCast(v),
+        .optional => |oi| if (v) |x| asI64(oi.child, x) else null,
+        else => null,
     };
 }
 

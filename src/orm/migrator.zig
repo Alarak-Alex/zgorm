@@ -66,7 +66,7 @@ pub const Migrator = struct {
         var out: std.ArrayList(i64) = .empty;
         for (res.rows) |row| {
             const cell = row[0] orelse continue;
-            const v = std.fmt.parseInt(i64, cell, 10) catch continue;
+            const v = @import("value.zig").decodeCell(i64, cell, res.columns[0].type_oid, res.columns[0].format, gpa) catch continue;
             out.append(gpa, v) catch return error.OutOfMemory;
         }
         return out.toOwnedSlice(gpa) catch return error.OutOfMemory;
@@ -126,7 +126,7 @@ pub const Migrator = struct {
             var res = try s.execRaw("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1");
             defer res.deinit();
             if (res.rows.len == 0 or res.rows[0][0] == null) break :blk null;
-            break :blk std.fmt.parseInt(i64, res.rows[0][0].?, 10) catch null;
+            break :blk @import("value.zig").decodeCell(i64, res.rows[0][0], res.columns[0].type_oid, res.columns[0].format, s.gpa) catch null;
         };
         const version = latest orelse return; // nothing applied
 

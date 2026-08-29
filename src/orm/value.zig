@@ -209,11 +209,24 @@ pub fn oidOf(comptime T: type) u32 {
 }
 
 pub fn arrayOid(comptime Elem: type) u32 {
-    return switch (@typeInfo(Elem)) {
+    // Optional elements unwrap to their scalar OID; nested slices recurse
+    // (the element OID of a sub-array equals the element type's OID).
+    const E = if (@typeInfo(Elem) == .optional) @typeInfo(Elem).optional.child else Elem;
+    return switch (@typeInfo(E)) {
         .bool => proto.Oid.bool_array,
         .int, .comptime_int => proto.Oid.int8_array,
         .float, .comptime_float => proto.Oid.float8_array,
-        .pointer, .array => proto.Oid.text_array,
+        .pointer => |ptr| blk: {
+            if (ptr.size == .slice) {
+                if (ptr.child == u8) break :blk proto.Oid.text_array;
+                break :blk arrayOid(ptr.child);
+            }
+            break :blk proto.Oid.text_array;
+        },
+        .array => |ai| blk: {
+            if (ai.child == u8) break :blk proto.Oid.text_array;
+            break :blk arrayOid(ai.child);
+        },
         else => proto.Oid.text_array,
     };
 }
@@ -309,7 +322,19 @@ fn writeArrayElement(comptime E: type, elem: E, w: *std.Io.Writer) !void {
         .pointer => |ptr| {
             if (ptr.size == .slice and ptr.child == u8) {
                 try writeQuotedArrayText(w, elem);
-            } else @compileError("zorm: unsupported array element type " ++ @typeName(E));
+                return;
+            }
+            if (ptr.size == .slice and ptr.child != u8) {
+                // Nested (multi-dimensional) sub-array.
+                try w.writeByte('{');
+                for (elem, 0..) |sub, i| {
+                    if (i > 0) try w.writeByte(',');
+                    try writeArrayElement(ptr.child, sub, w);
+                }
+                try w.writeByte('}');
+                return;
+            }
+            @compileError("zorm: unsupported array element type " ++ @typeName(E));
         },
         .array => |ai| {
             if (ai.child == u8) {
@@ -344,8 +369,9 @@ fn writeQuotedArrayText(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
 }
 
-/// Parses a 1-D PostgreSQL array literal into `[]Elem`; `Elem` may be an
-/// optional (NULL elements map to null). Strings are duplicated with `gpa`.
+/// Parses a PostgreSQL array literal (any dimension) into nested slices
+/// matching `Elem`'s shape; the innermost element type may be optional
+/// (NULL elements). Strings are duplicated with `gpa`.
 pub fn parseArrayText(comptime Elem: type, text: []const u8, gpa: std.mem.Allocator) DecodeError![]Elem {
     if (text.len < 2 or text[0] != '{' or text[text.len - 1] != '}')
         return error.TypeMismatch;
@@ -363,8 +389,10 @@ pub fn parseArrayText(comptime Elem: type, text: []const u8, gpa: std.mem.Alloca
 
         raw.clearRetainingCapacity();
         var quoted = false;
+        var ever_quoted = false;
         var escaped = false;
         var element_present = false;
+        var brace_depth: usize = 0;
         while (i < inner.len) {
             const ch = inner[i];
             if (quoted) {
@@ -381,11 +409,28 @@ pub fn parseArrayText(comptime Elem: type, text: []const u8, gpa: std.mem.Alloca
             } else switch (ch) {
                 '"' => {
                     quoted = true;
+                    ever_quoted = true;
+                    element_present = true;
+                },
+                '{' => {
+                    brace_depth += 1;
+                    raw.append(gpa, ch) catch return error.OutOfMemory;
+                    element_present = true;
+                },
+                '}' => {
+                    if (brace_depth > 0) brace_depth -= 1;
+                    raw.append(gpa, ch) catch return error.OutOfMemory;
                     element_present = true;
                 },
                 ',' => {
-                    i += 1;
-                    break;
+                    if (brace_depth > 0) {
+                        // Comma inside a nested sub-array.
+                        raw.append(gpa, ch) catch return error.OutOfMemory;
+                        element_present = true;
+                    } else {
+                        i += 1;
+                        break;
+                    }
                 },
                 else => {
                     raw.append(gpa, ch) catch return error.OutOfMemory;
@@ -394,12 +439,7 @@ pub fn parseArrayText(comptime Elem: type, text: []const u8, gpa: std.mem.Alloca
             }
             i += 1;
         }
-        if (!element_present and raw.items.len == 0) {
-            // `{,}`-style hole: treat as NULL (valid only for optional elems).
-            items.append(gpa, try nullElement(Elem)) catch return error.OutOfMemory;
-        } else {
-            items.append(gpa, try decodeArrayElement(Elem, raw.items, gpa)) catch return error.OutOfMemory;
-        }
+        items.append(gpa, try decodeArrayElement(Elem, raw.items, ever_quoted, element_present, gpa)) catch return error.OutOfMemory;
         if (i >= inner.len) break;
     }
     return items.toOwnedSlice(gpa) catch return error.OutOfMemory;
@@ -412,22 +452,55 @@ fn nullElement(comptime E: type) DecodeError!E {
     }
 }
 
-fn decodeArrayElement(comptime E: type, raw: []const u8, gpa: std.mem.Allocator) DecodeError!E {
+fn decodeArrayElement(comptime E: type, raw: []const u8, quoted: bool, present: bool, gpa: std.mem.Allocator) DecodeError!E {
+    const is_null_text = !quoted and std.ascii.eqlIgnoreCase(raw, "null");
+    if ((!present and raw.len == 0) or is_null_text) {
+        // Absent/unquoted-NULL elements resolve to null when the element
+        // type is optional, and are rejected otherwise.
+        return nullElement(E);
+    }
+    // A sub-array (multi-dimensional arrays): only for unquoted `{...}` and
+    // only when the element type is itself a slice.
+    const elem_info = @typeInfo(E);
+    const elem_is_slice = elem_info == .pointer and elem_info.pointer.size == .slice;
+    const elem_is_nested = elem_is_slice and elem_info.pointer.child != u8;
+    if (!quoted and raw.len >= 2 and raw[0] == '{' and raw[raw.len - 1] == '}') {
+        if (!elem_is_nested) return error.TypeMismatch;
+        const inner_list = try parseArrayText(elem_info.pointer.child, raw, gpa);
+        return inner_list;
+    }
     switch (@typeInfo(E)) {
         .optional => |oi| {
-            if (std.ascii.eqlIgnoreCase(raw, "null")) return null;
-            const inner = try decodeArrayElement(oi.child, raw, gpa);
+            const inner = try decodeArrayElement(oi.child, raw, quoted, present, gpa);
             return @as(E, inner);
         },
-        .int => return std.fmt.parseInt(E, raw, 10) catch error.TypeMismatch,
-        .float => return std.fmt.parseFloat(E, raw) catch error.TypeMismatch,
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                if (comptime ptr.child == u8) {
+                    return gpa.dupe(u8, raw) catch return error.OutOfMemory;
+                }
+                // Non-string scalar elements must appear as sub-arrays.
+                return error.TypeMismatch;
+            }
+            @compileError("zorm: unsupported array element type " ++ @typeName(E));
+        },
+        .int => {
+            const trimmed = if (quoted) raw else std.mem.trim(u8, raw, " \t");
+            return std.fmt.parseInt(E, trimmed, 10) catch error.TypeMismatch;
+        },
+        .float => {
+            const trimmed = if (quoted) raw else std.mem.trim(u8, raw, " \t");
+            return std.fmt.parseFloat(E, trimmed) catch error.TypeMismatch;
+        },
         .bool => {
-            if (std.ascii.eqlIgnoreCase(raw, "t") or std.ascii.eqlIgnoreCase(raw, "true")) return true;
-            if (std.ascii.eqlIgnoreCase(raw, "f") or std.ascii.eqlIgnoreCase(raw, "false")) return false;
+            const trimmed = if (quoted) raw else std.mem.trim(u8, raw, " \t");
+            if (std.ascii.eqlIgnoreCase(trimmed, "t") or std.ascii.eqlIgnoreCase(trimmed, "true")) return true;
+            if (std.ascii.eqlIgnoreCase(trimmed, "f") or std.ascii.eqlIgnoreCase(trimmed, "false")) return false;
             return error.TypeMismatch;
         },
-        .pointer => |ptr| {
-            if (ptr.size == .slice and ptr.child == u8) {
+        .array => |ai| {
+            if (ai.child == u8) {
+                if (!present) return nullElement(E) catch unreachable;
                 return gpa.dupe(u8, raw) catch return error.OutOfMemory;
             }
             @compileError("zorm: unsupported array element type " ++ @typeName(E));
@@ -438,26 +511,215 @@ fn decodeArrayElement(comptime E: type, raw: []const u8, gpa: std.mem.Allocator)
 
 pub const DecodeError = error{ NullValue, TypeMismatch, OutOfMemory };
 
-/// Decodes one result cell (text format, possibly NULL) into `T`.
-/// Returned strings are duplicated with `gpa`.
-pub fn decodeCell(comptime T: type, cell: ?[]const u8, type_oid: u32, gpa: std.mem.Allocator) DecodeError!T {
+/// Decodes one result cell into `T`. `format` selects the wire encoding:
+/// 0 = text, 1 = binary. Returned strings/arrays are duplicated with `gpa`.
+pub fn decodeCell(comptime T: type, cell: ?[]const u8, type_oid: u32, format: u16, gpa: std.mem.Allocator) DecodeError!T {
     if (@typeInfo(T) == .optional) {
         const Child = @typeInfo(T).optional.child;
         if (cell == null) return null;
-        return try decodeCell(Child, cell, type_oid, gpa);
+        return try decodeCell(Child, cell, type_oid, format, gpa);
     }
-    const text = cell orelse return error.NullValue;
-    return decodeText(T, text, type_oid, gpa);
+    const data = cell orelse return error.NullValue;
+    return switch (format) {
+        1 => decodeBinary(T, data, type_oid, gpa),
+        else => decodeText(T, data, type_oid, gpa),
+    };
+}
+
+/// Reads a big-endian two's-complement signed integer of `byte_len` bytes.
+fn readSigned(data: []const u8) DecodeError!i64 {
+    var v: u64 = 0;
+    if (data.len == 0 or data.len > 8) return error.TypeMismatch;
+    for (data) |b| v = (v << 8) | b;
+    // Sign-extend from the actual width.
+    const shift: u6 = @intCast(64 - @as(u64, data.len) * 8);
+    const signed: i64 = @bitCast(v);
+    return (signed << @intCast(shift)) >> @intCast(shift);
+}
+
+fn readUnsigned(data: []const u8) DecodeError!u64 {
+    var v: u64 = 0;
+    if (data.len == 0 or data.len > 8) return error.TypeMismatch;
+    for (data) |b| v = (v << 8) | b;
+    return v;
+}
+
+/// Decodes a binary-format cell into `T`. Supports the same type set as the
+/// text path: integers, floats, bools, strings, arrays (any dimension),
+/// enums, Time, Json and Bytes.
+pub fn decodeBinary(comptime T: type, data: []const u8, type_oid: u32, gpa: std.mem.Allocator) DecodeError!T {
+    return switch (@typeInfo(T)) {
+        .optional => |oi| blk: {
+            const inner = try decodeBinary(oi.child, data, type_oid, gpa);
+            break :blk @as(T, inner);
+        },
+        .int => |info| blk: {
+            const v: i64 = if (info.signedness == .signed)
+                try readSigned(data)
+            else
+                @bitCast(try readUnsigned(data));
+            break :blk std.math.cast(T, v) orelse return error.TypeMismatch;
+        },
+        .float => blk: {
+            switch (data.len) {
+                4 => {
+                    const f: f32 = @bitCast(@as(u32, @intCast(std.mem.readInt(u32, data[0..4], .big))));
+                    break :blk switch (@typeInfo(T).float.bits) {
+                        32 => f,
+                        else => @as(T, @floatCast(f)),
+                    };
+                },
+                8 => {
+                    const f: f64 = @bitCast(std.mem.readInt(u64, data[0..8], .big));
+                    break :blk switch (@typeInfo(T).float.bits) {
+                        64 => f,
+                        else => @as(T, @floatCast(f)),
+                    };
+                },
+                else => return error.TypeMismatch,
+            }
+        },
+        .bool => if (data.len == 1) data[0] != 0 else error.TypeMismatch,
+        .pointer => |ptr| blk: {
+            if (ptr.size == .slice) {
+                if (ptr.child == u8) {
+                    // Text-family OIDs are identical in binary format. bytea
+                    // is raw bytes too (no hex escaping in binary).
+                    break :blk gpa.dupe(u8, data) catch return error.OutOfMemory;
+                }
+                break :blk try decodeBinaryArray(T, data, type_oid, gpa);
+            }
+            @compileError("zorm: unsupported binary result type " ++ @typeName(T));
+        },
+        .@"enum" => blk: {
+            const tag = std.meta.stringToEnum(T, data) orelse return error.TypeMismatch;
+            break :blk tag;
+        },
+        .@"struct" => blk: {
+            if (@hasDecl(T, "__zorm_time")) {
+                if (data.len != 8) return error.TypeMismatch;
+                const micros = std.mem.readInt(i64, data[0..8], .big);
+                break :blk T{ .micros = micros + pg_epoch_us };
+            }
+            if (@hasDecl(T, "__zorm_json")) {
+                // jsonb binary = 1-byte version (1) + json text; json = text.
+                const raw: []const u8 = if (type_oid == pq.proto.Oid.jsonb) data[1..] else data;
+                break :blk T{ .data = gpa.dupe(u8, raw) catch return error.OutOfMemory };
+            }
+            if (@hasDecl(T, "__zorm_bytes")) {
+                break :blk T{ .data = gpa.dupe(u8, data) catch return error.OutOfMemory };
+            }
+            @compileError("zorm: unsupported binary result type " ++ @typeName(T));
+        },
+        else => @compileError("zorm: unsupported binary result type " ++ @typeName(T)),
+    };
+}
+
+/// Decodes PostgreSQL's binary array format into nested Zig slices matching
+/// the target depth (1-D `[]Elem`, 2-D `[][]Elem`, ...). The innermost
+/// element type may be optional (NULL elements). `SliceT` is the target
+/// slice type itself (e.g. `[][]i64` for a 2-D bigint[]).
+fn decodeBinaryArray(
+    comptime SliceT: type,
+    data: []const u8,
+    type_oid: u32,
+    gpa: std.mem.Allocator,
+) DecodeError!SliceT {
+    _ = type_oid;
+    if (data.len < 12) return error.TypeMismatch;
+    const ndim = std.mem.readInt(i32, data[0..4], .big);
+    if (ndim <= 0) return gpa.alloc(@typeInfo(SliceT).pointer.child, 0) catch return error.OutOfMemory;
+
+    const depth = depthOf(SliceT);
+    if (ndim != depth) return error.TypeMismatch;
+
+    var dims_buf: [8]usize = undefined;
+    var off: usize = 12;
+    for (0..@intCast(ndim)) |d| {
+        if (off + 8 > data.len) return error.TypeMismatch;
+        const n = std.mem.readInt(i32, data[off..][0..4], .big);
+        _ = std.mem.readInt(i32, data[off + 4 ..][0..4], .big); // lower bound
+        if (n < 0) return error.TypeMismatch;
+        dims_buf[d] = @intCast(n);
+        off += 8;
+    }
+    var reader = ArrayBinReader{ .data = data, .off = off };
+    return decodeBinaryDims(SliceT, &reader, dims_buf[0..@intCast(ndim)], gpa);
+}
+
+const ArrayBinReader = struct {
+    data: []const u8,
+    off: usize,
+
+    fn readLen(r: *ArrayBinReader) DecodeError!i32 {
+        if (r.off + 4 > r.data.len) return error.TypeMismatch;
+        const n = std.mem.readInt(i32, r.data[r.off..][0..4], .big);
+        r.off += 4;
+        return n;
+    }
+
+    fn readBytes(r: *ArrayBinReader, n: usize) DecodeError![]const u8 {
+        if (r.off + n > r.data.len) return error.TypeMismatch;
+        const s = r.data[r.off..][0..n];
+        r.off += n;
+        return s;
+    }
+};
+
+/// Number of array dimensions represented by the slice type `S`.
+/// Text arrays (`[]const []const u8` and deeper u8 nesting) are always
+/// treated as 1-D `text[]` leaves; multi-dimensional arrays are only
+/// supported for numeric/boolean element types.
+fn depthOf(comptime S: type) usize {
+    const info = @typeInfo(S);
+    if (info != .pointer or info.pointer.size != .slice) return 0;
+    const Child = info.pointer.child;
+    if (Child == u8) return 1;
+    const child_depth = depthOf(Child);
+    if (child_depth == 1 and isTextSlice(Child)) return 1; // text[] leaf
+    return 1 + child_depth;
+}
+
+fn isTextSlice(comptime S: type) bool {
+    const info = @typeInfo(S);
+    return info == .pointer and info.pointer.size == .slice and info.pointer.child == u8;
+}
+
+/// Recursively materializes one dimension level of a binary array. `dims`
+/// holds the remaining dimension lengths; when one remains, the slice child
+/// is the (optionally optional) element type.
+fn decodeBinaryDims(
+    comptime SliceT: type,
+    reader: *ArrayBinReader,
+    dims: []const usize,
+    gpa: std.mem.Allocator,
+) DecodeError!SliceT {
+    const Child = @typeInfo(SliceT).pointer.child;
+    const out = gpa.alloc(Child, dims[0]) catch return error.OutOfMemory;
+    if (comptime depthOf(SliceT) == 1) {
+        // Innermost level: length-prefixed elements (or NULL when optional).
+        for (out) |*slot| {
+            const len = try reader.readLen();
+            if (len < 0) {
+                if (@typeInfo(Child) != .optional) return error.NullValue;
+                slot.* = null;
+            } else {
+                const bytes = try reader.readBytes(@intCast(len));
+                slot.* = try decodeBinary(Child, bytes, 0, gpa);
+            }
+        }
+        return out;
+    }
+    for (out) |*slot| {
+        slot.* = try decodeBinaryDims(Child, reader, dims[1..], gpa);
+    }
+    return out;
 }
 
 fn decodeText(comptime T: type, text: []const u8, type_oid: u32, gpa: std.mem.Allocator) DecodeError!T {
     return switch (@typeInfo(T)) {
-        .int => |info| blk: {
-            const v = std.fmt.parseInt(T, text, 10) catch return error.TypeMismatch;
-            _ = info;
-            break :blk v;
-        },
-        .float => std.fmt.parseFloat(T, text) catch return error.TypeMismatch,
+        .int => std.fmt.parseInt(T, text, 10) catch error.TypeMismatch,
+        .float => std.fmt.parseFloat(T, text) catch error.TypeMismatch,
         .bool => switch (text[0]) {
             't', 'T', '1' => true,
             'f', 'F', '0' => false,
@@ -471,8 +733,8 @@ fn decodeText(comptime T: type, text: []const u8, type_oid: u32, gpa: std.mem.Al
                     }
                     break :blk gpa.dupe(u8, text) catch return error.OutOfMemory;
                 }
-                // 1-D array column (e.g. bigint[], text[]) decoded from the
-                // PostgreSQL array literal.
+                // Array column (any dimension) decoded from the PostgreSQL
+                // array literal.
                 break :blk parseArrayText(ptr.child, text, gpa) catch return error.TypeMismatch;
             }
             @compileError("zorm: unsupported result type " ++ @typeName(T));
@@ -599,12 +861,12 @@ test "decode struct row" {
     const gpa = arena_state.allocator();
 
     var row: Row = .{};
-    row.id = try decodeCell(?i64, "42", pq.proto.Oid.int8, gpa);
-    row.name = try decodeCell([]const u8, "alice", pq.proto.Oid.text, gpa);
-    row.nickname = try decodeCell(?[]const u8, null, pq.proto.Oid.text, gpa);
-    row.score = try decodeCell(f64, "3.25", pq.proto.Oid.float8, gpa);
-    row.ok = try decodeCell(bool, "t", pq.proto.Oid.bool_, gpa);
-    row.status = try decodeCell(@TypeOf(row.status), "active", pq.proto.Oid.text, gpa);
+    row.id = try decodeCell(?i64, "42", pq.proto.Oid.int8, 0, gpa);
+    row.name = try decodeCell([]const u8, "alice", pq.proto.Oid.text, 0, gpa);
+    row.nickname = try decodeCell(?[]const u8, null, pq.proto.Oid.text, 0, gpa);
+    row.score = try decodeCell(f64, "3.25", pq.proto.Oid.float8, 0, gpa);
+    row.ok = try decodeCell(bool, "t", pq.proto.Oid.bool_, 0, gpa);
+    row.status = try decodeCell(@TypeOf(row.status), "active", pq.proto.Oid.text, 0, gpa);
 
     try testing.expectEqual(@as(?i64, 42), row.id);
     try testing.expectEqualStrings("alice", row.name);
@@ -617,14 +879,14 @@ test "decode struct row" {
 test "null into non-optional is an error" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    try testing.expectError(error.NullValue, decodeCell(i64, null, pq.proto.Oid.int8, arena_state.allocator()));
+    try testing.expectError(error.NullValue, decodeCell(i64, null, pq.proto.Oid.int8, 0, arena_state.allocator()));
 }
 
 test "bytea hex round trip" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
-    const got = try decodeCell([]const u8, "\\x00ff10", pq.proto.Oid.bytea, gpa);
+    const got = try decodeCell([]const u8, "\\x00ff10", pq.proto.Oid.bytea, 0, gpa);
     try testing.expectEqualSlices(u8, &.{ 0, 0xff, 0x10 }, got);
 }
 
@@ -669,7 +931,7 @@ pub fn scanRow(
         inline for (table.columns) |col| {
             if (comptime std.mem.eql(u8, col.field_name, f.name)) {
                 if (res.colIndex(col.name)) |ci| {
-                    @field(out, f.name) = try decodeCell(f.type, row[ci], res.columns[ci].type_oid, gpa);
+                    @field(out, f.name) = try decodeCell(f.type, row[ci], res.columns[ci].type_oid, res.columns[ci].format, gpa);
                 } else if (f.defaultValue()) |d| {
                     @field(out, f.name) = d;
                 }
@@ -749,19 +1011,109 @@ test "decode json/bytes/array cells" {
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
 
-    const j = try decodeCell(Json, "{\"x\": 2}", pq.proto.Oid.jsonb, gpa);
+    const j = try decodeCell(Json, "{\"x\": 2}", pq.proto.Oid.jsonb, 0, gpa);
     try testing.expectEqualStrings("{\"x\": 2}", j.data);
 
-    const b = try decodeCell(Bytes, "\\xdead", pq.proto.Oid.bytea, gpa);
+    const b = try decodeCell(Bytes, "\\xdead", pq.proto.Oid.bytea, 0, gpa);
     try testing.expectEqualSlices(u8, &.{ 0xde, 0xad }, b.data);
 
-    const ints = try decodeCell([]const i64, "{10,20,30}", pq.proto.Oid.int8_array, gpa);
+    const ints = try decodeCell([]const i64, "{10,20,30}", pq.proto.Oid.int8_array, 0, gpa);
     try testing.expectEqualSlices(i64, &.{ 10, 20, 30 }, ints);
 
-    const strs = try decodeCell([]const []const u8, "{\"a b\",c}", pq.proto.Oid.text_array, gpa);
+    const strs = try decodeCell([]const []const u8, "{\"a b\",c}", pq.proto.Oid.text_array, 0, gpa);
     try testing.expectEqual(@as(usize, 2), strs.len);
     try testing.expectEqualStrings("a b", strs[0]);
     try testing.expectEqualStrings("c", strs[1]);
 
-    try testing.expectError(error.TypeMismatch, decodeCell([]const i64, "{{1},{2}}", pq.proto.Oid.int8_array, gpa));
+    try testing.expectError(error.TypeMismatch, decodeCell([]const i64, "{{1},{2}}", pq.proto.Oid.int8_array, 0, gpa));
+}
+
+test "binary i64 decode" {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(i64, &buf, 42, .big);
+    const v = try decodeBinary(i64, &buf, pq.proto.Oid.int8, testing.allocator);
+    try testing.expectEqual(@as(i64, 42), v);
+}
+
+test "2-D text format round trip" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const m = [_][]const i64{ &.{ 1, 2 }, &.{ 3, 4 } };
+    const p = try arrayParam([]const i64, &m, arena);
+    try testing.expectEqualStrings("{{1,2},{3,4}}", p.data);
+    try testing.expectEqual(proto.Oid.int8_array, p.oid);
+
+    const back = try parseArrayText([]const i64, "{{1,2},{3,4}}", arena);
+    try testing.expectEqual(@as(usize, 2), back.len);
+    try testing.expectEqualSlices(i64, &.{ 1, 2 }, back[0]);
+    try testing.expectEqualSlices(i64, &.{ 3, 4 }, back[1]);
+}
+
+test "binary array decode with nulls and 2 dims" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    // 1-D int8[] {1,NULL,3}: ndim=1, flags=1(hasnull), oid=20, dims=[3]
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    const be32 = struct {
+        fn w(list: *std.ArrayList(u8), a: std.mem.Allocator, v: i32) !void {
+            var b: [4]u8 = undefined;
+            std.mem.writeInt(i32, &b, v, .big);
+            try list.appendSlice(a, &b);
+        }
+    }.w;
+    try be32(&buf, testing.allocator, 1); // ndim
+    try be32(&buf, testing.allocator, 1); // flags
+    try be32(&buf, testing.allocator, 20); // elem oid
+    try be32(&buf, testing.allocator, 3); // dim 0
+    try be32(&buf, testing.allocator, 1); // lower bound
+    try be32(&buf, testing.allocator, 8);
+    try buf.appendSlice(testing.allocator, &.{ 0, 0, 0, 0, 0, 0, 0, 1 });
+    try be32(&buf, testing.allocator, -1); // NULL
+    try be32(&buf, testing.allocator, 8);
+    try buf.appendSlice(testing.allocator, &.{ 0, 0, 0, 0, 0, 0, 0, 3 });
+
+    const got = try decodeCell([]const ?i64, buf.items, pq.proto.Oid.int8_array, 1, gpa);
+    try testing.expectEqual(@as(usize, 3), got.len);
+    try testing.expectEqual(@as(?i64, 1), got[0]);
+    try testing.expectEqual(@as(?i64, null), got[1]);
+    try testing.expectEqual(@as(?i64, 3), got[2]);
+}
+
+test "binary 2-D array decode" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    const be32 = struct {
+        fn w(list: *std.ArrayList(u8), a: std.mem.Allocator, v: i32) !void {
+            var b: [4]u8 = undefined;
+            std.mem.writeInt(i32, &b, v, .big);
+            try list.appendSlice(a, &b);
+        }
+    }.w;
+    try be32(&buf, testing.allocator, 2); // ndim
+    try be32(&buf, testing.allocator, 0); // flags
+    try be32(&buf, testing.allocator, 20); // elem oid
+    try be32(&buf, testing.allocator, 2); // dim 0
+    try be32(&buf, testing.allocator, 1); // lb
+    try be32(&buf, testing.allocator, 2); // dim 1
+    try be32(&buf, testing.allocator, 1); // lb
+    for ([_]i64{ 1, 2, 3, 4 }) |v| {
+        try be32(&buf, testing.allocator, 8);
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(i64, &b, v, .big);
+        try buf.appendSlice(testing.allocator, &b);
+    }
+
+    const got = try decodeCell([]const []const i64, buf.items, pq.proto.Oid.int8_array, 1, gpa);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqualSlices(i64, &.{ 1, 2 }, got[0]);
+    try testing.expectEqualSlices(i64, &.{ 3, 4 }, got[1]);
 }

@@ -83,6 +83,9 @@ pub const Config = struct {
     database: []const u8 = "",
     ssl_mode: SslMode = .disable,
     application_name: []const u8 = "zorm",
+    /// Request results in binary format and decode them (default). Set to
+    /// false for exotic column types that lack binary output functions.
+    binary_results: bool = true,
 };
 
 /// A query parameter in its driver-level form. The ORM layer converts
@@ -115,6 +118,8 @@ pub const Result = struct {
     pub const Column = struct {
         name: []const u8,
         type_oid: u32,
+        /// 0 = text format, 1 = binary format (mirrors RowDescription).
+        format: u16 = 0,
     };
 
     pub const Row = []const ?[]const u8;
@@ -608,7 +613,13 @@ pub const Conn = struct {
         for (params) |p| try c.writeU16(p.format);
         try c.writeU16(@intCast(params.len));
         for (params) |p| try c.writeParam(p);
-        try c.writeU16(0); // result format codes: all text
+        // Result format: all-binary when enabled, all-text otherwise.
+        if (c.cfg.binary_results) {
+            try c.writeU16(1);
+            try c.writeU16(1);
+        } else {
+            try c.writeU16(0);
+        }
         try c.frameEndAt(pos);
 
         // Describe portal
@@ -674,7 +685,8 @@ pub const Conn = struct {
                         const name = try a.dupe(u8, m.data[i..name_end]);
                         if (name_end + 18 > m.data.len) return error.ProtocolViolation;
                         const type_oid = std.mem.readInt(u32, m.data[name_end + 7 ..][0..4], .big);
-                        try columns.append(a, .{ .name = name, .type_oid = type_oid });
+                        const col_format = std.mem.readInt(u16, m.data[name_end + 17 ..][0..2], .big);
+                        try columns.append(a, .{ .name = name, .type_oid = type_oid, .format = col_format });
                         i = name_end + 19; // NUL + table oid(4) + attr(2) + oid(4) + len(2) + mod(4) + format(2)
                     }
                     result.columns = columns.items;

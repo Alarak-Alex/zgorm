@@ -8,13 +8,14 @@ A GORM-inspired ORM for Zig 0.16. **PostgreSQL first**, with a pure-Zig PostgreS
 
 - **Pure-Zig PostgreSQL driver**: protocol 3.0, `SCRAM-SHA-256` / `MD5` / cleartext auth; simple query and extended query protocols (Parse/Bind/Describe/Execute, parameterized against SQL injection)
 - **Binary-format parameters**: scalars (ints/floats/bools/timestamps) are sent in binary format with explicit type OIDs; `bytea` travels raw — better performance and precision
-- **Array & JSON columns**: `[]const i64`, `[]const f64`, `[]const bool`, `[]const []const u8` (text[]), plus `z.Json` (jsonb) and `z.Bytes` (bytea)
+- **Array & JSON columns**: 1-D and multi-dimensional numeric/boolean arrays (`[]const i64`, `[][]const i64`, ...), text arrays (`[]const []const u8` = text[]), NULL elements via optional element types (`[]const ?f64`), plus `z.Json` (jsonb) and `z.Bytes` (bytea)
+- **Binary-format results**: result sets are decoded from PostgreSQL's binary format (arrays, timestamps, jsonb, numeric scalars...) — opt out via `Config.binary_results = false`
 - **Comptime model reflection**: plain Zig structs are models — no macros, no codegen, zero runtime registration
 - **Convention over configuration**: camelCase → snake_case, `id` as the default primary key, auto-filled `created_at`/`updated_at`
 - **GORM-style query builder**: `where` / `orWhere` / `whereEq` / `whereIn` / `order_by` / `limit` / `offset` / `group_by` / `having` / `for_update`, with automatic renumbering of `$1,$2...` placeholders across chained conditions
 - **CRUD + transactions + pool**: `insert` (auto-increment ids filled back), `insertBatch` (auto-chunked, max 65535 params), `update`, `save`, `delete`, `deleteWhere`, `updateWhere`, `find`, transactions `commit/rollback`
 - **autoMigrate**: creates tables, adds missing columns, creates indexes (unique/regular)
-- **Associations & preloading**: `has_many` / `belongs_to` declarations + `query.preload("posts")` batch-loads children — no N+1
+- **Associations & preloading**: `has_many` / `belongs_to` declarations + `query.preload("posts.comments")` nested preloading, batch-loaded per level — no N+1
 - **Model hooks**: `beforeSave` / `beforeCreate` / `afterCreate` / `beforeUpdate` / `afterUpdate` / `beforeDelete` / `afterDelete` / `afterFind`
 - **Savepoints / nested transactions**: `tx.begin()` creates a savepoint, `commit()` releases it, `rollback()` rolls back to it
 - **Migration version management**: `Migrator` applies/rolls back versioned SQL migrations tracked in a `schema_migrations` table
@@ -156,6 +157,13 @@ Parameters: `host`, `port`, `user`, `password`, `dbname`/`database`, `sslmode`, 
 
 ### Associations & preloading
 
+Preload paths nest with dots and are validated at compile time:
+
+```zig
+const authors = try z.query(Author, db).preload("posts.comments").all(gpa);
+// authors[0].posts[i].comments[j] are filled
+```
+
 ```zig
 pub const Author = struct {
     id: ?i64 = null,
@@ -250,8 +258,8 @@ Integration tests cover: table creation/migration, insert with id back-fill, uni
 
 ## Design notes & trade-offs
 
-- **Parameter format**: parameters are sent in binary format with explicit type OIDs (scalars, bytea, timestamps); arrays, JSON and enums use text format. Results are decoded from PostgreSQL's text format.
-- **Preloading is one level deep**: no nested preload chains; string/array values of preloaded rows are deep-copied per parent.
+- **Wire formats**: parameters are binary for scalars (int8/float8/bool/timestamptz/bytea/text with explicit OIDs) and text for arrays/JSON/enums; results are decoded from PostgreSQL's binary format by default (`Config.binary_results = false` to opt out for exotic column types).
+- **Preloading**: any depth via dotted paths; string/array values of preloaded rows are deep-copied per parent. Multi-dimensional arrays are supported for numeric/boolean element types; text arrays are 1-D.
 - **autoMigrate** only creates tables, adds missing columns and single-column indexes — it never drops columns or changes types. Use `Migrator` for anything more involved.
 - **SQL injection surface**: values are always parameterized; `order_by`, `group_by`, `having` and `select` column names are string-interpolated (same as GORM) — never pass user input there.
 - **Concurrency**: `Db`/the connection pool are thread-safe (`std.Io.Mutex`/`Condition`); a single `pq.Conn` and a `Session` with an in-flight operation are not.
@@ -264,9 +272,9 @@ Integration tests cover: table creation/migration, insert with id back-fill, uni
 - [x] Model hooks (BeforeSave etc.) (v0.2.0)
 - [x] Savepoints / nested transactions (v0.2.0)
 - [x] Migration version management (schema_migrations) (v0.2.0)
-- [ ] Binary-format result decoding
-- [ ] Multi-dimensional arrays / full NULL array elements
-- [ ] Nested preloading (preload of preloads)
+- [x] Nested preloading (v0.3.0)
+- [x] Binary-format result decoding (v0.3.0)
+- [x] Multi-dimensional arrays / full NULL array elements (v0.3.0)
 - [ ] MySQL/SQLite drivers
 
 ## License

@@ -8,13 +8,14 @@
 
 - **纯 Zig PostgreSQL 驱动**：协议 3.0，支持 `SCRAM-SHA-256`、`MD5`、明文认证；简单查询与扩展查询（Parse/Bind/Describe/Execute，参数化防注入）
 - **二进制格式参数**：标量（整数/浮点/布尔/时间）以二进制格式发送并显式声明类型 OID，`bytea` 原样收发，性能与精度更佳
-- **数组与 JSON 列**：`[]const i64`、`[]const f64`、`[]const bool`、`[]const []const u8`（text[]）与 `z.Json`（jsonb）、`z.Bytes`（bytea）
+- **数组与 JSON 列**：一维与多维数值/布尔数组（`[]const i64`、`[][]const i64`…）、text 数组（`[]const []const u8`）、可选元素类型的 NULL 元素（`[]const ?f64`），以及 `z.Json`（jsonb）、`z.Bytes`（bytea）
+- **结果集二进制格式解码**：查询结果默认从 PostgreSQL 二进制格式解码（数组、时间戳、jsonb 等）——`Config.binary_results = false` 可关闭
 - **comptime 模型反射**：普通 Zig 结构体即模型，无宏、无代码生成、运行时零注册
 - **约定优于配置**：驼峰转 snake_case、`id` 默认主键、`created_at`/`updated_at` 自动时间戳
 - **GORM 风格查询构建器**：`where` / `orWhere` / `whereEq` / `whereIn` / `order_by` / `limit` / `offset` / `group_by` / `having` / `for_update`，占位符 `$1,$2...` 跨条件自动重编号
 - **CRUD + 事务 + 连接池**：`insert`（自动回填自增主键）、`insertBatch`（自动分块、最多 65535 参数）、`update`、`save`、`delete`、`deleteWhere`、`updateWhere`、`find`、事务 `commit/rollback`
 - **autoMigrate**：建表、补列、创建索引（唯一/普通）
-- **关联与预加载**：`has_many` / `belongs_to` 声明 + `query.preload("posts")` 批量装配，避免 N+1
+- **关联与预加载**：`has_many` / `belongs_to` 声明 + `query.preload("posts.comments")` 嵌套预加载，逐层批量装配，避免 N+1
 - **模型 hook**：`beforeSave` / `beforeCreate` / `afterCreate` / `beforeUpdate` / `afterUpdate` / `beforeDelete` / `afterDelete` / `afterFind`
 - **Savepoint / 嵌套事务**：`tx.begin()` 创建 savepoint，`commit()` 释放、`rollback()` 回滚到保存点
 - **迁移版本管理**：`Migrator` 基于 `schema_migrations` 表按版本应用/回滚 SQL 迁移
@@ -155,6 +156,13 @@ host=/var/run/postgresql user=pg dbname=app          # unix socket 目录
 
 ### 关联与预加载
 
+预加载路径用点号嵌套，整条路径在编译期校验：
+
+```zig
+const authors = try z.query(Author, db).preload("posts.comments").all(gpa);
+// authors[0].posts[i].comments[j] 已填充
+```
+
 ```zig
 pub const Author = struct {
     id: ?i64 = null,
@@ -249,8 +257,8 @@ zig build -Doptimize=ReleaseFast              # 发布构建
 
 ## 设计与取舍
 
-- **参数格式**：参数以二进制格式发送并显式声明类型 OID（标量、bytea、时间戳）；数组、JSON、枚举走文本格式。结果统一按 PostgreSQL 文本格式解码。
-- **预加载一层**：不支持嵌套预加载链；预加载行的字符串/数组值会按父行深拷贝。
+- **线格式**：参数对标量（int8/float8/bool/timestamptz/bytea/text）用二进制格式并显式声明 OID，数组/JSON/枚举走文本；结果默认按 PostgreSQL 二进制格式解码（`Config.binary_results = false` 可为特殊列类型关闭）。
+- **预加载**：点号路径支持任意深度；预加载行的字符串/数组值会按父行深拷贝。多维数组仅支持数值/布尔元素；text 数组为一维。
 - **autoMigrate** 仅限建表/补列/单列索引，不删列不改类型；更复杂的变更请用 `Migrator`。
 - **SQL 注入面**：值一律参数化；`order_by`、`group_by`、`having`、`select` 列名为字符串拼接（同 GORM），请勿拼接用户输入。
 - **并发**：`Db`/连接池线程安全（`std.Io.Mutex`/`Condition`）；单个 `pq.Conn` 与进行中的 `Session` 非线程安全。
@@ -263,9 +271,9 @@ zig build -Doptimize=ReleaseFast              # 发布构建
 - [x] 模型 hook（BeforeSave 等）（v0.2.0）
 - [x] Savepoint / 嵌套事务（v0.2.0）
 - [x] 迁移版本管理（schema_migrations）（v0.2.0）
-- [ ] 结果集二进制格式解码
-- [ ] 多维数组 / 数组元素的 NULL 完整支持
-- [ ] 嵌套预加载（preload 的 preload）
+- [x] 嵌套预加载（v0.3.0）
+- [x] 结果集二进制格式解码（v0.3.0）
+- [x] 多维数组 / 数组元素的 NULL 完整支持（v0.3.0）
 - [ ] MySQL/SQLite 驱动
 
 ## License

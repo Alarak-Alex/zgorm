@@ -168,6 +168,7 @@ pub const Session = struct {
                 FType,
                 res.rows[0][0],
                 res.columns[0].type_oid,
+                res.columns[0].format,
                 s.gpa,
             );
         }
@@ -276,6 +277,7 @@ pub const Session = struct {
                     FType,
                     res.rows[r][0],
                     res.columns[0].type_oid,
+                    res.columns[0].format,
                     s.gpa,
                 );
             }
