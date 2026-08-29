@@ -18,6 +18,7 @@ A GORM-inspired ORM for Zig 0.16. **PostgreSQL first**, with a pure-Zig PostgreS
 - **Associations & preloading**: `has_many` / `belongs_to` declarations + `query.preload("posts.comments")` nested preloading, batch-loaded per level — no N+1
 - **Model hooks**: `beforeSave` / `beforeCreate` / `afterCreate` / `beforeUpdate` / `afterUpdate` / `beforeDelete` / `afterDelete` / `afterFind`
 - **Savepoints / nested transactions**: `tx.begin()` creates a savepoint, `commit()` releases it, `rollback()` rolls back to it
+- **Soft delete**: models with a `deleted_at` column (including `z.Model`) filter soft-deleted rows from queries and turn `delete` into a stamp; `unscoped()`, `deleteHard` and `restore` opt out
 - **Migration version management**: `Migrator` applies/rolls back versioned SQL migrations tracked in a `schema_migrations` table
 - **Type mapping**: integers / floats / `bool` / `[]const u8` (text) / `[]u8` / enums (stored by name) / `zorm.Time` (timestamptz, microsecond precision) — plus optionals of all of those
 - **Errors carry context**: server errors map to typed errors (`UniqueViolation`, `ForeignKeyViolation`, `SerializationFailure`, ...), with SQLSTATE, message and constraint details available via `lastError`
@@ -219,6 +220,21 @@ pub const User = struct {
 };
 ```
 Available hooks: `beforeSave`, `beforeCreate`, `afterCreate`, `beforeUpdate`, `afterUpdate`, `beforeDelete`, `afterDelete`, `afterFind` (declare them on the model, all optional; return `z.Error!void`, use `error.HookAborted` to abort the operation).
+
+### Soft delete
+
+Models with a `deleted_at` column (`?z.Time` or `?i64`, also included in `z.Model`) get GORM-style soft deletes:
+
+```zig
+_ = try db.delete(&user);            // UPDATE ... SET deleted_at = now()
+_ = try db.find(User, id);           // excludes soft-deleted rows
+_ = try z.query(User, db).count();   // filtered too; update/deleteWhere as well
+
+_ = try z.query(User, db).unscoped().count();  // include soft-deleted rows
+_ = try db.restore(&user);           // clear deleted_at by primary key
+_ = try db.deleteHard(&user);        // real DELETE
+_ = try db.deleteWhereHard(User, "age < $1", .{5});
+```
 
 ### Nested transactions (savepoints)
 

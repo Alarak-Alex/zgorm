@@ -12,6 +12,7 @@ const std = @import("std");
 const pq = @import("../pq.zig");
 const db_mod = @import("db.zig");
 const schema = @import("schema.zig");
+const time_mod = @import("time.zig");
 const value = @import("value.zig");
 
 pub const Error = pq.Error;
@@ -37,6 +38,9 @@ pub fn Query(comptime T: type) type {
         is_distinct: bool = false,
         /// Comptime-verified association field names to preload.
         preloads: std.ArrayList([]const u8) = .empty,
+        /// When true, soft-deleted rows are included and terminal `delete`
+        /// performs a real DELETE.
+        unscoped_flag: bool = false,
         conds: std.ArrayList(Cond) = .empty,
         freed: bool = false,
         args: std.ArrayList(pq.Param) = .empty,
@@ -87,6 +91,13 @@ pub fn Query(comptime T: type) type {
         /// numbered starting at $1 for this condition's own args.
         pub fn where(q: *Self, frag: []const u8, args: anytype) *Self {
             return q.addCond(frag, args, false);
+        }
+
+        /// Includes soft-deleted rows in the query (models with a
+        /// `deleted_at` column); terminal `delete` becomes a hard DELETE.
+        pub fn unscoped(q: *Self) *Self {
+            q.unscoped_flag = true;
+            return q;
         }
 
         /// Eager-loads a declared association (`has_many` fills the slice
@@ -195,10 +206,19 @@ pub fn Query(comptime T: type) type {
         // ------------------------------------------------------------ build
 
         /// Writes `WHERE ...` (or nothing when no conditions) into `w`.
+        /// Prepends the soft-delete filter unless unscoped.
         fn buildWhere(q: *Self, w: *std.Io.Writer) !void {
+            var wrote_filter = false;
+            if (comptime table.softDeletable()) {
+                if (!q.unscoped_flag) {
+                    const del_col = table.columns[table.deleted_at_index.?];
+                    try w.print(" WHERE {s} IS NULL", .{try quoteIdent(q.a(), del_col.name)});
+                    wrote_filter = true;
+                }
+            }
             for (q.conds.items, 0..) |cond, i| {
                 if (i == 0) {
-                    try w.writeAll(" WHERE ");
+                    try w.writeAll(if (wrote_filter) " AND " else " WHERE ");
                 } else {
                     try w.writeAll(if (cond.is_or) " OR " else " AND ");
                 }
@@ -381,6 +401,17 @@ pub fn Query(comptime T: type) type {
             q.deinit();
             return affected;
         }
+    };
+}
+
+/// SQL expression used to stamp a soft-delete `deleted_at` column. Uses the
+/// database clock so all writers agree on time.
+pub fn softDeleteStampSql(comptime FType: type) []const u8 {
+    const E = if (@typeInfo(FType) == .optional) @typeInfo(FType).optional.child else FType;
+    return switch (E) {
+        time_mod.Time => "now()",
+        i64 => "(extract(epoch from now()) * 1000000)::bigint",
+        else => @compileError("zorm: deleted_at must be zorm.Time or i64"),
     };
 }
 

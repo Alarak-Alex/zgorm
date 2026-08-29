@@ -18,6 +18,7 @@
 - **关联与预加载**：`has_many` / `belongs_to` 声明 + `query.preload("posts.comments")` 嵌套预加载，逐层批量装配，避免 N+1
 - **模型 hook**：`beforeSave` / `beforeCreate` / `afterCreate` / `beforeUpdate` / `afterUpdate` / `beforeDelete` / `afterDelete` / `afterFind`
 - **Savepoint / 嵌套事务**：`tx.begin()` 创建 savepoint，`commit()` 释放、`rollback()` 回滚到保存点
+- **软删除**：模型带 `deleted_at` 列（含 `z.Model`）时，查询自动过滤已删除行，`delete` 变为打戳；`unscoped()`、`deleteHard` 与 `restore` 可绕过或恢复
 - **迁移版本管理**：`Migrator` 基于 `schema_migrations` 表按版本应用/回滚 SQL 迁移
 - **类型映射**：整数/浮点/`bool`/`[]const u8`(text)/`[]u8`/枚举(按名存储)/`zorm.Time`(timestamptz, 微秒精度) 及其可选版本
 - **错误携带上下文**：服务器错误映射为类型化错误（`UniqueViolation`、`ForeignKeyViolation`、`SerializationFailure`…），并可通过 `lastError` 读取 SQLSTATE、消息、约束名等明细
@@ -216,6 +217,21 @@ pub const User = struct {
 };
 ```
 可用 hook：`beforeSave`、`beforeCreate`、`afterCreate`、`beforeUpdate`、`afterUpdate`、`beforeDelete`、`afterDelete`、`afterFind`（在模型上声明即可，可选实现；返回 `z.Error!void`，可用 `error.HookAborted` 中止操作）。
+
+### 软删除
+
+模型带 `deleted_at` 列（`?z.Time` 或 `?i64`，`z.Model` 已内含）即启用 GORM 风格软删除：
+
+```zig
+_ = try db.delete(&user);            // UPDATE ... SET deleted_at = now()
+_ = try db.find(User, id);           // 自动过滤已删除行
+_ = try z.query(User, db).count();   // count/update/deleteWhere 同样过滤
+
+_ = try z.query(User, db).unscoped().count();  // 包含已删除行
+_ = try db.restore(&user);           // 按主键清除 deleted_at
+_ = try db.deleteHard(&user);        // 真 DELETE
+_ = try db.deleteWhereHard(User, "age < $1", .{5});
+```
 
 ### 嵌套事务（Savepoint）
 

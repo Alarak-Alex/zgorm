@@ -339,6 +339,10 @@ pub const Session = struct {
             }
         }
         w.print(" WHERE {s} = ${d}", .{ try qb_mod.quoteIdent(arena, pkc.name), np + 1 }) catch return error.OutOfMemory;
+        if (comptime table.softDeletable()) {
+            const del_col = table.columns[table.deleted_at_index.?];
+            w.print(" AND {s} IS NULL", .{try qb_mod.quoteIdent(arena, del_col.name)}) catch return error.OutOfMemory;
+        }
         params.append(arena, try value.toParam(value.getColumn(m, pkc), arena)) catch return error.OutOfMemory;
 
         var res = try s.runExec(b.slice(), params.items);
@@ -384,11 +388,71 @@ pub const Session = struct {
         const arena = arena_state.allocator();
 
         var b = SqlBuf.init(arena);
+        const w = b.w();
+        const soft = comptime table.softDeletable();
+        const params = try arena.alloc(pq.Param, 1);
+        params[0] = try value.toParam(value.getColumn(m, pkc), arena);
+
+        if (soft) {
+            // Soft delete: stamp deleted_at instead of removing the row.
+            const del_col = table.columns[table.deleted_at_index.?];
+            w.print("UPDATE {s} SET {s} = {s} WHERE {s} = $1", .{
+                try qb_mod.quoteIdent(arena, table.name),
+                try qb_mod.quoteIdent(arena, del_col.name),
+                qb_mod.softDeleteStampSql(value.columnFieldType(T, del_col)),
+                try qb_mod.quoteIdent(arena, pkc.name),
+            }) catch return error.OutOfMemory;
+        } else {
+            w.print("DELETE FROM {s} WHERE {s} = $1", .{
+                try qb_mod.quoteIdent(arena, table.name),
+                try qb_mod.quoteIdent(arena, pkc.name),
+            }) catch return error.OutOfMemory;
+        }
+
+        var res = try s.runExec(b.slice(), params);
+        defer res.deinit();
+        const affected = res.affected;
+
+        if (soft) {
+            // Reflect the stamp in the in-memory model (GORM behaviour).
+            const del_col = table.columns[table.deleted_at_index.?];
+            const FType = value.columnFieldType(T, del_col);
+            const now = Time.now(s.io);
+            switch (FType) {
+                Time, ?Time => value.setColumn(m, del_col, now),
+                i64, ?i64 => value.setColumn(m, del_col, now.micros),
+                else => {},
+            }
+        }
+
+        try callHook(T, "afterDelete", m, s);
+        return affected;
+    }
+
+    /// Hard-deletes the model row even when the model has a `deleted_at`
+    /// column. Returns affected rows.
+    pub fn deleteHard(s: *Session, m: anytype) Error!i64 {
+        const MP = @typeInfo(@TypeOf(m));
+        if (MP != .pointer or MP.pointer.size != .one)
+            @compileError("zorm: deleteHard expects a pointer to a model");
+        const T = MP.pointer.child;
+        const table = comptime schema.tableOf(T);
+        if (table.pk_index == null) @compileError("zorm: model has no primary key");
+        const pkc = table.columns[table.pk_index.?];
+        if (isZeroValue(value.getColumn(m, pkc))) return error.NullValue;
+
+        try callHook(T, "beforeDelete", m, s);
+
+        var arena_state = std.heap.ArenaAllocator.init(s.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var b = SqlBuf.init(arena);
         b.w().print("DELETE FROM {s} WHERE {s} = $1", .{
             try qb_mod.quoteIdent(arena, table.name),
             try qb_mod.quoteIdent(arena, pkc.name),
         }) catch return error.OutOfMemory;
-        var params = try arena.alloc(pq.Param, 1);
+        const params = try arena.alloc(pq.Param, 1);
         params[0] = try value.toParam(value.getColumn(m, pkc), arena);
 
         var res = try s.runExec(b.slice(), params);
@@ -399,21 +463,77 @@ pub const Session = struct {
         return affected;
     }
 
-    /// `DELETE FROM table WHERE (frag)`, returns affected rows.
+    /// Undoes a soft delete by primary key (sets `deleted_at` back to NULL).
+    pub fn restore(s: *Session, m: anytype) Error!i64 {
+        const MP = @typeInfo(@TypeOf(m));
+        if (MP != .pointer or MP.pointer.size != .one)
+            @compileError("zorm: restore expects a pointer to a model");
+        const T = MP.pointer.child;
+        const table = comptime schema.tableOf(T);
+        if (table.deleted_at_index == null) @compileError("zorm: restore requires a deleted_at column");
+        if (table.pk_index == null) @compileError("zorm: model has no primary key");
+        const pkc = table.columns[table.pk_index.?];
+        const del_col = table.columns[table.deleted_at_index.?];
+        if (isZeroValue(value.getColumn(m, pkc))) return error.NullValue;
+
+        var arena_state = std.heap.ArenaAllocator.init(s.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var b = SqlBuf.init(arena);
+        b.w().print("UPDATE {s} SET {s} = NULL WHERE {s} = $1", .{
+            try qb_mod.quoteIdent(arena, table.name),
+            try qb_mod.quoteIdent(arena, del_col.name),
+            try qb_mod.quoteIdent(arena, pkc.name),
+        }) catch return error.OutOfMemory;
+        const params = try arena.alloc(pq.Param, 1);
+        params[0] = try value.toParam(value.getColumn(m, pkc), arena);
+
+        var res = try s.runExec(b.slice(), params);
+        defer res.deinit();
+        const affected = res.affected;
+        if (affected > 0) value.setColumn(m, del_col, null);
+        return affected;
+    }
+
+    /// Soft-deletes matching rows when the model has `deleted_at`, otherwise
+    /// performs a real DELETE. Returns affected rows.
     pub fn deleteWhere(s: *Session, comptime T: type, frag: []const u8, args: anytype) Error!i64 {
+        return s.deleteWhereImpl(T, frag, args, false);
+    }
+
+    /// Hard variant of `deleteWhere`: always performs a real DELETE.
+    pub fn deleteWhereHard(s: *Session, comptime T: type, frag: []const u8, args: anytype) Error!i64 {
+        return s.deleteWhereImpl(T, frag, args, true);
+    }
+
+    fn deleteWhereImpl(s: *Session, comptime T: type, frag: []const u8, args: anytype, comptime force_hard: bool) Error!i64 {
         var arena_state = std.heap.ArenaAllocator.init(s.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         const table = comptime schema.tableOf(T);
+        const soft = comptime table.softDeletable() and !force_hard;
 
         var b = SqlBuf.init(arena);
         const w = b.w();
-        w.print("DELETE FROM {s} WHERE (", .{try qb_mod.quoteIdent(arena, table.name)}) catch return error.OutOfMemory;
-        qb_mod.writeRenumbered(w, frag, 0) catch return error.OutOfMemory;
-        w.writeByte(')') catch return error.OutOfMemory;
+        const params_list = try value.argsToParams(args, arena);
 
-        const params = try value.argsToParams(args, arena);
-        var res = try s.runExec(b.slice(), params);
+        if (soft) {
+            const del_col = table.columns[table.deleted_at_index.?];
+            w.print("UPDATE {s} SET {s} = {s} WHERE (", .{
+                try qb_mod.quoteIdent(arena, table.name),
+                try qb_mod.quoteIdent(arena, del_col.name),
+                qb_mod.softDeleteStampSql(value.columnFieldType(T, del_col)),
+            }) catch return error.OutOfMemory;
+            qb_mod.writeRenumbered(w, frag, 0) catch return error.OutOfMemory;
+            w.writeAll(") AND deleted_at IS NULL") catch return error.OutOfMemory;
+        } else {
+            w.print("DELETE FROM {s} WHERE (", .{try qb_mod.quoteIdent(arena, table.name)}) catch return error.OutOfMemory;
+            qb_mod.writeRenumbered(w, frag, 0) catch return error.OutOfMemory;
+            w.writeByte(')') catch return error.OutOfMemory;
+        }
+
+        var res = try s.runExec(b.slice(), params_list);
         defer res.deinit();
         return res.affected;
     }
@@ -448,6 +568,10 @@ pub const Session = struct {
         w.writeAll(" WHERE (") catch return error.OutOfMemory;
         qb_mod.writeRenumbered(w, frag, SetsInfo.fields.len) catch return error.OutOfMemory;
         w.writeByte(')') catch return error.OutOfMemory;
+        if (comptime table.softDeletable()) {
+            const del_col = table.columns[table.deleted_at_index.?];
+            w.print(" AND {s} IS NULL", .{try qb_mod.quoteIdent(arena, del_col.name)}) catch return error.OutOfMemory;
+        }
 
         const cond_params = try value.argsToParams(args, arena);
         params.appendSlice(arena, cond_params) catch return error.OutOfMemory;
@@ -470,10 +594,15 @@ pub const Session = struct {
         const arena = arena_state.allocator();
 
         var b = SqlBuf.init(arena);
-        b.w().print("SELECT * FROM {s} WHERE {s} = $1 LIMIT 1", .{
+        b.w().print("SELECT * FROM {s} WHERE {s} = $1", .{
             try qb_mod.quoteIdent(arena, table.name),
             try qb_mod.quoteIdent(arena, pkc.name),
         }) catch return error.OutOfMemory;
+        if (comptime table.softDeletable()) {
+            const del_col = table.columns[table.deleted_at_index.?];
+            b.w().print(" AND {s} IS NULL", .{try qb_mod.quoteIdent(arena, del_col.name)}) catch return error.OutOfMemory;
+        }
+        b.w().writeAll(" LIMIT 1") catch return error.OutOfMemory;
         const params = try arena.alloc(pq.Param, 1);
         params[0] = try value.toParam(pk, arena);
 
@@ -813,6 +942,15 @@ pub const Tx = struct {
     pub fn deleteWhere(t: *Tx, comptime T: type, frag: []const u8, args: anytype) Error!i64 {
         return t.sess.deleteWhere(T, frag, args);
     }
+    pub fn deleteHard(t: *Tx, m: anytype) Error!i64 {
+        return t.sess.deleteHard(m);
+    }
+    pub fn deleteWhereHard(t: *Tx, comptime T: type, frag: []const u8, args: anytype) Error!i64 {
+        return t.sess.deleteWhereHard(T, frag, args);
+    }
+    pub fn restore(t: *Tx, m: anytype) Error!i64 {
+        return t.sess.restore(m);
+    }
     pub fn updateWhere(t: *Tx, comptime T: type, sets: anytype, frag: []const u8, args: anytype) Error!i64 {
         return t.sess.updateWhere(T, sets, frag, args);
     }
@@ -914,6 +1052,18 @@ pub const Db = struct {
     pub fn deleteWhere(d: *Db, comptime T: type, frag: []const u8, args: anytype) Error!i64 {
         var s = d.session();
         return s.deleteWhere(T, frag, args);
+    }
+    pub fn deleteHard(d: *Db, m: anytype) Error!i64 {
+        var s = d.session();
+        return s.deleteHard(m);
+    }
+    pub fn deleteWhereHard(d: *Db, comptime T: type, frag: []const u8, args: anytype) Error!i64 {
+        var s = d.session();
+        return s.deleteWhereHard(T, frag, args);
+    }
+    pub fn restore(d: *Db, m: anytype) Error!i64 {
+        var s = d.session();
+        return s.restore(m);
     }
     pub fn updateWhere(d: *Db, comptime T: type, sets: anytype, frag: []const u8, args: anytype) Error!i64 {
         var s = d.session();

@@ -90,6 +90,9 @@ pub const Table = struct {
     pk_index: ?usize = null,
     created_at_index: ?usize = null,
     updated_at_index: ?usize = null,
+    /// Index of the `deleted_at` column when the model declares one —
+    /// enables soft-delete semantics (filter + stamped deletes).
+    deleted_at_index: ?usize = null,
     /// Columns with a UNIQUE single-column index.
     unique: []const []const u8 = &.{},
     /// Columns with a plain single-column index.
@@ -105,6 +108,11 @@ pub const Table = struct {
             if (std.mem.eql(u8, c.name, name)) return true;
         }
         return false;
+    }
+
+    /// True when the model declares a `deleted_at` column (soft delete).
+    pub fn softDeletable(t: *const Table) bool {
+        return t.deleted_at_index != null;
     }
 
     pub fn assoc(t: *const Table, comptime field_name: []const u8) ?Assoc {
@@ -266,6 +274,7 @@ pub fn tableOf(comptime T: type) Table {
     comptime var pk_index: ?usize = null;
     comptime var created_at_index: ?usize = null;
     comptime var updated_at_index: ?usize = null;
+    comptime var deleted_at_index: ?usize = null;
     // Column list index (struct fields can be skipped via `.ignore`).
     comptime var col_i: usize = 0;
 
@@ -281,6 +290,7 @@ pub fn tableOf(comptime T: type) Table {
                 if (col.is_pk) pk_index = col_i;
                 if (comptime std.mem.eql(u8, col.name, "created_at")) created_at_index = col_i;
                 if (comptime std.mem.eql(u8, col.name, "updated_at")) updated_at_index = col_i;
+                if (comptime std.mem.eql(u8, col.name, "deleted_at")) deleted_at_index = col_i;
                 col_i += 1;
             }
             continue;
@@ -335,6 +345,7 @@ pub fn tableOf(comptime T: type) Table {
         if (col.is_pk) pk_index = col_i;
         if (comptime std.mem.eql(u8, col.name, "created_at")) created_at_index = col_i;
         if (comptime std.mem.eql(u8, col.name, "updated_at")) updated_at_index = col_i;
+        if (comptime std.mem.eql(u8, col.name, "deleted_at")) deleted_at_index = col_i;
         col_i += 1;
     }
 
@@ -364,6 +375,7 @@ pub fn tableOf(comptime T: type) Table {
         .pk_index = pk_index,
         .created_at_index = created_at_index,
         .updated_at_index = updated_at_index,
+        .deleted_at_index = deleted_at_index,
         .unique = unique,
         .indexes = indexes,
     };

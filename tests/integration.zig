@@ -749,3 +749,75 @@ test "v3: issue fixes regression" {
     _ = try db.deleteWhere(Full, "true", .{});
     drop(try db.execRaw("DROP TABLE IF EXISTS v3_fix CASCADE"));
 }
+
+const SoftPost = struct {
+    id: ?i64 = null,
+    title: []const u8 = "",
+    deleted_at: ?z.Time = null, // enables soft delete
+
+    pub const zorm = .{ .table = "v4_soft" };
+};
+
+test "v4: soft delete semantics" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    defer db.deinit();
+
+    drop(try db.execRaw("DROP TABLE IF EXISTS v4_soft CASCADE"));
+    try db.autoMigrate(SoftPost);
+
+    var a = SoftPost{ .title = "alive" };
+    var b = SoftPost{ .title = "doomed" };
+    var c = SoftPost{ .title = "counted" };
+    try db.insert(&a);
+    try db.insert(&b);
+    try db.insert(&c);
+
+    // Model-level delete is a soft delete.
+    try std.testing.expectEqual(@as(i64, 1), try db.delete(&b));
+    try std.testing.expect(b.deleted_at != null);
+
+    // Filtered out of find/count/exists by default.
+    try std.testing.expect((try db.find(SoftPost, b.id.?)) == null);
+    try std.testing.expectEqual(@as(i64, 0), try z.query(SoftPost, db).whereEq("title", "doomed").count());
+    try std.testing.expectEqual(@as(i64, 2), try z.query(SoftPost, db).count());
+
+    // Update does not touch soft-deleted rows.
+    _ = try db.updateWhere(SoftPost, .{ .title = "x" }, "title = $1", .{"doomed"});
+    try std.testing.expectEqual(@as(i64, 0), try z.query(SoftPost, db).whereEq("title", "x").count());
+
+    // unscoped() sees them.
+    try std.testing.expectEqual(@as(i64, 3), try z.query(SoftPost, db).unscoped().count());
+    const doomed = (try db.find(SoftPost, b.id.?)) == null;
+    _ = doomed;
+
+    // restore brings the row back.
+    var target = SoftPost{ .id = b.id };
+    _ = try db.restore(&target);
+    try std.testing.expectEqual(@as(i64, 1), try z.query(SoftPost, db).whereEq("title", "doomed").count());
+
+    // Builder-level delete soft-deletes too.
+    _ = try z.query(SoftPost, db).whereEq("title", "counted").delete();
+    try std.testing.expectEqual(@as(i64, 0), try z.query(SoftPost, db).whereEq("title", "counted").count());
+    try std.testing.expectEqual(@as(i64, 2), try z.query(SoftPost, db).unscoped().count());
+
+    // unscoped delete is a hard delete.
+    _ = try z.query(SoftPost, db).unscoped().whereEq("title", "doomed").delete();
+    try std.testing.expectEqual(@as(i64, 1), try z.query(SoftPost, db).unscoped().count());
+
+    // Model-level hard delete.
+    var alive = (try db.find(SoftPost, a.id.?)).?;
+    defer z.free(SoftPost, alive, gpa);
+    _ = try db.deleteHard(&alive);
+    try std.testing.expectEqual(@as(i64, 0), try z.query(SoftPost, db).unscoped().count());
+
+    // deleteWhere hard variant.
+    var d2 = SoftPost{ .title = "hard" };
+    try db.insert(&d2);
+    _ = try db.deleteWhereHard(SoftPost, "title = $1", .{"hard"});
+    try std.testing.expectEqual(@as(i64, 0), try z.query(SoftPost, db).unscoped().count());
+}
