@@ -309,8 +309,18 @@ pub const Session = struct {
     }
 
     /// Updates every column of the model (except the primary key) by primary
-    /// key. `updated_at` is refreshed. Returns affected rows (0 or 1).
+    /// key. `updated_at` is refreshed. Soft-deleted rows are not updated.
+    /// Returns affected rows (0 or 1).
     pub fn update(s: *Session, m: anytype) Error!i64 {
+        return s.updateImpl(m, false);
+    }
+
+    /// Like `update`, but also updates soft-deleted rows.
+    pub fn updateUnscoped(s: *Session, m: anytype) Error!i64 {
+        return s.updateImpl(m, true);
+    }
+
+    fn updateImpl(s: *Session, m: anytype, comptime unscoped: bool) Error!i64 {
         const MP = @typeInfo(@TypeOf(m));
         if (MP != .pointer or MP.pointer.size != .one or MP.pointer.is_const)
             @compileError("zorm: update expects a mutable pointer to a model, e.g. db.update(&user)");
@@ -345,7 +355,7 @@ pub const Session = struct {
             }
         }
         w.print(" WHERE {s} = ${d}", .{ try qb_mod.quoteIdent(arena, pkc.name), np + 1 }) catch return error.OutOfMemory;
-        if (comptime table.softDeletable()) {
+        if (comptime table.softDeletable() and !unscoped) {
             const del_col = table.columns[table.deleted_at_index.?];
             w.print(" AND {s} IS NULL", .{try qb_mod.quoteIdent(arena, del_col.name)}) catch return error.OutOfMemory;
         }
@@ -590,7 +600,18 @@ pub const Session = struct {
     /// Fetches one model by primary key, or null.
     /// Returned strings are allocated with the session's gpa; release them
     /// with `zorm.free(T, value, gpa)` or decode into an arena of your own.
+    /// Fetches one model by primary key, excluding soft-deleted rows
+    /// (models with a `deleted_at` column). Use `findUnscoped` to include them.
     pub fn find(s: *Session, comptime T: type, pk: anytype) Error!?T {
+        return s.findImpl(T, pk, false);
+    }
+
+    /// Like `find`, but also matches soft-deleted rows.
+    pub fn findUnscoped(s: *Session, comptime T: type, pk: anytype) Error!?T {
+        return s.findImpl(T, pk, true);
+    }
+
+    fn findImpl(s: *Session, comptime T: type, pk: anytype, comptime unscoped: bool) Error!?T {
         const table = comptime schema.tableOf(T);
         if (table.pk_index == null) @compileError("zorm: model has no primary key");
         const pkc = table.columns[table.pk_index.?];
@@ -604,7 +625,7 @@ pub const Session = struct {
             try qb_mod.quoteIdent(arena, table.name),
             try qb_mod.quoteIdent(arena, pkc.name),
         }) catch return error.OutOfMemory;
-        if (comptime table.softDeletable()) {
+        if (comptime table.softDeletable() and !unscoped) {
             const del_col = table.columns[table.deleted_at_index.?];
             b.w().print(" AND {s} IS NULL", .{try qb_mod.quoteIdent(arena, del_col.name)}) catch return error.OutOfMemory;
         }
@@ -963,6 +984,12 @@ pub const Tx = struct {
     pub fn find(t: *Tx, comptime T: type, pk: anytype) Error!?T {
         return t.sess.find(T, pk);
     }
+    pub fn findUnscoped(t: *Tx, comptime T: type, pk: anytype) Error!?T {
+        return t.sess.findUnscoped(T, pk);
+    }
+    pub fn updateUnscoped(t: *Tx, m: anytype) Error!i64 {
+        return t.sess.updateUnscoped(m);
+    }
     pub fn query(t: *Tx, comptime T: type) *Query(T) {
         const gpa = t.sess.gpa;
         const arena = gpa.create(std.heap.ArenaAllocator) catch @panic("zorm: out of memory");
@@ -1078,6 +1105,14 @@ pub const Db = struct {
     pub fn find(d: *Db, comptime T: type, pk: anytype) Error!?T {
         var s = d.session();
         return s.find(T, pk);
+    }
+    pub fn findUnscoped(d: *Db, comptime T: type, pk: anytype) Error!?T {
+        var s = d.session();
+        return s.findUnscoped(T, pk);
+    }
+    pub fn updateUnscoped(d: *Db, m: anytype) Error!i64 {
+        var s = d.session();
+        return s.updateUnscoped(m);
     }
     pub fn begin(d: *Db) Error!Tx {
         const s = d.gpa.create(Session) catch return error.OutOfMemory;

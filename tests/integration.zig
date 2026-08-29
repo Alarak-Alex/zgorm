@@ -808,32 +808,47 @@ test "v4: soft delete semantics" {
 
     // unscoped() sees them.
     try std.testing.expectEqual(@as(i64, 3), try z.query(SoftPost, db).unscoped().count());
-    const doomed = (try db.find(SoftPost, b.id.?)) == null;
-    _ = doomed;
 
-    // restore brings the row back.
+    // findUnscoped fetches soft-deleted rows by pk; updateUnscoped can modify them.
+    const doomed = (try db.findUnscoped(SoftPost, b.id.?)).?;
+    defer z.free(SoftPost, doomed, gpa);
+    try std.testing.expectEqualStrings("doomed", doomed.title);
+    try std.testing.expect(doomed.deleted_at != null);
+    var upd = doomed;
+    upd.title = "doomed-v2";
+    try std.testing.expectEqual(@as(i64, 1), try db.updateUnscoped(&upd));
+    const renamed = (try db.findUnscoped(SoftPost, b.id.?)).?;
+    defer z.free(SoftPost, renamed, gpa);
+    try std.testing.expectEqualStrings("doomed-v2", renamed.title);
+    // default find still excludes it
+    try std.testing.expect((try db.find(SoftPost, b.id.?)) == null);
+
+    // restore brings the row back (title was renamed to "doomed-v2" above).
     var target = SoftPost{ .id = b.id };
     _ = try db.restore(&target);
-    try std.testing.expectEqual(@as(i64, 1), try z.query(SoftPost, db).whereEq("title", "doomed").count());
+    try std.testing.expectEqual(@as(i64, 1), try z.query(SoftPost, db).whereEq("title", "doomed-v2").count());
 
     // Builder-level delete soft-deletes too.
     _ = try z.query(SoftPost, db).whereEq("title", "counted").delete();
     try std.testing.expectEqual(@as(i64, 0), try z.query(SoftPost, db).whereEq("title", "counted").count());
-    try std.testing.expectEqual(@as(i64, 2), try z.query(SoftPost, db).unscoped().count());
+    try std.testing.expectEqual(@as(i64, 3), try z.query(SoftPost, db).unscoped().count());
 
-    // unscoped delete is a hard delete.
-    _ = try z.query(SoftPost, db).unscoped().whereEq("title", "doomed").delete();
-    try std.testing.expectEqual(@as(i64, 1), try z.query(SoftPost, db).unscoped().count());
+    // unscoped delete is a hard delete (removes the restored "doomed-v2";
+    // "counted" remains as a soft-deleted row).
+    _ = try z.query(SoftPost, db).unscoped().whereEq("title", "doomed-v2").delete();
+    try std.testing.expectEqual(@as(i64, 2), try z.query(SoftPost, db).unscoped().count());
 
     // Model-level hard delete.
     var alive = (try db.find(SoftPost, a.id.?)).?;
     defer z.free(SoftPost, alive, gpa);
     _ = try db.deleteHard(&alive);
-    try std.testing.expectEqual(@as(i64, 0), try z.query(SoftPost, db).unscoped().count());
+    try std.testing.expectEqual(@as(i64, 1), try z.query(SoftPost, db).unscoped().count());
 
-    // deleteWhere hard variant.
+    // deleteWhere hard variant removes the new row but the soft-deleted
+    // "counted" row remains visible under unscoped.
     var d2 = SoftPost{ .title = "hard" };
     try db.insert(&d2);
     _ = try db.deleteWhereHard(SoftPost, "title = $1", .{"hard"});
-    try std.testing.expectEqual(@as(i64, 0), try z.query(SoftPost, db).unscoped().count());
+    try std.testing.expectEqual(@as(i64, 1), try z.query(SoftPost, db).unscoped().count());
+    try std.testing.expectEqual(@as(i64, 0), try z.query(SoftPost, db).count());
 }

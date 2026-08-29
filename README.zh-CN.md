@@ -228,6 +228,8 @@ _ = try db.find(User, id);           // 自动过滤已删除行
 _ = try z.query(User, db).count();   // count/update/deleteWhere 同样过滤
 
 _ = try z.query(User, db).unscoped().count();  // 包含已删除行
+_ = try db.findUnscoped(User, id);   // 按主键取回已删除行
+_ = try db.updateUnscoped(&user);    // 更新已删除行
 _ = try db.restore(&user);           // 按主键清除 deleted_at
 _ = try db.deleteHard(&user);        // 真 DELETE
 _ = try db.deleteWhereHard(User, "age < $1", .{5});

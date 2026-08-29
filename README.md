@@ -231,6 +231,8 @@ _ = try db.find(User, id);           // excludes soft-deleted rows
 _ = try z.query(User, db).count();   // filtered too; update/deleteWhere as well
 
 _ = try z.query(User, db).unscoped().count();  // include soft-deleted rows
+_ = try db.findUnscoped(User, id);   // fetch a soft-deleted row by pk
+_ = try db.updateUnscoped(&user);    // update it too
 _ = try db.restore(&user);           // clear deleted_at by primary key
 _ = try db.deleteHard(&user);        // real DELETE
 _ = try db.deleteWhereHard(User, "age < $1", .{5});
