@@ -64,9 +64,17 @@ pub const Migrator = struct {
         var res = try s.execRaw("SELECT version FROM schema_migrations ORDER BY version");
         defer res.deinit();
         var out: std.ArrayList(i64) = .empty;
+        errdefer out.deinit(gpa);
+        if (res.rows.len > 0 and res.columns.len == 0) return error.ProtocolViolation;
         for (res.rows) |row| {
-            const cell = row[0] orelse continue;
-            const v = @import("value.zig").decodeCell(i64, cell, res.columns[0].type_oid, res.columns[0].format, gpa) catch continue;
+            if (row.len == 0) return error.ProtocolViolation;
+            const v = try @import("value.zig").decodeCell(
+                i64,
+                row[0],
+                res.columns[0].type_oid,
+                res.columns[0].format,
+                gpa,
+            );
             out.append(gpa, v) catch return error.OutOfMemory;
         }
         return out.toOwnedSlice(gpa) catch return error.OutOfMemory;
@@ -125,8 +133,15 @@ pub const Migrator = struct {
         const latest: ?i64 = blk: {
             var res = try s.execRaw("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1");
             defer res.deinit();
-            if (res.rows.len == 0 or res.rows[0][0] == null) break :blk null;
-            break :blk @import("value.zig").decodeCell(i64, res.rows[0][0], res.columns[0].type_oid, res.columns[0].format, s.gpa) catch null;
+            if (res.rows.len == 0) break :blk null;
+            if (res.rows[0].len == 0 or res.columns.len == 0) return error.ProtocolViolation;
+            break :blk try @import("value.zig").decodeCell(
+                i64,
+                res.rows[0][0],
+                res.columns[0].type_oid,
+                res.columns[0].format,
+                s.gpa,
+            );
         };
         const version = latest orelse return; // nothing applied
 

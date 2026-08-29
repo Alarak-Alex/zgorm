@@ -180,6 +180,7 @@ pub const Conn = struct {
     // ------------------------------------------------------------------ open
 
     pub fn connect(gpa: std.mem.Allocator, io: Io, cfg: Config) Error!*Conn {
+        try validateConfig(cfg);
         const stream = try openSocket(gpa, io, cfg);
         errdefer stream.close(io);
 
@@ -217,6 +218,24 @@ pub const Conn = struct {
         try c.authenticate();
         try c.awaitReady();
         return c;
+    }
+
+    fn validateConfig(cfg: Config) Error!void {
+        const fields = [_][]const u8{
+            cfg.host,
+            cfg.user,
+            cfg.password,
+            cfg.database,
+            cfg.application_name,
+        };
+        for (fields) |field| {
+            if (std.mem.indexOfScalar(u8, field, 0) != null)
+                return error.InvalidDsn;
+        }
+        if (cfg.ca_file) |file| {
+            if (std.mem.indexOfScalar(u8, file, 0) != null)
+                return error.InvalidDsn;
+        }
     }
 
     fn openSocket(gpa: std.mem.Allocator, io: Io, cfg: Config) Error!net.Stream {
@@ -261,34 +280,32 @@ pub const Conn = struct {
         // when no trusted root can be loaded.
         const CaOpt = @TypeOf(@as(std.crypto.tls.Client.Options, undefined).ca);
         var ca_opt: ?CaOpt = null;
+        var ca_bundle: ?*std.crypto.Certificate.Bundle = null;
+        errdefer if (ca_bundle) |bundle| {
+            bundle.deinit(c.gpa);
+            c.gpa.destroy(bundle);
+        };
         if (c.cfg.ssl_mode == .verify_ca or c.cfg.ssl_mode == .verify_full) {
             const bundle = c.gpa.create(std.crypto.Certificate.Bundle) catch
                 return error.OutOfMemory;
-            errdefer c.gpa.destroy(bundle);
             bundle.* = .empty;
+            ca_bundle = bundle;
             if (c.cfg.ca_file) |file| {
                 bundle.addCertsFromFilePath(c.gpa, c.io, std.Io.Timestamp.now(c.io, .real), Io.Dir.cwd(), file) catch {
-                    bundle.deinit(c.gpa);
-                    c.gpa.destroy(bundle);
                     c.broken = true;
                     return error.TlsUnsupported;
                 };
             } else {
                 bundle.rescan(c.gpa, c.io, std.Io.Timestamp.now(c.io, .real)) catch {
-                    bundle.deinit(c.gpa);
-                    c.gpa.destroy(bundle);
                     c.broken = true;
                     return error.TlsUnsupported;
                 };
             }
             if (bundle.map.count() == 0) {
                 // Fail closed: no trusted roots available.
-                bundle.deinit(c.gpa);
-                c.gpa.destroy(bundle);
                 c.broken = true;
                 return error.TlsUnsupported;
             }
-            c.ca_bundle = bundle;
             ca_opt = .{ .bundle = .{
                 .gpa = c.gpa,
                 .io = c.io,
@@ -315,6 +332,7 @@ pub const Conn = struct {
             c.broken = true;
             return error.TlsUnsupported;
         };
+        c.ca_bundle = ca_bundle;
         c.tls = tls_client;
         c.tls_mem = tls_mem;
         c.rd = &tls_client.reader;
@@ -489,6 +507,8 @@ pub const Conn = struct {
     }
 
     fn writeCStr(c: *Conn, s: []const u8) Error!void {
+        if (std.mem.indexOfScalar(u8, s, 0) != null)
+            return error.ProtocolViolation;
         try c.wbuf.appendSlice(c.gpa, s);
         try c.wbuf.append(c.gpa, 0);
     }
@@ -583,30 +603,45 @@ pub const Conn = struct {
 
     // ------------------------------------------------------- error reporting
 
-    fn storeError(c: *Conn, payload: []const u8) Error!void {
-        _ = c.err_arena_state.reset(.retain_capacity);
-        const arena = c.err_arena_state.allocator();
+    fn parseError(payload: []const u8) PgError {
         var e: PgError = .{};
         var it = std.mem.splitScalar(u8, payload, 0);
         while (it.next()) |field| {
             if (field.len < 2) break;
             const value = field[1..];
-            const dup = arena.dupe(u8, value) catch return error.OutOfMemory;
             switch (field[0]) {
-                proto.ErrField.severity => e.severity = dup,
-                proto.ErrField.code => e.code = dup,
-                proto.ErrField.message => e.message = dup,
-                proto.ErrField.detail => e.detail = dup,
-                proto.ErrField.hint => e.hint = dup,
-                proto.ErrField.position => e.position = dup,
-                proto.ErrField.schema_name => e.schema = dup,
-                proto.ErrField.table_name => e.table = dup,
-                proto.ErrField.column_name => e.column = dup,
-                proto.ErrField.constraint_name => e.constraint = dup,
+                proto.ErrField.severity => e.severity = value,
+                proto.ErrField.code => e.code = value,
+                proto.ErrField.message => e.message = value,
+                proto.ErrField.detail => e.detail = value,
+                proto.ErrField.hint => e.hint = value,
+                proto.ErrField.position => e.position = value,
+                proto.ErrField.schema_name => e.schema = value,
+                proto.ErrField.table_name => e.table = value,
+                proto.ErrField.column_name => e.column = value,
+                proto.ErrField.constraint_name => e.constraint = value,
                 else => {},
             }
         }
-        c.last_error = e;
+        return e;
+    }
+
+    fn storeError(c: *Conn, payload: []const u8) Error!void {
+        _ = c.err_arena_state.reset(.retain_capacity);
+        const arena = c.err_arena_state.allocator();
+        const src = parseError(payload);
+        c.last_error = .{
+            .severity = arena.dupe(u8, src.severity) catch return error.OutOfMemory,
+            .code = arena.dupe(u8, src.code) catch return error.OutOfMemory,
+            .message = arena.dupe(u8, src.message) catch return error.OutOfMemory,
+            .detail = arena.dupe(u8, src.detail) catch return error.OutOfMemory,
+            .hint = arena.dupe(u8, src.hint) catch return error.OutOfMemory,
+            .position = arena.dupe(u8, src.position) catch return error.OutOfMemory,
+            .schema = arena.dupe(u8, src.schema) catch return error.OutOfMemory,
+            .table = arena.dupe(u8, src.table) catch return error.OutOfMemory,
+            .column = arena.dupe(u8, src.column) catch return error.OutOfMemory,
+            .constraint = arena.dupe(u8, src.constraint) catch return error.OutOfMemory,
+        };
     }
 
     fn errorForLastError(c: *Conn) Error {
@@ -715,6 +750,11 @@ pub const Conn = struct {
     }
 
     fn collectResults(c: *Conn) Error!Result {
+        var synchronized = false;
+        errdefer {
+            if (!synchronized) c.broken = true;
+        }
+
         const arena = try c.gpa.create(std.heap.ArenaAllocator);
         arena.* = std.heap.ArenaAllocator.init(c.gpa);
         errdefer {
@@ -728,31 +768,39 @@ pub const Conn = struct {
         var rows: std.ArrayList(Result.Row) = .empty;
         var row_cells: std.ArrayList(?[]const u8) = .empty;
         var got_error = false;
+        var has_row_description = false;
 
         while (true) {
             const m = try c.readMessage();
             switch (m.tag) {
                 proto.Tag.row_description => {
                     columns.clearRetainingCapacity();
+                    rows.clearRetainingCapacity();
+                    has_row_description = true;
                     if (m.data.len < 2) return error.ProtocolViolation;
                     const nfields = std.mem.readInt(i16, m.data[0..2], .big);
+                    if (nfields < 0) return error.ProtocolViolation;
                     var i: usize = 2;
                     var f: i16 = 0;
                     while (f < nfields) : (f += 1) {
                         const name_end = std.mem.indexOfScalarPos(u8, m.data, i, 0) orelse
                             return error.ProtocolViolation;
                         const name = try a.dupe(u8, m.data[i..name_end]);
-                        if (name_end + 18 > m.data.len) return error.ProtocolViolation;
+                        if (m.data.len - name_end < 19) return error.ProtocolViolation;
                         const type_oid = std.mem.readInt(u32, m.data[name_end + 7 ..][0..4], .big);
                         const col_format = std.mem.readInt(u16, m.data[name_end + 17 ..][0..2], .big);
                         try columns.append(a, .{ .name = name, .type_oid = type_oid, .format = col_format });
                         i = name_end + 19; // NUL + table oid(4) + attr(2) + oid(4) + len(2) + mod(4) + format(2)
                     }
+                    if (i != m.data.len) return error.ProtocolViolation;
                     result.columns = columns.items;
                 },
                 proto.Tag.data_row => {
                     if (m.data.len < 2) return error.ProtocolViolation;
                     const ncols = std.mem.readInt(i16, m.data[0..2], .big);
+                    if (ncols < 0) return error.ProtocolViolation;
+                    if (!has_row_description or @as(usize, @intCast(ncols)) != columns.items.len)
+                        return error.ProtocolViolation;
                     row_cells.clearRetainingCapacity();
                     var i: usize = 2;
                     var n: i16 = 0;
@@ -760,7 +808,8 @@ pub const Conn = struct {
                         if (i + 4 > m.data.len) return error.ProtocolViolation;
                         const len = std.mem.readInt(i32, m.data[i..][0..4], .big);
                         i += 4;
-                        if (len < 0) {
+                        if (len < -1) return error.ProtocolViolation;
+                        if (len == -1) {
                             try row_cells.append(a, null);
                         } else {
                             const ulen: usize = @intCast(len);
@@ -769,14 +818,23 @@ pub const Conn = struct {
                             i += ulen;
                         }
                     }
+                    if (i != m.data.len) return error.ProtocolViolation;
                     const row = try a.alloc(?[]const u8, row_cells.items.len);
                     @memcpy(row, row_cells.items);
                     try rows.append(a, row);
                 },
                 proto.Tag.command_complete => {
+                    if (!has_row_description) {
+                        columns.clearRetainingCapacity();
+                        rows.clearRetainingCapacity();
+                        result.columns = columns.items;
+                    }
+                    if (m.data.len == 0 or m.data[m.data.len - 1] != 0)
+                        return error.ProtocolViolation;
                     const tag = std.mem.sliceTo(m.data, 0);
                     result.cmd_tag = try a.dupe(u8, tag);
                     result.affected = parseAffected(tag);
+                    has_row_description = false;
                 },
                 proto.Tag.error_response => {
                     try c.storeError(m.data);
@@ -788,14 +846,12 @@ pub const Conn = struct {
                     got_error = true;
                 },
                 proto.Tag.notice_response => {
-                    if (Conn.on_notice) |hook| {
-                        try c.storeError(m.data);
-                        if (c.last_error) |e| hook(e);
-                        c.last_error = null;
-                    }
+                    if (Conn.on_notice) |hook| hook(parseError(m.data));
                 },
                 proto.Tag.ready_for_query => {
+                    if (m.data.len != 1) return error.ProtocolViolation;
                     c.setTxnStatus(m.data);
+                    synchronized = true;
                     break;
                 },
                 else => {},
@@ -822,16 +878,16 @@ pub const Conn = struct {
     /// Frees handshake/query scratch state (wbuf, msg, TLS). Used by both
     /// `close` and the `connect` error path; leaves stream/buffers alone.
     fn deinitScratch(c: *Conn) void {
-        if (c.ca_bundle) |b| {
-            b.deinit(c.gpa);
-            c.gpa.destroy(b);
-            c.ca_bundle = null;
-        }
         if (c.tls) |t| {
             t.end() catch {};
             c.gpa.destroy(t);
             c.gpa.free(c.tls_mem);
             c.tls = null;
+        }
+        if (c.ca_bundle) |b| {
+            b.deinit(c.gpa);
+            c.gpa.destroy(b);
+            c.ca_bundle = null;
         }
         c.msg.deinit(c.gpa);
         c.wbuf.deinit(c.gpa);
@@ -888,4 +944,17 @@ test "hex encode" {
     var out: [4]u8 = undefined;
     hexInto(&out, "\xde\xad");
     try std.testing.expectEqualStrings("dead", &out);
+}
+
+test "config rejects embedded NUL bytes" {
+    try std.testing.expectError(error.InvalidDsn, Conn.validateConfig(.{
+        .user = "user\x00database",
+    }));
+}
+
+test "notice parsing does not require owned storage" {
+    const e = Conn.parseError("SERROR\x00C23505\x00Mduplicate\x00\x00");
+    try std.testing.expectEqualStrings("ERROR", e.severity);
+    try std.testing.expectEqualStrings("23505", e.code);
+    try std.testing.expectEqualStrings("duplicate", e.message);
 }

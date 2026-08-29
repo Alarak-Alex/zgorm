@@ -629,7 +629,13 @@ pub fn decodeBinary(comptime T: type, data: []const u8, type_oid: u32, gpa: std.
                 else => return error.TypeMismatch,
             }
         },
-        .bool => if (data.len == 1) data[0] != 0 else error.TypeMismatch,
+        .bool => if (data.len != 1)
+            error.TypeMismatch
+        else switch (data[0]) {
+            0 => false,
+            1 => true,
+            else => error.TypeMismatch,
+        },
         .pointer => |ptr| blk: {
             if (ptr.size == .slice) {
                 if (ptr.child == u8) {
@@ -653,8 +659,11 @@ pub fn decodeBinary(comptime T: type, data: []const u8, type_oid: u32, gpa: std.
             }
             if (@hasDecl(T, "__zorm_json")) {
                 // jsonb binary = 1-byte version (1) + json text; json = text.
-                const raw: []const u8 = if (type_oid == pq.proto.Oid.jsonb) data[1..] else data;
-                break :blk T{ .data = gpa.dupe(u8, raw) catch return error.OutOfMemory };
+                if (type_oid == pq.proto.Oid.jsonb) {
+                    if (data.len == 0 or data[0] != 1) return error.TypeMismatch;
+                    break :blk T{ .data = gpa.dupe(u8, data[1..]) catch return error.OutOfMemory };
+                }
+                break :blk T{ .data = gpa.dupe(u8, data) catch return error.OutOfMemory };
             }
             if (@hasDecl(T, "__zorm_bytes")) {
                 break :blk T{ .data = gpa.dupe(u8, data) catch return error.OutOfMemory };
@@ -678,10 +687,11 @@ fn decodeBinaryArray(
     _ = type_oid;
     if (data.len < 12) return error.TypeMismatch;
     const ndim = std.mem.readInt(i32, data[0..4], .big);
-    if (ndim <= 0) return gpa.alloc(@typeInfo(SliceT).pointer.child, 0) catch return error.OutOfMemory;
+    if (ndim < 0) return error.TypeMismatch;
+    if (ndim == 0) return gpa.alloc(@typeInfo(SliceT).pointer.child, 0) catch return error.OutOfMemory;
 
     const depth = depthOf(SliceT);
-    if (ndim != depth) return error.TypeMismatch;
+    if (ndim != depth or ndim > 8) return error.TypeMismatch;
 
     var dims_buf: [8]usize = undefined;
     var off: usize = 12;
@@ -694,7 +704,12 @@ fn decodeBinaryArray(
         off += 8;
     }
     var reader = ArrayBinReader{ .data = data, .off = off };
-    return decodeBinaryDims(SliceT, &reader, dims_buf[0..@intCast(ndim)], gpa);
+    const out = try decodeBinaryDims(SliceT, &reader, dims_buf[0..@intCast(ndim)], gpa);
+    if (reader.off != data.len) {
+        freeValue(SliceT, out, gpa);
+        return error.TypeMismatch;
+    }
+    return out;
 }
 
 const ArrayBinReader = struct {
@@ -746,6 +761,11 @@ fn decodeBinaryDims(
 ) DecodeError!SliceT {
     const Child = @typeInfo(SliceT).pointer.child;
     const out = gpa.alloc(Child, dims[0]) catch return error.OutOfMemory;
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| freeValue(Child, item, gpa);
+        gpa.free(out);
+    }
     if (comptime depthOf(SliceT) == 1) {
         // Innermost level: length-prefixed elements (or NULL when optional).
         for (out) |*slot| {
@@ -757,11 +777,13 @@ fn decodeBinaryDims(
                 const bytes = try reader.readBytes(@intCast(len));
                 slot.* = try decodeBinary(Child, bytes, 0, gpa);
             }
+            initialized += 1;
         }
         return out;
     }
     for (out) |*slot| {
         slot.* = try decodeBinaryDims(Child, reader, dims[1..], gpa);
+        initialized += 1;
     }
     return out;
 }
@@ -770,11 +792,16 @@ fn decodeText(comptime T: type, text: []const u8, type_oid: u32, gpa: std.mem.Al
     return switch (@typeInfo(T)) {
         .int => std.fmt.parseInt(T, text, 10) catch error.TypeMismatch,
         .float => std.fmt.parseFloat(T, text) catch error.TypeMismatch,
-        .bool => switch (text[0]) {
-            't', 'T', '1' => true,
-            'f', 'F', '0' => false,
-            else => error.TypeMismatch,
-        },
+        .bool => if (std.ascii.eqlIgnoreCase(text, "t") or
+            std.ascii.eqlIgnoreCase(text, "true") or
+            std.mem.eql(u8, text, "1"))
+            true
+        else if (std.ascii.eqlIgnoreCase(text, "f") or
+            std.ascii.eqlIgnoreCase(text, "false") or
+            std.mem.eql(u8, text, "0"))
+            false
+        else
+            error.TypeMismatch,
         .pointer => |ptr| blk: {
             if (ptr.size == .slice) {
                 if (ptr.child == u8) {
@@ -818,6 +845,7 @@ fn decodeBytea(text: []const u8, gpa: std.mem.Allocator) ![]u8 {
     const hex_part = text[2..];
     if (hex_part.len % 2 != 0) return error.InvalidBytea;
     const out = try gpa.alloc(u8, hex_part.len / 2);
+    errdefer gpa.free(out);
     var i: usize = 0;
     while (i < out.len) : (i += 1) {
         const hi = try std.fmt.charToDigit(hex_part[i * 2], 16);
@@ -1194,4 +1222,20 @@ test "binary 2-D array decode" {
     try testing.expectEqual(@as(usize, 2), got.len);
     try testing.expectEqualSlices(i64, &.{ 1, 2 }, got[0]);
     try testing.expectEqualSlices(i64, &.{ 3, 4 }, got[1]);
+}
+
+test "malformed binary values fail without leaking" {
+    try testing.expectError(error.TypeMismatch, decodeCell(bool, "", pq.proto.Oid.bool_, 0, testing.allocator));
+    try testing.expectError(error.TypeMismatch, decodeBinary(bool, &.{2}, pq.proto.Oid.bool_, testing.allocator));
+    try testing.expectError(error.TypeMismatch, decodeBinary(Json, &.{}, pq.proto.Oid.jsonb, testing.allocator));
+
+    var array: [24]u8 = @splat(0);
+    std.mem.writeInt(i32, array[0..4], 1, .big); // ndim
+    std.mem.writeInt(i32, array[12..16], 1, .big); // length
+    std.mem.writeInt(i32, array[16..20], 1, .big); // lower bound
+    std.mem.writeInt(i32, array[20..24], -1, .big); // NULL element
+    try testing.expectError(
+        error.NullValue,
+        decodeBinary([]const i64, &array, pq.proto.Oid.int8_array, testing.allocator),
+    );
 }

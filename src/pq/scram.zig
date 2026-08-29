@@ -57,7 +57,7 @@ pub const Client = struct {
         @memcpy(c.server_first_buf[0..msg.len], msg);
         c.server_first = c.server_first_buf[0..msg.len];
 
-        var it = std.mem.splitScalar(u8, msg, ',');
+        var it = std.mem.splitScalar(u8, c.server_first, ',');
         var have_r = false;
         var have_s = false;
         var have_i = false;
@@ -66,9 +66,9 @@ pub const Client = struct {
             const value = entry[2..];
             switch (entry[0]) {
                 'r' => {
-                    // The server nonce must extend the client nonce.
+                    // The server nonce must strictly extend the client nonce.
                     const client_nonce = c.client_first_bare[5..];
-                    if (!std.mem.startsWith(u8, value, client_nonce))
+                    if (value.len <= client_nonce.len or !std.mem.startsWith(u8, value, client_nonce))
                         return error.AuthenticationFailed;
                     c.server_nonce = value;
                     have_r = true;
@@ -187,6 +187,20 @@ test "scram rejects a server nonce that does not extend the client nonce" {
     _ = c.clientFirstMessage(std.testing.io);
     const sf = "r=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB,s=MTIzNDU2Nzg=,i=4096";
     try testing.expectError(error.AuthenticationFailed, c.receiveServerFirst(sf));
+}
+
+test "scram copies and strictly extends the server nonce" {
+    var c: Client = .{};
+    _ = c.clientFirstMessage(std.testing.io);
+
+    var msg_buf: [128]u8 = undefined;
+    const equal_nonce = try std.fmt.bufPrint(&msg_buf, "r={s},s=MTIzNDU2Nzg=,i=4096", .{c.client_first_bare[5..]});
+    try testing.expectError(error.AuthenticationFailed, c.receiveServerFirst(equal_nonce));
+
+    const extended = try std.fmt.bufPrint(&msg_buf, "r={s}SERVER,s=MTIzNDU2Nzg=,i=4096", .{c.client_first_bare[5..]});
+    try c.receiveServerFirst(extended);
+    @memset(extended, 'x');
+    try testing.expect(std.mem.endsWith(u8, c.server_nonce, "SERVER"));
 }
 
 test "scram rejects malformed server first" {

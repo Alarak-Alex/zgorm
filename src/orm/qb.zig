@@ -182,7 +182,7 @@ pub fn Query(comptime T: type) type {
         }
 
         pub fn for_update(q: *Self) *Self {
-            q.for_update = true;
+            q.for_update_flag = true;
             return q;
         }
 
@@ -276,6 +276,27 @@ pub fn Query(comptime T: type) type {
             return aw.writer.buffered();
         }
 
+        fn buildDeleteSql(q: *Self) ![]const u8 {
+            var aw: std.Io.Writer.Allocating = .init(q.a());
+            const w = &aw.writer;
+            if (comptime table.softDeletable()) {
+                if (!q.unscoped_flag) {
+                    const del_col = table.columns[table.deleted_at_index.?];
+                    try w.print("UPDATE {s} SET {s} = {s}", .{
+                        try quoteIdent(q.a(), table.name),
+                        try quoteIdent(q.a(), del_col.name),
+                        softDeleteStampSql(value.columnFieldType(T, del_col)),
+                    });
+                } else {
+                    try w.print("DELETE FROM {s}", .{try quoteIdent(q.a(), table.name)});
+                }
+            } else {
+                try w.print("DELETE FROM {s}", .{try quoteIdent(q.a(), table.name)});
+            }
+            try q.buildWhere(w);
+            return aw.writer.buffered();
+        }
+
         fn run(q: *Self, sql: []const u8) Error!pq.Result {
             const conn = try q.sess.acquire();
             const res = conn.execParams(sql, q.args.items) catch |e| {
@@ -310,6 +331,7 @@ pub fn Query(comptime T: type) type {
             for (res.rows, 0..) |row, i| {
                 rows[i] = try value.scanRow(T, table, &res, row, out_gpa);
                 decoded = i + 1;
+                try db_mod.Session.callHook(T, "afterFind", &rows[i], q.sess);
             }
             try q.applyPreloads(rows, out_gpa);
             q.deinit();
@@ -332,6 +354,8 @@ pub fn Query(comptime T: type) type {
                 return null;
             }
             var one = [1]T{try value.scanRow(T, table, &res, res.rows[0], q.sess.gpa)};
+            errdefer value.freeValue(T, one[0], q.sess.gpa);
+            try db_mod.Session.callHook(T, "afterFind", &one[0], q.sess);
             try q.applyPreloads(&one, q.sess.gpa);
             q.deinit();
             return one[0];
@@ -347,14 +371,18 @@ pub fn Query(comptime T: type) type {
             const sql = q.buildSelectSql(true) catch return error.OutOfMemory;
             var res = try q.run(sql);
             defer res.deinit();
-            const out: i64 = if (res.rows.len == 0 or res.rows[0][0] == null)
+            const out: i64 = if (res.rows.len == 0)
                 0
             else blk: {
-                const cell = res.rows[0][0].?;
-                if (res.columns[0].format == 1 and cell.len == 8) {
-                    break :blk std.mem.readInt(i64, cell[0..8], .big);
-                }
-                break :blk value.decodeBinary(i64, cell, res.columns[0].type_oid, q.sess.gpa) catch 0;
+                if (res.rows[0].len == 0 or res.columns.len == 0)
+                    return error.ProtocolViolation;
+                break :blk try value.decodeCell(
+                    i64,
+                    res.rows[0][0],
+                    res.columns[0].type_oid,
+                    res.columns[0].format,
+                    q.sess.gpa,
+                );
             };
             q.deinit();
             return out;
@@ -390,12 +418,8 @@ pub fn Query(comptime T: type) type {
                 return e;
             };
             errdefer q.deinit();
-            var aw: std.Io.Writer.Allocating = .init(q.a());
-            const w = &aw.writer;
-            w.print("DELETE FROM {s}", .{try quoteIdent(q.a(), table.name)}) catch
-                return error.OutOfMemory;
-            q.buildWhere(w) catch return error.OutOfMemory;
-            var res = try q.run(aw.writer.buffered());
+            const sql = q.buildDeleteSql() catch return error.OutOfMemory;
+            var res = try q.run(sql);
             defer res.deinit();
             const affected = res.affected;
             q.deinit();
@@ -479,9 +503,12 @@ fn loadAssoc(
                 @compileError("zorm: has_many requires the parent model to declare a primary key");
             var ids: std.ArrayList(i64) = .empty;
             defer ids.deinit(gpa);
-            for (rows) |*r| {
+            var parent_indexes: std.ArrayList(usize) = .empty;
+            defer parent_indexes.deinit(gpa);
+            for (rows, 0..) |*r, ri| {
                 if (asIFieldOf(M, pkc.field_name, @field(r, pkc.field_name))) |id| {
                     ids.append(gpa, id) catch return error.OutOfMemory;
+                    parent_indexes.append(gpa, ri) catch return error.OutOfMemory;
                 }
             }
             if (ids.items.len == 0) return;
@@ -512,9 +539,9 @@ fn loadAssoc(
                 const fk = asIFieldOf(Child, assoc.foreign_key, @field(c, assoc.foreign_key));
                 var owner: ?usize = null;
                 if (fk) |k| {
-                    for (ids.items, 0..) |id, pi| {
+                    for (ids.items, 0..) |id, ii| {
                         if (id == k) {
-                            owner = pi;
+                            owner = parent_indexes.items[ii];
                             break;
                         }
                     }
@@ -648,7 +675,7 @@ fn queryChildren(
     var items: std.ArrayList(Child) = .empty;
     for (res.rows) |row| {
         var child = try value.scanRow(Child, child_table, &res, row, arena);
-        db_mod.Session.callHook(Child, "afterFind", &child, s) catch {};
+        try db_mod.Session.callHook(Child, "afterFind", &child, s);
         items.append(arena, child) catch return error.OutOfMemory;
     }
     return items;
@@ -660,7 +687,7 @@ fn asIFieldOf(comptime M: type, comptime name: []const u8, field_value: FieldOfT
 
 fn asI64(comptime FT: type, v: FT) ?i64 {
     return switch (@typeInfo(FT)) {
-        .int => @intCast(v),
+        .int => std.math.cast(i64, v),
         .optional => |oi| if (v) |x| asI64(oi.child, x) else null,
         else => null,
     };
@@ -701,8 +728,16 @@ pub fn writeRenumbered(w: *std.Io.Writer, frag: []const u8, base: usize) !void {
         if (frag[i] == '$' and i + 1 < frag.len and frag[i + 1] >= '0' and frag[i + 1] <= '9') {
             var j = i + 1;
             while (j < frag.len and frag[j] >= '0' and frag[j] <= '9') j += 1;
-            const n = std.fmt.parseInt(usize, frag[i + 1 .. j], 10) catch 0;
-            try w.print("${d}", .{n + base});
+            const n = std.fmt.parseInt(usize, frag[i + 1 .. j], 10) catch {
+                try w.writeAll(frag[i..j]);
+                i = j;
+                continue;
+            };
+            if (n == 0 or n > std.math.maxInt(usize) - base) {
+                try w.writeAll(frag[i..j]);
+            } else {
+                try w.print("${d}", .{n + base});
+            }
             i = j;
         } else {
             try w.writeByte(frag[i]);
@@ -718,6 +753,10 @@ test "placeholder renumbering" {
     var w: std.Io.Writer = .fixed(&buf);
     try writeRenumbered(&w, "age > $1 AND name LIKE $2", 3);
     try testing.expectEqualStrings("age > $4 AND name LIKE $5", w.buffered());
+    var edge_buf: [256]u8 = undefined;
+    var edge_writer: std.Io.Writer = .fixed(&edge_buf);
+    try writeRenumbered(&edge_writer, "$0 $99999999999999999999999999999999999999", 3);
+    try testing.expectEqualStrings("$0 $99999999999999999999999999999999999999", edge_writer.buffered());
 }
 
 test "quoteIdent escapes quotes" {
@@ -726,4 +765,34 @@ test "quoteIdent escapes quotes" {
     const a = arena_state.allocator();
     try testing.expectEqualStrings("\"users\"", try quoteIdent(a, "users"));
     try testing.expectEqualStrings("\"we\"\"ird\"", try quoteIdent(a, "we\"ird"));
+}
+
+test "association IDs outside i64 are ignored" {
+    try testing.expectEqual(@as(?i64, null), asI64(u64, std.math.maxInt(u64)));
+}
+
+const SoftDeleteTestModel = struct {
+    id: ?i64 = null,
+    deleted_at: ?time_mod.Time = null,
+
+    pub const zorm = .{ .table = "records" };
+};
+
+test "for update and soft delete SQL" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var q = Query(SoftDeleteTestModel){
+        .sess = undefined,
+        .arena = &arena_state,
+    };
+    _ = q.for_update();
+    try testing.expect(q.for_update_flag);
+    try testing.expectEqualStrings(
+        "UPDATE \"records\" SET \"deleted_at\" = now() WHERE \"deleted_at\" IS NULL",
+        try q.buildDeleteSql(),
+    );
+
+    q.unscoped_flag = true;
+    try testing.expectEqualStrings("DELETE FROM \"records\"", try q.buildDeleteSql());
 }

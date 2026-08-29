@@ -63,7 +63,8 @@ fn parseUrl(arena: std.mem.Allocator, dsn: []const u8) Error!Config {
         const close = std.mem.indexOfScalar(u8, host, ']') orelse return error.InvalidDsn;
         cfg.host = try arena.dupe(u8, host[1..close]);
         host = host[close + 1 ..];
-        if (std.mem.startsWith(u8, host, ":")) {
+        if (host.len > 0) {
+            if (host[0] != ':') return error.InvalidDsn;
             cfg.port = std.fmt.parseInt(u16, host[1..], 10) catch return error.InvalidDsn;
         }
     } else if (std.mem.indexOfScalar(u8, host, ':')) |colon| {
@@ -146,25 +147,18 @@ fn applyKeyword(arena: std.mem.Allocator, cfg: *Config, key: []const u8, raw_val
 }
 
 fn percentDecode(arena: std.mem.Allocator, s: []const u8) Error![]const u8 {
+    if (std.mem.indexOfScalar(u8, s, 0) != null) return error.InvalidDsn;
     if (std.mem.indexOfScalar(u8, s, '%') == null) return s;
     const out = try arena.alloc(u8, s.len);
     var n: usize = 0;
     var i: usize = 0;
     while (i < s.len) {
-        if (s[i] == '%' and i + 2 < s.len) {
-            const hi = std.fmt.charToDigit(s[i + 1], 16) catch {
-                out[n] = s[i];
-                n += 1;
-                i += 1;
-                continue;
-            };
-            const lo = std.fmt.charToDigit(s[i + 2], 16) catch {
-                out[n] = s[i];
-                n += 1;
-                i += 1;
-                continue;
-            };
+        if (s[i] == '%') {
+            if (i + 2 >= s.len) return error.InvalidDsn;
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch return error.InvalidDsn;
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch return error.InvalidDsn;
             out[n] = @as(u8, hi) * 16 + lo;
+            if (out[n] == 0) return error.InvalidDsn;
             n += 1;
             i += 3;
         } else {
@@ -225,4 +219,14 @@ test "reject missing user" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     try testing.expectError(error.InvalidDsn, parse(arena_state.allocator(), "postgres://127.0.0.1/db"));
+}
+
+test "reject malformed URL encoding and IPv6 suffixes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    try testing.expectError(error.InvalidDsn, parse(a, "postgres://u%ZZ@127.0.0.1/db"));
+    try testing.expectError(error.InvalidDsn, parse(a, "postgres://u%00x@127.0.0.1/db"));
+    try testing.expectError(error.InvalidDsn, parse(a, "postgres://u@[::1]junk/db"));
 }

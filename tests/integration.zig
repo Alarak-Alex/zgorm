@@ -407,7 +407,6 @@ test "v2: associations and preloading" {
 
     _ = try db.deleteWhere(RichPost, "true", .{});
     _ = try db.deleteWhere(BlogAuthor, "true", .{});
-
 }
 
 test "v2: model hooks" {
@@ -435,10 +434,24 @@ test "v2: model hooks" {
     var found = (try db.find(Hooked, h.id.?)).?;
     defer z.free(Hooked, found, gpa);
     try std.testing.expectEqual(@as(i32, 1), found.calls); // afterFind ran
+
+    const queried = (try z.query(Hooked, db).whereEq("id", h.id.?).first()).?;
+    defer z.free(Hooked, queried, gpa);
+    try std.testing.expectEqual(@as(i32, 1), queried.calls);
+
+    const queried_all = try z.query(Hooked, db).all(gpa);
+    defer z.freeSlice(Hooked, queried_all, gpa);
+    try std.testing.expectEqual(@as(usize, 1), queried_all.len);
+    try std.testing.expectEqual(@as(i32, 1), queried_all[0].calls);
+
+    var multi = try db.execRaw("SELECT 1 AS n; SELECT 2 AS n");
+    defer multi.deinit();
+    try std.testing.expectEqual(@as(usize, 1), multi.rows.len);
+    try std.testing.expectEqualStrings("2", multi.rows[0][0].?);
     _ = try db.delete(&found);
 
-    // insert -> B C; update -> U; find -> F; delete -> D
-    try std.testing.expectEqualStrings("BCUFD", Hooked.log[0..Hooked.log_len]);
+    // insert -> B C; update -> U; find/query/query -> F F F; delete -> D
+    try std.testing.expectEqualStrings("BCUFFFD", Hooked.log[0..Hooked.log_len]);
 
     _ = try db.deleteWhere(Hooked, "true", .{});
 }

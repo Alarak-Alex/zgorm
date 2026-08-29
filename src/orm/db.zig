@@ -204,18 +204,21 @@ pub const Session = struct {
         const table = comptime schema.tableOf(T);
         if (models.len == 0) return;
 
-        var all_auto: bool = true;
+        var return_auto_pk = false;
         if (comptime table.pk()) |pkc| {
-            for (list) |*m| {
-                if (!isZeroValue(value.getColumn(m, pkc))) {
-                    all_auto = false;
-                    break;
-                }
-            }
-            if (!all_auto) {
+            if (comptime pkc.is_auto) {
+                return_auto_pk = true;
                 for (list) |*m| {
-                    if (isZeroValue(value.getColumn(m, pkc)))
-                        return error.NullValue; // mixed manual/auto pk batch
+                    if (!isZeroValue(value.getColumn(m, pkc))) {
+                        return_auto_pk = false;
+                        break;
+                    }
+                }
+                if (!return_auto_pk) {
+                    for (list) |*m| {
+                        if (isZeroValue(value.getColumn(m, pkc)))
+                            return error.NullValue; // mixed manual/auto pk batch
+                    }
                 }
             }
         }
@@ -225,7 +228,7 @@ pub const Session = struct {
         var i: usize = 0;
         while (i < list.len) {
             const end = @min(i + chunk_rows, list.len);
-            try s.insertChunk(T, list[i..end], all_auto and table.pk() != null);
+            try s.insertChunk(T, list[i..end], return_auto_pk);
             i = end;
         }
     }
@@ -281,11 +284,14 @@ pub const Session = struct {
 
         var res = try s.runExec(b.slice(), params.items);
         defer res.deinit();
+        if (returning and (res.rows.len != models.len or res.columns.len == 0))
+            return error.ProtocolViolation;
 
         if (returning) {
             const pkc = comptime table.pk().?;
             const FType = value.columnFieldType(T, pkc);
             for (models, 0..) |*m, r| {
+                if (res.rows[r].len == 0) return error.ProtocolViolation;
                 value.setColumn(m, pkc, try value.decodeCell(
                     FType,
                     res.rows[r][0],
@@ -526,7 +532,7 @@ pub const Session = struct {
                 qb_mod.softDeleteStampSql(value.columnFieldType(T, del_col)),
             }) catch return error.OutOfMemory;
             qb_mod.writeRenumbered(w, frag, 0) catch return error.OutOfMemory;
-            w.writeAll(") AND deleted_at IS NULL") catch return error.OutOfMemory;
+            w.print(") AND {s} IS NULL", .{try qb_mod.quoteIdent(arena, del_col.name)}) catch return error.OutOfMemory;
         } else {
             w.print("DELETE FROM {s} WHERE (", .{try qb_mod.quoteIdent(arena, table.name)}) catch return error.OutOfMemory;
             qb_mod.writeRenumbered(w, frag, 0) catch return error.OutOfMemory;

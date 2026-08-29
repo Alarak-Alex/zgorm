@@ -74,12 +74,13 @@ pub const Time = struct {
         const frac: u32 = dt.micros;
         if (frac != 0) {
             return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}+00", .{
-                @as(u64, @intCast(@max(dt.year, 0))), dt.month, dt.day,
-                dt.hour,                              dt.minute, dt.second, frac,
+                @as(u64, @intCast(@max(dt.year, 0))), dt.month,  dt.day,
+                dt.hour,                              dt.minute, dt.second,
+                frac,
             }) catch unreachable;
         }
         return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}+00", .{
-            @as(u64, @intCast(@max(dt.year, 0))), dt.month, dt.day,
+            @as(u64, @intCast(@max(dt.year, 0))), dt.month,  dt.day,
             dt.hour,                              dt.minute, dt.second,
         }) catch unreachable;
     }
