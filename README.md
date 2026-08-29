@@ -47,12 +47,12 @@ const mod = b.addModule("zorm", .{
 ### Defining a model
 
 Models can embed `z.Model` (GORM `gorm.Model` equivalent) to get `id`,
-`created_at` and `updated_at` columns automatically — the embedded fields are
+`created_at`, `updated_at`, and `deleted_at` columns automatically — the embedded fields are
 flattened into the table at comptime:
 
 ```zig
 pub const Post = struct {
-    base: z.Model = .{},     // id, created_at, updated_at
+    base: z.Model = .{},     // id, created_at, updated_at, deleted_at
     title: []const u8 = "",
 
     pub const zorm = .{ .table = "posts" };

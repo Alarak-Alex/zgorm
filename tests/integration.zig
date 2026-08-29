@@ -613,14 +613,14 @@ test "v2: migration versioning" {
 }
 
 const EmbeddedUser = struct {
-    base: z.Model = .{}, // id, created_at, updated_at
+    base: z.Model = .{}, // id, created_at, updated_at, deleted_at
     name: []const u8 = "",
     email: ?[]const u8 = null,
 
     pub const zorm = .{ .table = "v3_embedded_users", .unique = .{"email"} };
 };
 
-test "v3: embedded zorm.Model (id/timestamps) round trip" {
+test "v3: embedded zorm.Model round trip and soft delete" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -637,6 +637,7 @@ test "v3: embedded zorm.Model (id/timestamps) round trip" {
     try std.testing.expect(u.base.id != null); // auto PK filled into the embedded model
     try std.testing.expect(u.base.created_at != null);
     try std.testing.expect(u.base.updated_at != null);
+    try std.testing.expect(u.base.deleted_at == null);
 
     const found = (try db.find(EmbeddedUser, u.base.id.?)).?;
     defer z.free(EmbeddedUser, found, gpa);
@@ -657,7 +658,9 @@ test "v3: embedded zorm.Model (id/timestamps) round trip" {
     const n = try z.query(EmbeddedUser, db).whereEq("name", "Alice2").count();
     try std.testing.expectEqual(@as(i64, 1), n);
 
-    _ = try db.deleteWhere(EmbeddedUser, "true", .{});
+    _ = try db.delete(&u);
+    try std.testing.expect((try db.find(EmbeddedUser, u.base.id.?)) == null);
+    _ = try db.deleteWhereHard(EmbeddedUser, "true", .{});
 }
 
 test "v3: issue fixes regression" {

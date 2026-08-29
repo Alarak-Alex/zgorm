@@ -123,11 +123,11 @@ pub const proto = @import("../pq/proto.zig");
 pub const pg_epoch_us: i64 = 946_684_800_000_000;
 
 /// GORM-style embedded base model. A field of this type inside a model is
-/// flattened into `id`, `created_at` and `updated_at` columns:
+/// flattened into `id`, `created_at`, `updated_at`, and `deleted_at` columns:
 ///
 /// ```zig
 /// pub const Post = struct {
-///     base: z.Model,          // id, created_at, updated_at
+///     base: z.Model,          // id, created_at, updated_at, deleted_at
 ///     title: []const u8 = "",
 /// };
 /// ```
@@ -135,6 +135,7 @@ pub const Model = struct {
     id: ?i64 = null,
     created_at: ?Time = null,
     updated_at: ?Time = null,
+    deleted_at: ?Time = null,
 
     pub const __zorm_embedded = true;
 };
