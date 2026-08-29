@@ -612,6 +612,54 @@ test "v2: migration versioning" {
     drop(try db.execRaw("DROP TABLE IF EXISTS schema_migrations CASCADE"));
 }
 
+const EmbeddedUser = struct {
+    base: z.Model = .{}, // id, created_at, updated_at
+    name: []const u8 = "",
+    email: ?[]const u8 = null,
+
+    pub const zorm = .{ .table = "v3_embedded_users", .unique = .{"email"} };
+};
+
+test "v3: embedded zorm.Model (id/timestamps) round trip" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    defer db.deinit();
+
+    drop(try db.execRaw("DROP TABLE IF EXISTS v3_embedded_users CASCADE"));
+    try db.autoMigrate(EmbeddedUser);
+
+    var u = EmbeddedUser{ .name = "Alice", .email = "alice@example.com" };
+    try db.insert(&u);
+    try std.testing.expect(u.base.id != null); // auto PK filled into the embedded model
+    try std.testing.expect(u.base.created_at != null);
+    try std.testing.expect(u.base.updated_at != null);
+
+    const found = (try db.find(EmbeddedUser, u.base.id.?)).?;
+    defer z.free(EmbeddedUser, found, gpa);
+    try std.testing.expectEqualStrings("Alice", found.name);
+    try std.testing.expectEqual(u.base.id.?, found.base.id.?);
+
+    // Update through a copy so `found` keeps its heap-owned strings
+    // (z.free requires the value's strings to be unmodified).
+    var upd = found;
+    upd.name = "Alice2";
+    _ = try db.update(&upd);
+    const after = (try db.find(EmbeddedUser, u.base.id.?)).?;
+    defer z.free(EmbeddedUser, after, gpa);
+    try std.testing.expectEqualStrings("Alice2", after.name);
+    // updated_at was refreshed by the update
+    try std.testing.expect(after.base.updated_at.?.micros >= found.base.updated_at.?.micros);
+
+    const n = try z.query(EmbeddedUser, db).whereEq("name", "Alice2").count();
+    try std.testing.expectEqual(@as(i64, 1), n);
+
+    _ = try db.deleteWhere(EmbeddedUser, "true", .{});
+}
+
 test "v3: issue fixes regression" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

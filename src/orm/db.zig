@@ -144,7 +144,7 @@ pub const Session = struct {
         w.print("INSERT INTO {s} (", .{try qb_mod.quoteIdent(arena, table.name)}) catch return error.OutOfMemory;
         var first = true;
         inline for (table.columns) |col| {
-            if (!(col.is_auto and isZeroPk(T, m, col.field_name))) {
+            if (!(col.is_auto and isZeroValue(value.getColumn(m, col)))) {
                 if (!first) w.writeAll(", ") catch return error.OutOfMemory;
                 w.writeAll(try qb_mod.quoteIdent(arena, col.name)) catch return error.OutOfMemory;
                 first = false;
@@ -153,10 +153,10 @@ pub const Session = struct {
         w.writeAll(") VALUES (") catch return error.OutOfMemory;
         var nparams: usize = 0;
         inline for (table.columns) |col| {
-            if (!(col.is_auto and isZeroPk(T, m, col.field_name))) {
+            if (!(col.is_auto and isZeroValue(value.getColumn(m, col)))) {
                 if (nparams > 0) w.writeAll(", ") catch return error.OutOfMemory;
                 w.print("${d}", .{nparams + 1}) catch return error.OutOfMemory;
-                params.append(arena, try value.toParam(getField(T, m, col.field_name), arena)) catch return error.OutOfMemory;
+                params.append(arena, try value.toParam(value.getColumn(m, col), arena)) catch return error.OutOfMemory;
                 nparams += 1;
             }
         }
@@ -164,7 +164,7 @@ pub const Session = struct {
 
         var returning = false;
         if (comptime (pk_col != null and pk_col.?.is_auto)) {
-            if (isZeroPk(T, m, pk_col.?.field_name)) {
+            if (isZeroValue(value.getColumn(m, pk_col.?))) {
                 returning = true;
                 const pkc = pk_col.?;
                 w.print(" RETURNING {s}", .{try qb_mod.quoteIdent(arena, pkc.name)}) catch return error.OutOfMemory;
@@ -176,14 +176,14 @@ pub const Session = struct {
 
         if (returning and res.rows.len > 0 and table.pk_index != null) {
             const pkc = table.columns[table.pk_index.?];
-            const FType = FieldOf(T, pkc.field_name);
-            @field(m, pkc.field_name) = try value.decodeCell(
+            const FType = value.columnFieldType(T, pkc);
+            value.setColumn(m, pkc, try value.decodeCell(
                 FType,
                 res.rows[0][0],
                 res.columns[0].type_oid,
                 res.columns[0].format,
                 s.gpa,
-            );
+            ));
         }
 
         try callHook(T, "afterCreate", m, s);
@@ -207,14 +207,14 @@ pub const Session = struct {
         var all_auto: bool = true;
         if (comptime table.pk()) |pkc| {
             for (list) |*m| {
-                if (!isZeroPk(T, m, pkc.field_name)) {
+                if (!isZeroValue(value.getColumn(m, pkc))) {
                     all_auto = false;
                     break;
                 }
             }
             if (!all_auto) {
                 for (list) |*m| {
-                    if (isZeroPk(T, m, pkc.field_name))
+                    if (isZeroValue(value.getColumn(m, pkc)))
                         return error.NullValue; // mixed manual/auto pk batch
                 }
             }
@@ -266,7 +266,7 @@ pub const Session = struct {
                 if (!(returning and col.is_pk)) {
                     if (!first) w.writeAll(", ") catch return error.OutOfMemory;
                     w.print("${d}", .{np + 1}) catch return error.OutOfMemory;
-                    params.append(arena, try value.toParam(getField(T, m, col.field_name), arena)) catch return error.OutOfMemory;
+                    params.append(arena, try value.toParam(value.getColumn(m, col), arena)) catch return error.OutOfMemory;
                     np += 1;
                     first = false;
                 }
@@ -284,15 +284,15 @@ pub const Session = struct {
 
         if (returning) {
             const pkc = comptime table.pk().?;
-            const FType = FieldOf(T, pkc.field_name);
+            const FType = value.columnFieldType(T, pkc);
             for (models, 0..) |*m, r| {
-                @field(m, pkc.field_name) = try value.decodeCell(
+                value.setColumn(m, pkc, try value.decodeCell(
                     FType,
                     res.rows[r][0],
                     res.columns[0].type_oid,
                     res.columns[0].format,
                     s.gpa,
-                );
+                ));
             }
         }
 
@@ -312,7 +312,7 @@ pub const Session = struct {
         const table = comptime schema.tableOf(T);
         if (table.pk_index == null) @compileError("zorm: model has no primary key; declare one via `pub const zorm = .{ .primary_key = ... }`");
         const pkc = table.columns[table.pk_index.?];
-        if (isZeroPk(T, m, pkc.field_name)) return error.NullValue;
+        if (isZeroValue(value.getColumn(m, pkc))) return error.NullValue;
 
         try callHook(T, "beforeSave", m, s);
         try callHook(T, "beforeUpdate", m, s);
@@ -333,13 +333,13 @@ pub const Session = struct {
             if (!col.is_pk) {
                 if (!first) w.writeAll(", ") catch return error.OutOfMemory;
                 w.print("{s} = ${d}", .{ try qb_mod.quoteIdent(arena, col.name), np + 1 }) catch return error.OutOfMemory;
-                params.append(arena, try value.toParam(getField(T, m, col.field_name), arena)) catch return error.OutOfMemory;
+                params.append(arena, try value.toParam(value.getColumn(m, col), arena)) catch return error.OutOfMemory;
                 first = false;
                 np += 1;
             }
         }
         w.print(" WHERE {s} = ${d}", .{ try qb_mod.quoteIdent(arena, pkc.name), np + 1 }) catch return error.OutOfMemory;
-        params.append(arena, try value.toParam(getField(T, m, pkc.field_name), arena)) catch return error.OutOfMemory;
+        params.append(arena, try value.toParam(value.getColumn(m, pkc), arena)) catch return error.OutOfMemory;
 
         var res = try s.runExec(b.slice(), params.items);
         defer res.deinit();
@@ -359,7 +359,7 @@ pub const Session = struct {
             return;
         }
         const pkc = table.columns[table.pk_index.?];
-        if (isZeroPk(T, m, pkc.field_name)) {
+        if (isZeroValue(value.getColumn(m, pkc))) {
             try s.insert(m);
         } else {
             _ = try s.update(m);
@@ -375,7 +375,7 @@ pub const Session = struct {
         const table = comptime schema.tableOf(T);
         if (table.pk_index == null) @compileError("zorm: model has no primary key");
         const pkc = table.columns[table.pk_index.?];
-        if (isZeroPk(T, m, pkc.field_name)) return error.NullValue;
+        if (isZeroValue(value.getColumn(m, pkc))) return error.NullValue;
 
         try callHook(T, "beforeDelete", m, s);
 
@@ -389,7 +389,7 @@ pub const Session = struct {
             try qb_mod.quoteIdent(arena, pkc.name),
         }) catch return error.OutOfMemory;
         var params = try arena.alloc(pq.Param, 1);
-        params[0] = try value.toParam(getField(T, m, pkc.field_name), arena);
+        params[0] = try value.toParam(value.getColumn(m, pkc), arena);
 
         var res = try s.runExec(b.slice(), params);
         defer res.deinit();
@@ -659,19 +659,19 @@ pub const Session = struct {
             const is_created = table.created_at_index != null and table.created_at_index.? == i;
             const is_updated = table.updated_at_index != null and table.updated_at_index.? == i;
             if ((is_created and is_insert) or is_updated) {
-                const FType = FieldOf(T, col.field_name);
+                const FType = value.columnFieldType(T, col);
                 switch (FType) {
                     Time => {
-                        if (@field(m, col.field_name).micros == 0) @field(m, col.field_name) = now;
+                        if (value.getColumn(m, col).micros == 0) value.setColumn(m, col, now);
                     },
                     ?Time => {
-                        if (@field(m, col.field_name) == null) @field(m, col.field_name) = now;
+                        if (value.getColumn(m, col) == null) value.setColumn(m, col, now);
                     },
                     i64 => {
-                        if (@field(m, col.field_name) == 0) @field(m, col.field_name) = now.micros;
+                        if (value.getColumn(m, col) == 0) value.setColumn(m, col, now.micros);
                     },
                     ?i64 => {
-                        if (@field(m, col.field_name) == null) @field(m, col.field_name) = now.micros;
+                        if (value.getColumn(m, col) == null) value.setColumn(m, col, now.micros);
                     },
                     else => {},
                 }
@@ -679,20 +679,7 @@ pub const Session = struct {
         }
     }
 
-    fn getField(comptime T: type, m: anytype, comptime name: []const u8) FieldOf(T, name) {
-        return @field(m, name);
-    }
-
-    fn FieldOf(comptime T: type, comptime name: []const u8) type {
-        inline for (@typeInfo(T).@"struct".fields) |f| {
-            if (comptime std.mem.eql(u8, f.name, name)) return f.type;
-        }
-        @compileError("zorm: model " ++ @typeName(T) ++ " has no field " ++ name);
-    }
-
-    fn isZeroPk(comptime T: type, m: anytype, comptime name: []const u8) bool {
-        _ = T;
-        const v = @field(m, name);
+    fn isZeroValue(v: anytype) bool {
         return switch (@typeInfo(@TypeOf(v))) {
             .optional => v == null,
             .int => v == 0,

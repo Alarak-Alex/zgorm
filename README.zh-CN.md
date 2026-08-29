@@ -45,6 +45,20 @@ const mod = b.addModule("zorm", .{
 
 ### 定义模型
 
+模型可以内嵌 `z.Model`（等价于 GORM 的 `gorm.Model`）自动获得 `id`、`created_at`、`updated_at` 三列——内嵌字段在编译期扁平化进表结构：
+
+```zig
+pub const Post = struct {
+    base: z.Model = .{},     // id, created_at, updated_at
+    title: []const u8 = "",
+
+    pub const zorm = .{ .table = "posts" };
+};
+// post.base.id 在插入后自动回填；时间戳自动填充
+```
+
+不使用内嵌的普通模型用法完全相同：
+
 ```zig
 const std = @import("std");
 const z = @import("zorm");
@@ -139,6 +153,7 @@ pub fn main(init: std.process.Init) !void {
 ## 内存所有权约定
 
 - `db.find` / `Query.all` / `Query.first` 解码出的**字符串**由你传入的分配器分配，配套的 `z.free(T, value, gpa)` 与 `z.freeSlice(T, slice, gpa)` 负责释放。
+- `z.free` 只能用于字符串/切片字段**未被重新赋值**的结果（给字段赋字面量会把堆指针换成静态指针）。拿不准时请改用 arena。
 - 想要一次性释放整批结果，传 `ArenaAllocator` 的分配器即可（`z.free*` 对 arena 无害）。
 - `db.exec` / `execRaw` 返回的 `pq.Result` 拥有自身内存：调用 `res.deinit()`。
 - 查询构建器为一次性对象：终端操作（`all`/`first`/`count`/`exists`/`delete`）自动释放，无需手动清理。

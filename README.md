@@ -45,6 +45,22 @@ const mod = b.addModule("zorm", .{
 
 ### Defining a model
 
+Models can embed `z.Model` (GORM `gorm.Model` equivalent) to get `id`,
+`created_at` and `updated_at` columns automatically — the embedded fields are
+flattened into the table at comptime:
+
+```zig
+pub const Post = struct {
+    base: z.Model = .{},     // id, created_at, updated_at
+    title: []const u8 = "",
+
+    pub const zorm = .{ .table = "posts" };
+};
+// post.base.id is filled back on insert; timestamps are auto-stamped
+```
+
+Plain models without embedding work exactly the same way:
+
 ```zig
 const std = @import("std");
 const z = @import("zorm");
@@ -140,6 +156,7 @@ pub fn main(init: std.process.Init) !void {
 ## Memory ownership
 
 - **Strings** decoded by `db.find` / `Query.all` / `Query.first` are allocated with the allocator you pass in; release them with `z.free(T, value, gpa)` / `z.freeSlice(T, slice, gpa)`.
+- `z.free` must only be called on values whose string/slice fields were **not reassigned** after decoding (assigning a literal replaces the heap pointer with a static one). When in doubt, pass an arena.
 - To free a whole batch at once, pass an `ArenaAllocator` allocator (`z.free*` are harmless on arenas).
 - `db.exec` / `execRaw` return a `pq.Result` that owns its memory: call `res.deinit()`.
 - Query builders are one-shot: terminal operations (`all`/`first`/`count`/`exists`/`delete`) release everything automatically.

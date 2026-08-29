@@ -24,6 +24,7 @@ pub const Migration = migrator.Migration;
 pub const Json = value.Json;
 pub const Bytes = value.Bytes;
 pub const Time = time.Time;
+pub const Model = value.Model;
 
 pub const Error = pq.Error;
 

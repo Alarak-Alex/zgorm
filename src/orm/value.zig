@@ -122,6 +122,55 @@ pub const proto = @import("../pq/proto.zig");
 /// PostgreSQL internal epoch: 2000-01-01T00:00:00Z, in Unix microseconds.
 pub const pg_epoch_us: i64 = 946_684_800_000_000;
 
+/// GORM-style embedded base model. A field of this type inside a model is
+/// flattened into `id`, `created_at` and `updated_at` columns:
+///
+/// ```zig
+/// pub const Post = struct {
+///     base: z.Model,          // id, created_at, updated_at
+///     title: []const u8 = "",
+/// };
+/// ```
+pub const Model = struct {
+    id: ?i64 = null,
+    created_at: ?Time = null,
+    updated_at: ?Time = null,
+
+    pub const __zorm_embedded = true;
+};
+
+/// The leaf value type a column maps to (resolves through embedded models).
+pub fn columnFieldType(comptime T: type, comptime col: schema.Column) type {
+    if (col.embed) |parent| {
+        return fieldOf(fieldOf(T, parent), col.field_name);
+    }
+    return fieldOf(T, col.field_name);
+}
+
+fn fieldOf(comptime T: type, comptime name: []const u8) type {
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        if (comptime std.mem.eql(u8, f.name, name)) return f.type;
+    }
+    @compileError("zorm: model " ++ @typeName(T) ++ " has no field " ++ name);
+}
+
+/// Reads a column's leaf value (supports embedded models).
+pub fn getColumn(m: anytype, comptime col: schema.Column) columnFieldType(@TypeOf(m.*), col) {
+    if (col.embed) |parent| {
+        return @field(@field(m.*, parent), col.field_name);
+    }
+    return @field(m.*, col.field_name);
+}
+
+/// Writes a column's leaf value (supports embedded models).
+pub fn setColumn(m: anytype, comptime col: schema.Column, v: columnFieldType(@TypeOf(m.*), col)) void {
+    if (col.embed) |parent| {
+        @field(@field(m.*, parent), col.field_name) = v;
+    } else {
+        @field(m.*, col.field_name) = v;
+    }
+}
+
 /// Wrapper mapping a raw-JSON field to a `jsonb` column.
 pub const Json = struct {
     data: []const u8,
@@ -928,18 +977,39 @@ pub fn scanRow(
 ) DecodeError!T {
     var out = std.mem.zeroInit(T, .{});
     errdefer value_freePartiallyBuilt(T, &out, gpa);
-    inline for (@typeInfo(T).@"struct".fields) |f| {
-        inline for (table.columns) |col| {
-            if (comptime std.mem.eql(u8, col.field_name, f.name)) {
-                if (res.colIndex(col.name)) |ci| {
-                    @field(out, f.name) = try decodeCell(f.type, row[ci], res.columns[ci].type_oid, res.columns[ci].format, gpa);
-                } else if (f.defaultValue()) |d| {
-                    @field(out, f.name) = d;
-                }
-            }
+    inline for (table.columns) |col| {
+        if (res.colIndex(col.name)) |ci| {
+            const V = columnFieldType(T, col);
+            setColumn(&out, col, try decodeCell(V, row[ci], res.columns[ci].type_oid, res.columns[ci].format, gpa));
+        } else {
+            // Column not selected: fall back to the field default (embedded
+            // models resolve their leaf field defaults too).
+            const d = columnDefault(T, col);
+            if (d) |dv| setColumn(&out, col, dv);
         }
     }
     return out;
+}
+
+/// The leaf field's default value for a column, when it has one.
+fn columnDefault(comptime T: type, comptime col: schema.Column) ?columnFieldType(T, col) {
+    if (col.embed) |parent| {
+        const P = fieldOf(T, parent);
+        inline for (@typeInfo(P).@"struct".fields) |f| {
+            if (comptime std.mem.eql(u8, f.name, col.field_name)) {
+                if (f.defaultValue()) |d| return d;
+                return null;
+            }
+        }
+        return null;
+    }
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        if (comptime std.mem.eql(u8, f.name, col.field_name)) {
+            if (f.defaultValue()) |d| return d;
+            return null;
+        }
+    }
+    return null;
 }
 
 /// Frees the already-decoded heap fields of a partially constructed value

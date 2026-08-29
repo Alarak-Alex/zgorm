@@ -52,8 +52,11 @@ pub const FieldKind = enum {
 
 pub const Column = struct {
     name: []const u8, // SQL column identifier
-    field_name: []const u8, // Zig struct field name
+    field_name: []const u8, // Zig struct field name (leaf; within `embed` when set)
     kind: FieldKind,
+    /// Non-null when the column comes from an embedded model field
+    /// (e.g. `base: zorm.Model`); holds the embedding field's name.
+    embed: ?[]const u8 = null,
     /// DDL type, e.g. "bigint", "text".
     ddl_type: []const u8,
     is_optional: bool = false,
@@ -182,6 +185,61 @@ fn kindOf(comptime T: type) FieldKind {
     };
 }
 
+/// True when the model (or any of its embedded models) has a field named
+/// `id` — the default primary-key convention.
+fn hasIdLeaf(comptime T: type) bool {
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        if (comptime std.mem.eql(u8, f.name, "id")) return true;
+        const FT = f.type;
+        if (comptime (@typeInfo(FT) == .@"struct" and @hasDecl(FT, "__zorm_embedded"))) {
+            if (comptime @hasField(FT, "id")) return true;
+        }
+    }
+    return false;
+}
+
+/// Builds one column from a model field (or a field of an embedded model,
+/// when `embed` is non-null).
+fn makeColumn(
+    comptime embed: ?[]const u8,
+    comptime field: std.builtin.Type.StructField,
+    comptime fname: []const u8,
+    comptime opts: anytype,
+    comptime pk_field: ?[]const u8,
+) Column {
+    const FT = field.type;
+    const is_optional = @typeInfo(FT) == .optional;
+    const Inner = if (is_optional) @typeInfo(FT).optional.child else FT;
+
+    var col_name: []const u8 = naming.toSnakeCase(fname);
+    if (@hasField(@TypeOf(opts), "columns")) {
+        const cols_opts = opts.columns;
+        if (@hasField(@TypeOf(cols_opts), fname)) {
+            col_name = @field(cols_opts, fname);
+        }
+    }
+
+    const kind = comptime kindOf(Inner);
+    const is_pk = blk: {
+        if (pk_field) |p| break :blk std.mem.eql(u8, p, fname);
+        break :blk false;
+    };
+    // Auto-increment: integer primary key stored as an optional (null ->
+    // let the sequence fill it).
+    const is_auto = is_pk and is_optional and (kind == .integer or kind == .unsigned);
+
+    return .{
+        .name = col_name,
+        .field_name = fname,
+        .kind = kind,
+        .ddl_type = comptime ddlType(kind, Inner),
+        .is_optional = is_optional,
+        .is_pk = is_pk,
+        .is_auto = is_auto,
+        .embed = embed,
+    };
+}
+
 /// Evaluates the table metadata for model `T` at comptime.
 pub fn tableOf(comptime T: type) Table {
     @setEvalBranchQuota(20000);
@@ -201,7 +259,7 @@ pub fn tableOf(comptime T: type) Table {
 
     const pk_field: ?[]const u8 = if (@hasField(@TypeOf(opts), "primary_key"))
         opts.primary_key
-    else if (@hasField(T, "id")) "id" else null;
+    else if (hasIdLeaf(T)) "id" else null;
 
     comptime var columns: []const Column = &.{};
     comptime var assocs: []const Assoc = &.{};
@@ -213,6 +271,20 @@ pub fn tableOf(comptime T: type) Table {
 
     inline for (info.fields) |field| {
         const fname = field.name;
+
+        // Embedded models (e.g. `base: zorm.Model`) flatten into columns.
+        const FT_raw = field.type;
+        if (@typeInfo(FT_raw) == .@"struct" and @hasDecl(FT_raw, "__zorm_embedded")) {
+            inline for (@typeInfo(FT_raw).@"struct".fields) |sub| {
+                const col = comptime makeColumn(fname, sub, sub.name, opts, pk_field);
+                columns = columns ++ &[_]Column{col};
+                if (col.is_pk) pk_index = col_i;
+                if (comptime std.mem.eql(u8, col.name, "created_at")) created_at_index = col_i;
+                if (comptime std.mem.eql(u8, col.name, "updated_at")) updated_at_index = col_i;
+                col_i += 1;
+            }
+            continue;
+        }
 
         // Association fields are handled by preload, not as columns.
         comptime var is_assoc = false;
@@ -257,42 +329,22 @@ pub fn tableOf(comptime T: type) Table {
             if (ignored) continue;
         }
 
-        const FT = field.type;
-        const is_optional = @typeInfo(FT) == .optional;
-        const Inner = if (is_optional) @typeInfo(FT).optional.child else FT;
-
-        var col_name: []const u8 = naming.toSnakeCase(fname);
-        if (@hasField(@TypeOf(opts), "columns")) {
-            const cols_opts = opts.columns;
-            if (@hasField(@TypeOf(cols_opts), fname)) {
-                col_name = @field(cols_opts, fname);
-            }
-        }
-
-        const kind = comptime kindOf(Inner);
-        const is_pk = blk: {
-            if (pk_field) |p| break :blk std.mem.eql(u8, p, fname);
-            break :blk false;
-        };
-        // Auto-increment: integer primary key stored as an optional (null ->
-        // let the sequence fill it).
-        const is_auto = is_pk and is_optional and (kind == .integer or kind == .unsigned);
-
-        const col = Column{
-            .name = col_name,
-            .field_name = fname,
-            .kind = kind,
-            .ddl_type = comptime ddlType(kind, Inner),
-            .is_optional = is_optional,
-            .is_pk = is_pk,
-            .is_auto = is_auto,
-        };
+        const col = comptime makeColumn(null, field, fname, opts, pk_field);
         columns = columns ++ &[_]Column{col};
 
-        if (is_pk) pk_index = col_i;
+        if (col.is_pk) pk_index = col_i;
         if (comptime std.mem.eql(u8, col.name, "created_at")) created_at_index = col_i;
         if (comptime std.mem.eql(u8, col.name, "updated_at")) updated_at_index = col_i;
         col_i += 1;
+    }
+
+    // Detect duplicate column names (e.g. two embedded models colliding).
+    inline for (columns, 0..) |a, i| {
+        inline for (columns, 0..) |b, j| {
+            if (j > i and comptime std.mem.eql(u8, a.name, b.name)) {
+                @compileError("zorm: model " ++ @typeName(T) ++ " has duplicate column name '" ++ a.name ++ "'");
+            }
+        }
     }
 
     comptime var unique: []const []const u8 = &.{};
@@ -438,4 +490,31 @@ test "table reflection with options" {
     try testing.expectEqual(@as(usize, 1), t.unique.len);
     try testing.expectEqualStrings("email", t.unique[0]);
     try testing.expectEqualStrings("last_seen", t.columns[3].name);
+}
+
+const EmbModel = struct {
+    id: ?i64 = null,
+    created_at: ?time_mod.Time = null,
+    updated_at: ?time_mod.Time = null,
+
+    pub const __zorm_embedded = true;
+};
+
+const EmbPost = struct {
+    base: EmbModel,
+    title: []const u8 = "",
+
+    pub const zorm = .{ .table = "embedded_posts" };
+};
+
+test "embedded model fields flatten into columns" {
+    const t = comptime tableOf(EmbPost);
+    try testing.expectEqual(@as(usize, 4), t.columns.len); // id, created_at, updated_at, title
+    try testing.expectEqualStrings("id", t.columns[0].name);
+    try testing.expectEqualStrings("base", t.columns[0].embed.?);
+    try testing.expect(t.columns[0].is_auto);
+    try testing.expectEqualStrings("created_at", t.columns[1].name);
+    try testing.expectEqualStrings("updated_at", t.columns[2].name);
+    try testing.expectEqualStrings("title", t.columns[3].name);
+    try testing.expect(t.columns[3].embed == null);
 }
