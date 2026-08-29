@@ -86,6 +86,9 @@ pub const Config = struct {
     /// Request results in binary format and decode them (default). Set to
     /// false for exotic column types that lack binary output functions.
     binary_results: bool = true,
+    /// CA certificate file (PEM) used by `verify_ca`/`verify_full`. When
+    /// null, the system trust store is scanned instead.
+    ca_file: ?[]const u8 = null,
 };
 
 /// A query parameter in its driver-level form. The ORM layer converts
@@ -156,6 +159,8 @@ pub const Conn = struct {
     sock_wr: net.Stream.Writer,
     tls: ?*std.crypto.tls.Client = null,
     tls_mem: []u8 = &.{}, // combined read+write buffers of the tls client
+    ca_bundle: ?*std.crypto.Certificate.Bundle = null,
+    ca_lock: std.Io.RwLock = .init,
 
     /// Active endpoints (socket or TLS).
     rd: *Io.Reader,
@@ -185,6 +190,8 @@ pub const Conn = struct {
         errdefer gpa.free(rd_buf);
         const wr_buf = try gpa.alloc(u8, write_buffer_len);
         errdefer gpa.free(wr_buf);
+        // If anything below fails before the Conn takes ownership, these two
+        // buffers are freed by the errdefers above.
 
         c.* = .{
             .gpa = gpa,
@@ -199,7 +206,10 @@ pub const Conn = struct {
         };
         c.rd = &c.sock_rd.interface;
         c.wr = &c.sock_wr.interface;
-        errdefer c.err_arena_state.deinit();
+        // From here on the handshake may allocate scratch state (wbuf/msg/
+        // TLS); on failure it is cleaned here while stream/buffers/the Conn
+        // itself are handled by the errdefers above (issue #5).
+        errdefer c.deinitScratch();
 
         if (cfg.ssl_mode != .disable) try c.startTls();
 
@@ -247,6 +257,46 @@ pub const Conn = struct {
         var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
         c.io.random(&entropy);
 
+        // verify_ca / verify_full must verify a real CA chain; fail closed
+        // when no trusted root can be loaded.
+        const CaOpt = @TypeOf(@as(std.crypto.tls.Client.Options, undefined).ca);
+        var ca_opt: ?CaOpt = null;
+        if (c.cfg.ssl_mode == .verify_ca or c.cfg.ssl_mode == .verify_full) {
+            const bundle = c.gpa.create(std.crypto.Certificate.Bundle) catch
+                return error.OutOfMemory;
+            errdefer c.gpa.destroy(bundle);
+            bundle.* = .empty;
+            if (c.cfg.ca_file) |file| {
+                bundle.addCertsFromFilePath(c.gpa, c.io, std.Io.Timestamp.now(c.io, .real), Io.Dir.cwd(), file) catch {
+                    bundle.deinit(c.gpa);
+                    c.gpa.destroy(bundle);
+                    c.broken = true;
+                    return error.TlsUnsupported;
+                };
+            } else {
+                bundle.rescan(c.gpa, c.io, std.Io.Timestamp.now(c.io, .real)) catch {
+                    bundle.deinit(c.gpa);
+                    c.gpa.destroy(bundle);
+                    c.broken = true;
+                    return error.TlsUnsupported;
+                };
+            }
+            if (bundle.map.count() == 0) {
+                // Fail closed: no trusted roots available.
+                bundle.deinit(c.gpa);
+                c.gpa.destroy(bundle);
+                c.broken = true;
+                return error.TlsUnsupported;
+            }
+            c.ca_bundle = bundle;
+            ca_opt = .{ .bundle = .{
+                .gpa = c.gpa,
+                .io = c.io,
+                .lock = &c.ca_lock,
+                .bundle = bundle,
+            } };
+        }
+
         tls_client.* = std.crypto.tls.Client.init(
             &c.sock_rd.interface,
             &c.sock_wr.interface,
@@ -255,10 +305,7 @@ pub const Conn = struct {
                     .{ .explicit = c.cfg.host }
                 else
                     .no_verification,
-                .ca = switch (c.cfg.ssl_mode) {
-                    .verify_ca, .verify_full => .self_signed,
-                    else => .no_verification,
-                },
+                .ca = ca_opt orelse .no_verification,
                 .write_buffer = tls_mem[0..write_buffer_len],
                 .read_buffer = tls_mem[write_buffer_len..],
                 .entropy = &entropy,
@@ -459,14 +506,26 @@ pub const Conn = struct {
     }
 
     fn send(c: *Conn) Error!void {
-        c.wr.writeAll(c.wbuf.items) catch return error.ConnectionClosed;
-        c.wr.flush() catch return error.ConnectionClosed;
+        c.wr.writeAll(c.wbuf.items) catch {
+            c.broken = true;
+            return error.ConnectionClosed;
+        };
+        c.wr.flush() catch {
+            c.broken = true;
+            return error.ConnectionClosed;
+        };
         c.wbuf.clearRetainingCapacity();
     }
 
     fn rawWrite(c: *Conn, bytes: []const u8) !void {
-        try c.wr.writeAll(bytes);
-        try c.wr.flush();
+        c.wr.writeAll(bytes) catch {
+            c.broken = true;
+            return error.ConnectionClosed;
+        };
+        c.wr.flush() catch {
+            c.broken = true;
+            return error.ConnectionClosed;
+        };
     }
 
     // -------------------------------------------------------- message reading
@@ -760,6 +819,25 @@ pub const Conn = struct {
 
     // ---------------------------------------------------------------- close
 
+    /// Frees handshake/query scratch state (wbuf, msg, TLS). Used by both
+    /// `close` and the `connect` error path; leaves stream/buffers alone.
+    fn deinitScratch(c: *Conn) void {
+        if (c.ca_bundle) |b| {
+            b.deinit(c.gpa);
+            c.gpa.destroy(b);
+            c.ca_bundle = null;
+        }
+        if (c.tls) |t| {
+            t.end() catch {};
+            c.gpa.destroy(t);
+            c.gpa.free(c.tls_mem);
+            c.tls = null;
+        }
+        c.msg.deinit(c.gpa);
+        c.wbuf.deinit(c.gpa);
+        c.err_arena_state.deinit();
+    }
+
     pub fn close(c: *Conn) void {
         if (c.closed) return;
         c.closed = true;
@@ -771,18 +849,10 @@ pub const Conn = struct {
                 c.send() catch {};
             } else |_| {}
         }
-        if (c.tls) |t| {
-            t.end() catch {};
-            c.gpa.destroy(t);
-            c.gpa.free(c.tls_mem);
-            c.tls = null;
-        }
+        c.deinitScratch();
         c.gpa.free(c.sock_rd.interface.buffer);
         c.gpa.free(c.sock_wr.interface.buffer);
         c.stream.close(c.io);
-        c.msg.deinit(c.gpa);
-        c.wbuf.deinit(c.gpa);
-        c.err_arena_state.deinit();
         c.gpa.destroy(c);
     }
 

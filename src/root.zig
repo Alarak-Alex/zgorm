@@ -39,6 +39,12 @@ pub fn lastError(d: *Db) ?pq.PgError {
     return d.pool.last_error;
 }
 
+/// Concurrency-safe snapshot of the last server error, deep-copied into
+/// `arena`.
+pub fn lastErrorCopy(d: *Db, arena: std.mem.Allocator) ?pq.PgError {
+    return d.pool.lastErrorCopy(arena);
+}
+
 pub fn free(comptime T: type, v: T, gpa: std.mem.Allocator) void {
     value.freeValue(T, v, gpa);
 }

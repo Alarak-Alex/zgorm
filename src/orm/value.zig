@@ -927,6 +927,7 @@ pub fn scanRow(
     gpa: std.mem.Allocator,
 ) DecodeError!T {
     var out = std.mem.zeroInit(T, .{});
+    errdefer value_freePartiallyBuilt(T, &out, gpa);
     inline for (@typeInfo(T).@"struct".fields) |f| {
         inline for (table.columns) |col| {
             if (comptime std.mem.eql(u8, col.field_name, f.name)) {
@@ -939,6 +940,12 @@ pub fn scanRow(
         }
     }
     return out;
+}
+
+/// Frees the already-decoded heap fields of a partially constructed value
+/// (zeroed fields are empty/static and are skipped by freeValue).
+fn value_freePartiallyBuilt(comptime T: type, out: *T, gpa: std.mem.Allocator) void {
+    freeValue(T, out.*, gpa);
 }
 
 test "array param and parse round trip" {

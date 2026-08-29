@@ -286,16 +286,15 @@ pub fn Query(comptime T: type) type {
             defer res.deinit();
 
             const rows = out_gpa.alloc(T, res.rows.len) catch return error.OutOfMemory;
-            var ok = true;
-            for (res.rows, 0..) |row, i| {
-                rows[i] = value.scanRow(T, table, &res, row, out_gpa) catch {
-                    ok = false;
-                    break;
-                };
+            var decoded: usize = 0;
+            errdefer {
+                // Free every fully decoded row plus the row array itself.
+                for (rows[0..decoded]) |*r| value.freeValue(T, r.*, out_gpa);
+                out_gpa.free(rows);
             }
-            if (!ok) {
-                value.freeSlice(T, rows[0..0], out_gpa);
-                return error.TypeMismatch;
+            for (res.rows, 0..) |row, i| {
+                rows[i] = try value.scanRow(T, table, &res, row, out_gpa);
+                decoded = i + 1;
             }
             try q.applyPreloads(rows, out_gpa);
             q.deinit();

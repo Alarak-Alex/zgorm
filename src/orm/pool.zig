@@ -17,7 +17,10 @@ pub const Pool = struct {
     /// Connections currently existing (free + checked out).
     total: usize = 0,
     closed: bool = false,
-    /// Details of the most recent server error (diagnostic; not synchronized).
+    /// Details of the most recent server error. Guarded by `err_mutex` so
+    /// concurrent failed queries cannot tear the stored fields apart; the
+    /// returned slices remain valid until the next captured error.
+    err_mutex: std.Io.Mutex = .init,
     err_buf: [1024]u8 = undefined,
     last_error: ?pq.PgError = null,
 
@@ -25,6 +28,8 @@ pub const Pool = struct {
     /// outlives the session that observed it.
     pub fn captureError(p: *Pool, c: *pq.Conn) void {
         const src = c.last_error orelse return;
+        p.err_mutex.lockUncancelable(p.io);
+        defer p.err_mutex.unlock(p.io);
         var fbs: std.Io.Writer = .fixed(&p.err_buf);
         var e: pq.PgError = .{};
         e.severity = store(&fbs, src.severity);
@@ -38,6 +43,27 @@ pub const Pool = struct {
         e.column = store(&fbs, src.column);
         e.constraint = store(&fbs, src.constraint);
         p.last_error = e;
+    }
+
+    /// Snapshot of the most recent server error, deep-copied into `arena`.
+    /// Safe under concurrency: the pool's error buffer is locked while the
+    /// copy is made.
+    pub fn lastErrorCopy(p: *Pool, arena: std.mem.Allocator) ?pq.PgError {
+        p.err_mutex.lockUncancelable(p.io);
+        defer p.err_mutex.unlock(p.io);
+        const src = p.last_error orelse return null;
+        var e: pq.PgError = .{};
+        e.severity = arena.dupe(u8, src.severity) catch return null;
+        e.code = arena.dupe(u8, src.code) catch return null;
+        e.message = arena.dupe(u8, src.message) catch return null;
+        e.detail = arena.dupe(u8, src.detail) catch return null;
+        e.hint = arena.dupe(u8, src.hint) catch return null;
+        e.position = arena.dupe(u8, src.position) catch return null;
+        e.schema = arena.dupe(u8, src.schema) catch return null;
+        e.table = arena.dupe(u8, src.table) catch return null;
+        e.column = arena.dupe(u8, src.column) catch return null;
+        e.constraint = arena.dupe(u8, src.constraint) catch return null;
+        return e;
     }
 
     fn store(fbs: *std.Io.Writer, src: []const u8) []const u8 {

@@ -34,6 +34,19 @@ const SqlBuf = struct {
     }
 };
 
+/// Type-appropriate zero value used as DEFAULT when adding NOT NULL columns
+/// to existing tables (PostgreSQL requires a default for existing rows).
+fn zeroDefault(kind: schema.FieldKind) []const u8 {
+    return switch (kind) {
+        .integer, .unsigned, .float => "0",
+        .boolean => "false",
+        .text, .enum_, .bytes => "''",
+        .time => "now()",
+        .jsonb => "'{}'::jsonb",
+        .int_array, .uint_array, .float_array, .bool_array, .text_array => "'{}'",
+    };
+}
+
 /// One unit of work against the database. Db hands out sessions; a session
 /// inside a transaction pins a single connection.
 pub const Session = struct {
@@ -553,6 +566,21 @@ pub const Session = struct {
             var res = try s.execRaw(b.slice());
             res.deinit();
         } else {
+            // Does the table already have a primary key? Auto-increment
+            // columns can only carry PRIMARY KEY when none exists.
+            var table_has_pk = false;
+            {
+                var res = try s.exec(
+                    \\SELECT 1 FROM information_schema.table_constraints
+                    \\WHERE table_schema = current_schema() AND table_name = $1
+                    \\  AND constraint_type = 'PRIMARY KEY' LIMIT 1
+                ,
+                    .{table.name},
+                );
+                defer res.deinit();
+                table_has_pk = res.rows.len > 0;
+            }
+
             inline for (table.columns) |col| {
                 var found = false;
                 for (existing.items) |name| {
@@ -560,11 +588,30 @@ pub const Session = struct {
                 }
                 if (!found) {
                     var b = SqlBuf.init(arena);
-                    b.w().print("ALTER TABLE {s} ADD COLUMN IF NOT EXISTS {s} {s}", .{
+                    const w = b.w();
+                    w.print("ALTER TABLE {s} ADD COLUMN IF NOT EXISTS {s} ", .{
                         try qb_mod.quoteIdent(arena, table.name),
                         try qb_mod.quoteIdent(arena, col.name),
-                        col.ddl_type,
                     }) catch return error.OutOfMemory;
+                    if (col.is_auto) {
+                        // Serial implies NOT NULL + sequence default.
+                        const serial: []const u8 = if (std.mem.eql(u8, col.ddl_type, "integer"))
+                            "serial"
+                        else if (std.mem.eql(u8, col.ddl_type, "bigint"))
+                            "bigserial"
+                        else
+                            col.ddl_type;
+                        w.writeAll(serial) catch return error.OutOfMemory;
+                        if (!table_has_pk) w.writeAll(" PRIMARY KEY") catch return error.OutOfMemory;
+                    } else {
+                        w.writeAll(col.ddl_type) catch return error.OutOfMemory;
+                        if (!col.is_optional) {
+                            w.print(" NOT NULL DEFAULT {s}", .{zeroDefault(col.kind)}) catch return error.OutOfMemory;
+                        }
+                        if (col.is_pk and !table_has_pk) {
+                            w.writeAll(" PRIMARY KEY") catch return error.OutOfMemory;
+                        }
+                    }
                     var res = try s.execRaw(b.slice());
                     res.deinit();
                 }
@@ -808,6 +855,9 @@ pub const Db = struct {
     io: std.Io,
     /// Optional SQL logger (debug aid).
     logger: ?*const fn (sql: []const u8, params: []const pq.Param) void = null,
+    /// Owns the parsed Config strings for DSN-based connections so they live
+    /// as long as the pool (the pool only copies the slices).
+    cfg_arena: ?*std.heap.ArenaAllocator = null,
 
     pub fn connect(gpa: std.mem.Allocator, io: std.Io, cfg: pq.Config, max_connections: usize) Error!*Db {
         const d = try gpa.create(Db);
@@ -823,16 +873,29 @@ pub const Db = struct {
         return d;
     }
 
-    /// Parses `dsn` (URL or keyword form) and connects.
+    /// Parses `dsn` (URL or keyword form) and connects. The parsed strings
+    /// are owned by the returned Db and live until `deinit` — the caller's
+    /// DSN buffer may be freed immediately after this call.
     pub fn connectDsn(gpa: std.mem.Allocator, io: std.Io, dsn: []const u8, max_connections: usize) Error!*Db {
-        var arena_state = std.heap.ArenaAllocator.init(gpa);
-        defer arena_state.deinit();
-        const cfg = try pq.parseDsn(arena_state.allocator(), dsn);
-        return connect(gpa, io, cfg, max_connections);
+        const arena = try gpa.create(std.heap.ArenaAllocator);
+        errdefer gpa.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+
+        const cfg = try pq.parseDsn(arena.allocator(), dsn);
+        const d = try connect(gpa, io, cfg, max_connections);
+        // connect succeeded: hand the arena over to the Db.
+        d.cfg_arena = arena;
+        return d;
     }
 
     pub fn deinit(d: *Db) void {
         d.pool.deinit();
+        if (d.cfg_arena) |a| {
+            const gpa = d.gpa;
+            a.deinit();
+            gpa.destroy(a);
+        }
         d.gpa.destroy(d);
     }
 
@@ -887,9 +950,17 @@ pub const Db = struct {
     }
 
     /// Details (SQLSTATE, message, constraint, ...) of the most recent
-    /// server error observed through this handle.
+    /// server error observed through this handle. The returned slices point
+    /// into the pool's diagnostic buffer and are valid until the next
+    /// captured error on any session of this Db.
     pub fn lastError(d: *Db) ?pq.PgError {
         return d.pool.last_error;
+    }
+
+    /// Concurrency-safe variant of `lastError`: returns a snapshot whose
+    /// strings are deep-copied into `arena`.
+    pub fn lastErrorCopy(d: *Db, arena: std.mem.Allocator) ?pq.PgError {
+        return d.pool.lastErrorCopy(arena);
     }
     pub fn exec(d: *Db, sql: []const u8, args: anytype) Error!pq.Result {
         var s = d.session();

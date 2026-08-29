@@ -611,3 +611,93 @@ test "v2: migration versioning" {
 
     drop(try db.execRaw("DROP TABLE IF EXISTS schema_migrations CASCADE"));
 }
+
+test "v3: issue fixes regression" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dsn = test_options.dsn orelse return error.SkipZigTest;
+
+    // Issue #5: a failed connect (wrong password) must not leak conn state.
+    // The DebugAllocator above reports leaks on deinit, so this test failing
+    // to clean up would surface as an error log.
+    {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const cfg = try z.pq.parseDsn(arena_state.allocator(), dsn);
+        var bad = cfg;
+        bad.password = "definitely-not-the-password";
+        try std.testing.expectError(error.AuthenticationFailed, z.Db.connect(gpa, io, bad, 1));
+    }
+
+    const db = try z.Db.connectDsn(gpa, io, dsn, 8);
+    defer db.deinit();
+
+    // Issue #8: adding missing columns to an existing table keeps the same
+    // constraints as CREATE TABLE (NOT NULL + DEFAULT; serial for auto PK).
+    drop(try db.execRaw("DROP TABLE IF EXISTS v3_fix CASCADE"));
+    var created = try db.execRaw("CREATE TABLE v3_fix (title text NOT NULL)"); // no id yet
+    created.deinit();
+    const OldShape = struct {
+        title: []const u8 = "",
+    };
+    _ = OldShape;
+    const Full = struct {
+        id: ?i64 = null,
+        title: []const u8 = "",
+        note: []const u8 = "",
+        flag: bool = false,
+        pub const zorm = .{ .table = "v3_fix" };
+    };
+    try db.autoMigrate(Full);
+    var row = Full{ .title = "t" };
+    try db.insert(&row); // would fail if id serial/NOT NULL constraints were missing
+    var info = try db.exec(
+        \\SELECT column_name, is_nullable, column_default FROM information_schema.columns
+        \\WHERE table_schema = current_schema() AND table_name = 'v3_fix' AND column_name IN ('id','note','flag')
+        \\ORDER BY column_name
+    , .{});
+    defer info.deinit();
+    try std.testing.expectEqual(@as(usize, 3), info.rows.len);
+    // note/flag must be NOT NULL with a non-null default.
+    for (info.rows) |r| {
+        const name = r[0].?;
+        if (std.mem.eql(u8, name, "note") or std.mem.eql(u8, name, "flag")) {
+            try std.testing.expectEqualStrings("NO", r[1].?);
+            try std.testing.expect(r[2] != null);
+        }
+    }
+
+    // Issue #2: the pool can open new connections long after connectDsn
+    // returned (DSN strings must remain valid). Force an extra connection
+    // through a second session + transaction while one is pinned.
+    {
+        var tx = try db.begin();
+        var pinned = try db.execRaw("SELECT 1");
+        pinned.deinit();
+        var other = try z.Db.connectDsn(gpa, io, dsn, 1); // fresh pool, same path
+        defer other.deinit();
+        var r2 = try other.execRaw("SELECT 2");
+        r2.deinit();
+        try tx.commit();
+    }
+
+    // Issue #6: lastErrorCopy returns a deep-copied snapshot.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var dup = User{ .name = "dup", .email = "dup@example.com" };
+    try db.insert(&dup);
+    var dup2 = User{ .name = "dup2", .email = "dup@example.com" };
+    try std.testing.expectError(error.UniqueViolation, db.insert(&dup2));
+    const snapshot = z.lastErrorCopy(db, arena_state.allocator());
+    try std.testing.expect(snapshot != null);
+    try std.testing.expectEqualStrings("23505", snapshot.?.code);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot.?.message, "unique") != null);
+
+    _ = try db.deleteWhere(User, "true", .{});
+    _ = try db.deleteWhere(Full, "true", .{});
+    drop(try db.execRaw("DROP TABLE IF EXISTS v3_fix CASCADE"));
+}
