@@ -3,7 +3,7 @@
 //! stderr; replace it per-`Db` with `db.setLogger(...)`.
 
 const std = @import("std");
-const pq = @import("../pq.zig");
+const pq = @import("../drivers/postgres/root.zig");
 const time_mod = @import("time.zig");
 const value_mod = @import("value.zig");
 

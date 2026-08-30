@@ -2,13 +2,48 @@
 //! typed Zig values. All decoding happens against PostgreSQL's text format.
 
 const std = @import("std");
-const pq = @import("../pq.zig");
+const pq = @import("../drivers/postgres/root.zig");
 const time_mod = @import("time.zig");
 const schema = @import("schema.zig");
 
 pub const Time = time_mod.Time;
 pub const Error = pq.Error;
 const Param = pq.Param;
+pub const DecodeError = error{ NullValue, TypeMismatch, OutOfMemory };
+
+fn hasCodec(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct", .@"enum", .@"union" => @hasDecl(T, "zormEncode") and @hasDecl(T, "zormDecode"),
+        else => false,
+    };
+}
+
+pub fn TextScalar(comptime ddl: []const u8) type {
+    return struct {
+        data: []const u8,
+        pub const zormDdl = ddl;
+
+        pub fn zormEncode(self: @This(), _: std.mem.Allocator) Error!Param {
+            return .{ .oid = 0, .format = 0, .data = self.data };
+        }
+
+        pub fn zormDecode(
+            data: []const u8,
+            _: u32,
+            _: u16,
+            gpa: std.mem.Allocator,
+        ) DecodeError!@This() {
+            return .{ .data = gpa.dupe(u8, data) catch return error.OutOfMemory };
+        }
+    };
+}
+
+pub const Uuid = TextScalar("uuid");
+pub const Decimal = TextScalar("numeric");
+pub const Inet = TextScalar("inet");
+pub const Cidr = TextScalar("cidr");
+pub const Range = TextScalar("numrange");
+pub const Geometry = TextScalar("geometry");
 
 /// Converts a comptime-typed value into a driver parameter. Scalars are
 /// pre-encoded in PostgreSQL's binary format (with an explicit type OID so
@@ -16,6 +51,7 @@ const Param = pq.Param;
 /// format. All scratch memory comes from `arena`.
 pub fn toParam(value: anytype, arena: std.mem.Allocator) Error!Param {
     const T = @TypeOf(value);
+    if (comptime hasCodec(T)) return value.zormEncode(arena);
     var num_buf: [64]u8 = undefined;
     return switch (@typeInfo(T)) {
         .null => Param.nullParam(proto.Oid.text),
@@ -95,21 +131,23 @@ pub fn toParam(value: anytype, arena: std.mem.Allocator) Error!Param {
         },
         .@"struct" => blk: {
             if (@hasDecl(T, "__zorm_time")) {
-                // timestamptz binary format: i64 microseconds since
-                // 2000-01-01T00:00:00Z (PostgreSQL's internal epoch).
+                // PostgreSQL receives its native binary instant; other
+                // drivers use the canonical timestamp text.
                 var buf: [8]u8 = undefined;
                 const pg_micros = value.micros - pg_epoch_us;
                 std.mem.writeInt(u64, &buf, @bitCast(pg_micros), .big);
+                var text_buf: [Time.pg_text_len]u8 = undefined;
                 break :blk mkBinary(.{
                     .oid = proto.Oid.timestamptz,
+                    .canonical = arena.dupe(u8, value.toPgText(&text_buf)) catch return error.OutOfMemory,
                     .data = arena.dupe(u8, &buf) catch return error.OutOfMemory,
                 });
             }
             if (@hasDecl(T, "__zorm_json")) {
-                break :blk mkText(.{ .oid = proto.Oid.jsonb, .data = value.data });
+                break :blk mkText(.{ .oid = proto.Oid.jsonb, .kind = .json, .data = value.data });
             }
             if (@hasDecl(T, "__zorm_bytes")) {
-                break :blk mkBinary(.{ .oid = proto.Oid.bytea, .data = value.data });
+                break :blk mkBinary(.{ .oid = proto.Oid.bytea, .kind = .bytes, .data = value.data });
             }
             @compileError("zorm: unsupported parameter type " ++ @typeName(T));
         },
@@ -117,7 +155,7 @@ pub fn toParam(value: anytype, arena: std.mem.Allocator) Error!Param {
     };
 }
 
-pub const proto = @import("../pq/proto.zig");
+pub const proto = @import("../drivers/postgres/proto.zig");
 
 /// PostgreSQL internal epoch: 2000-01-01T00:00:00Z, in Unix microseconds.
 pub const pg_epoch_us: i64 = 946_684_800_000_000;
@@ -189,12 +227,28 @@ pub const Bytes = struct {
 fn mkBinary(p: Param) Param {
     var r = p;
     r.format = 1;
+    r.kind = switch (r.oid) {
+        proto.Oid.bool_ => .boolean,
+        proto.Oid.int8 => .signed,
+        proto.Oid.float8 => .float,
+        proto.Oid.timestamptz => .time,
+        proto.Oid.bytea => .bytes,
+        proto.Oid.jsonb => .json,
+        else => .text,
+    };
     return r;
 }
 
 fn mkText(p: Param) Param {
     var r = p;
     r.format = 0;
+    r.kind = switch (r.oid) {
+        proto.Oid.numeric => .signed,
+        proto.Oid.json, proto.Oid.jsonb => .json,
+        proto.Oid.bytea => .bytes,
+        proto.Oid.timestamptz => .time,
+        else => .text,
+    };
     return r;
 }
 
@@ -204,6 +258,7 @@ fn intParam(v: i64, arena: std.mem.Allocator) Error!Param {
     return .{
         .oid = proto.Oid.int8,
         .format = 1,
+        .kind = .signed,
         .data = arena.dupe(u8, &buf) catch return error.OutOfMemory,
     };
 }
@@ -212,6 +267,7 @@ fn numericParam(digits: []const u8, arena: std.mem.Allocator) Error!Param {
     return .{
         .oid = proto.Oid.numeric,
         .format = 0,
+        .kind = .signed,
         .data = try arena.dupe(u8, digits),
     };
 }
@@ -559,8 +615,6 @@ fn decodeArrayElement(comptime E: type, raw: []const u8, quoted: bool, present: 
     }
 }
 
-pub const DecodeError = error{ NullValue, TypeMismatch, OutOfMemory };
-
 /// Decodes one result cell into `T`. `format` selects the wire encoding:
 /// 0 = text, 1 = binary. Returned strings/arrays are duplicated with `gpa`.
 pub fn decodeCell(comptime T: type, cell: ?[]const u8, type_oid: u32, format: u16, gpa: std.mem.Allocator) DecodeError!T {
@@ -570,6 +624,12 @@ pub fn decodeCell(comptime T: type, cell: ?[]const u8, type_oid: u32, format: u1
         return try decodeCell(Child, cell, type_oid, format, gpa);
     }
     const data = cell orelse return error.NullValue;
+    if (comptime hasCodec(T)) {
+        return T.zormDecode(data, type_oid, format, gpa) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.TypeMismatch,
+        };
+    }
     return switch (format) {
         1 => decodeBinary(T, data, type_oid, gpa),
         else => decodeText(T, data, type_oid, gpa),

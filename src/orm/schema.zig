@@ -48,6 +48,8 @@ pub const FieldKind = enum {
     jsonb,
     /// `zorm.Bytes` wrapper <-> `bytea` column.
     bytes,
+    /// User-defined scalar with zormEncode/zormDecode and zormDdl.
+    custom,
 };
 
 pub const Column = struct {
@@ -68,16 +70,24 @@ pub const Column = struct {
 
 /// One declared association (`belongs_to` or `has_many`).
 pub const Assoc = struct {
-    pub const Kind = enum { has_many, belongs_to };
+    pub const Kind = enum { belongs_to, has_one, has_many, many_to_many };
 
     field_name: []const u8, // Zig field on this model
     model: type, // the associated model
-    /// Column holding the foreign key:
     ///   has_many   -> column on the *associated* model pointing at this pk
     ///   belongs_to -> column on *this* model pointing at the associated pk
     foreign_key: []const u8,
     /// Field of the associated model used as the key (default `id`).
     primary_key: []const u8 = "id",
+    foreign_keys: []const []const u8 = &.{},
+    primary_keys: []const []const u8 = &.{},
+    join_table: []const u8 = "",
+    join_foreign_key: []const u8 = "",
+    join_association_key: []const u8 = "",
+    association_key: []const u8 = "id",
+    polymorphic_type: []const u8 = "",
+    polymorphic_value: []const u8 = "",
+    cascade_delete: bool = false,
     kind: Kind,
 };
 
@@ -88,8 +98,12 @@ pub const Table = struct {
     /// Declared associations, excluded from `columns`.
     assocs: []const Assoc = &.{},
     pk_index: ?usize = null,
+    /// All primary-key column indexes; length > 1 denotes a composite key.
+    pk_indexes: []const usize = &.{},
     created_at_index: ?usize = null,
     updated_at_index: ?usize = null,
+    /// Integer field used for optimistic locking.
+    version_index: ?usize = null,
     /// Index of the `deleted_at` column when the model declares one —
     /// enables soft-delete semantics (filter + stamped deletes).
     deleted_at_index: ?usize = null,
@@ -100,6 +114,11 @@ pub const Table = struct {
 
     pub fn pk(t: *const Table) ?Column {
         const i = t.pk_index orelse return null;
+        return t.columns[i];
+    }
+
+    pub fn version(t: *const Table) ?Column {
+        const i = t.version_index orelse return null;
         return t.columns[i];
     }
 
@@ -149,6 +168,7 @@ fn ddlType(comptime kind: FieldKind, comptime T: type) []const u8 {
         .text_array => "text[]",
         .jsonb => "jsonb",
         .bytes => "bytea",
+        .custom => T.zormDdl,
     };
 }
 
@@ -180,11 +200,13 @@ fn kindOf(comptime T: type) FieldKind {
             @compileError("zorm: unsupported field type " ++ @typeName(T) ++
                 " (only []const u8 / []u8 slices are supported for strings)");
         },
-        .@"enum" => FieldKind.enum_,
+        .@"enum" => if (@hasDecl(T, "zormEncode") and @hasDecl(T, "zormDecode") and @hasDecl(T, "zormDdl")) FieldKind.custom else FieldKind.enum_,
         .@"struct" => blk: {
             if (@hasDecl(T, "__zorm_time")) break :blk FieldKind.time;
             if (@hasDecl(T, "__zorm_json")) break :blk FieldKind.jsonb;
             if (@hasDecl(T, "__zorm_bytes")) break :blk FieldKind.bytes;
+            if (@hasDecl(T, "zormEncode") and @hasDecl(T, "zormDecode") and @hasDecl(T, "zormDdl"))
+                break :blk FieldKind.custom;
             @compileError("zorm: unsupported struct field type " ++ @typeName(T) ++
                 " (zorm.Time / zorm.Json / zorm.Bytes are the supported struct column types)");
         },
@@ -229,12 +251,18 @@ fn makeColumn(
 
     const kind = comptime kindOf(Inner);
     const is_pk = blk: {
-        if (pk_field) |p| break :blk std.mem.eql(u8, p, fname);
+        if (@hasField(@TypeOf(opts), "primary_keys")) {
+            inline for (opts.primary_keys) |name| {
+                if (std.mem.eql(u8, name, fname)) break :blk true;
+            }
+            break :blk false;
+        }
+        if (pk_field) |name| break :blk std.mem.eql(u8, name, fname);
         break :blk false;
     };
     // Auto-increment: integer primary key stored as an optional (null ->
     // let the sequence fill it).
-    const is_auto = is_pk and is_optional and (kind == .integer or kind == .unsigned);
+    const is_auto = is_pk and !@hasField(@TypeOf(opts), "primary_keys") and is_optional and (kind == .integer or kind == .unsigned);
 
     return .{
         .name = col_name,
@@ -269,12 +297,20 @@ pub fn tableOf(comptime T: type) Table {
         opts.primary_key
     else if (hasIdLeaf(T)) "id" else null;
 
+    const version_field: ?[]const u8 = if (@hasField(@TypeOf(opts), "version"))
+        opts.version
+    else if (@hasField(T, "version"))
+        "version"
+    else
+        null;
+
     comptime var columns: []const Column = &.{};
     comptime var assocs: []const Assoc = &.{};
-    comptime var pk_index: ?usize = null;
+    comptime var pk_indexes: []const usize = &.{};
     comptime var created_at_index: ?usize = null;
     comptime var updated_at_index: ?usize = null;
     comptime var deleted_at_index: ?usize = null;
+    comptime var version_index: ?usize = null;
     // Column list index (struct fields can be skipped via `.ignore`).
     comptime var col_i: usize = 0;
 
@@ -287,10 +323,13 @@ pub fn tableOf(comptime T: type) Table {
             inline for (@typeInfo(FT_raw).@"struct".fields) |sub| {
                 const col = comptime makeColumn(fname, sub, sub.name, opts, pk_field);
                 columns = columns ++ &[_]Column{col};
-                if (col.is_pk) pk_index = col_i;
+                if (col.is_pk) pk_indexes = pk_indexes ++ &[_]usize{col_i};
                 if (comptime std.mem.eql(u8, col.name, "created_at")) created_at_index = col_i;
                 if (comptime std.mem.eql(u8, col.name, "updated_at")) updated_at_index = col_i;
                 if (comptime std.mem.eql(u8, col.name, "deleted_at")) deleted_at_index = col_i;
+                if (version_field) |name| {
+                    if (comptime std.mem.eql(u8, col.field_name, name)) version_index = col_i;
+                }
                 col_i += 1;
             }
             continue;
@@ -302,12 +341,37 @@ pub fn tableOf(comptime T: type) Table {
             inline for (@typeInfo(@TypeOf(opts.belongs_to)).@"struct".fields) |af| {
                 if (comptime std.mem.eql(u8, af.name, fname)) {
                     const cfg = @field(opts.belongs_to, af.name);
+                    const foreign_key = if (@hasField(@TypeOf(cfg), "foreign_key")) cfg.foreign_key else cfg.foreign_keys[0];
+                    const primary_key = if (@hasField(@TypeOf(cfg), "primary_key")) cfg.primary_key else if (@hasField(@TypeOf(cfg), "primary_keys")) cfg.primary_keys[0] else "id";
+                    assocs = assocs ++ &[_]Assoc{.{
+                        .field_name = fname,
+                        .model = cfg.model,
+                        .foreign_key = foreign_key,
+                        .primary_key = primary_key,
+                        .foreign_keys = if (@hasField(@TypeOf(cfg), "foreign_keys")) cfg.foreign_keys else &.{foreign_key},
+                        .primary_keys = if (@hasField(@TypeOf(cfg), "primary_keys")) cfg.primary_keys else &.{primary_key},
+                        .kind = .belongs_to,
+                    }};
+                    is_assoc = true;
+                }
+            }
+        }
+        if (!is_assoc and @hasField(@TypeOf(opts), "has_one")) {
+            inline for (@typeInfo(@TypeOf(opts.has_one)).@"struct".fields) |af| {
+                if (comptime std.mem.eql(u8, af.name, fname)) {
+                    const cfg = @field(opts.has_one, af.name);
+                    const primary_key = if (@hasField(@TypeOf(cfg), "primary_key")) cfg.primary_key else "id";
                     assocs = assocs ++ &[_]Assoc{.{
                         .field_name = fname,
                         .model = cfg.model,
                         .foreign_key = cfg.foreign_key,
-                        .primary_key = if (@hasField(@TypeOf(cfg), "primary_key")) cfg.primary_key else "id",
-                        .kind = .belongs_to,
+                        .primary_key = primary_key,
+                        .foreign_keys = &.{cfg.foreign_key},
+                        .primary_keys = &.{primary_key},
+                        .polymorphic_type = if (@hasField(@TypeOf(cfg), "polymorphic_type")) cfg.polymorphic_type else "",
+                        .polymorphic_value = if (@hasField(@TypeOf(cfg), "polymorphic_value")) cfg.polymorphic_value else "",
+                        .cascade_delete = if (@hasField(@TypeOf(cfg), "cascade_delete")) cfg.cascade_delete else false,
+                        .kind = .has_one,
                     }};
                     is_assoc = true;
                 }
@@ -317,12 +381,43 @@ pub fn tableOf(comptime T: type) Table {
             inline for (@typeInfo(@TypeOf(opts.has_many)).@"struct".fields) |af| {
                 if (comptime std.mem.eql(u8, af.name, fname)) {
                     const cfg = @field(opts.has_many, af.name);
+                    const foreign_key = if (@hasField(@TypeOf(cfg), "foreign_key")) cfg.foreign_key else cfg.foreign_keys[0];
+                    const primary_key = if (@hasField(@TypeOf(cfg), "primary_key")) cfg.primary_key else if (@hasField(@TypeOf(cfg), "primary_keys")) cfg.primary_keys[0] else "id";
+                    assocs = assocs ++ &[_]Assoc{.{
+                        .field_name = fname,
+                        .model = cfg.model,
+                        .foreign_key = foreign_key,
+                        .primary_key = primary_key,
+                        .foreign_keys = if (@hasField(@TypeOf(cfg), "foreign_keys")) cfg.foreign_keys else &.{foreign_key},
+                        .primary_keys = if (@hasField(@TypeOf(cfg), "primary_keys")) cfg.primary_keys else &.{primary_key},
+                        .polymorphic_type = if (@hasField(@TypeOf(cfg), "polymorphic_type")) cfg.polymorphic_type else "",
+                        .polymorphic_value = if (@hasField(@TypeOf(cfg), "polymorphic_value")) cfg.polymorphic_value else "",
+                        .cascade_delete = if (@hasField(@TypeOf(cfg), "cascade_delete")) cfg.cascade_delete else false,
+                        .kind = .has_many,
+                    }};
+                    is_assoc = true;
+                }
+            }
+        }
+        if (!is_assoc and @hasField(@TypeOf(opts), "many_to_many")) {
+            inline for (@typeInfo(@TypeOf(opts.many_to_many)).@"struct".fields) |af| {
+                if (comptime std.mem.eql(u8, af.name, fname)) {
+                    const cfg = @field(opts.many_to_many, af.name);
+                    const primary_key = if (@hasField(@TypeOf(cfg), "primary_key")) cfg.primary_key else "id";
+                    const association_key = if (@hasField(@TypeOf(cfg), "association_key")) cfg.association_key else "id";
                     assocs = assocs ++ &[_]Assoc{.{
                         .field_name = fname,
                         .model = cfg.model,
                         .foreign_key = cfg.foreign_key,
-                        .primary_key = if (@hasField(@TypeOf(cfg), "primary_key")) cfg.primary_key else "id",
-                        .kind = .has_many,
+                        .primary_key = primary_key,
+                        .foreign_keys = &.{cfg.foreign_key},
+                        .primary_keys = &.{primary_key},
+                        .join_table = cfg.join_table,
+                        .join_foreign_key = cfg.join_foreign_key,
+                        .join_association_key = cfg.join_association_key,
+                        .association_key = association_key,
+                        .cascade_delete = if (@hasField(@TypeOf(cfg), "cascade_delete")) cfg.cascade_delete else false,
+                        .kind = .many_to_many,
                     }};
                     is_assoc = true;
                 }
@@ -342,10 +437,13 @@ pub fn tableOf(comptime T: type) Table {
         const col = comptime makeColumn(null, field, fname, opts, pk_field);
         columns = columns ++ &[_]Column{col};
 
-        if (col.is_pk) pk_index = col_i;
+        if (col.is_pk) pk_indexes = pk_indexes ++ &[_]usize{col_i};
         if (comptime std.mem.eql(u8, col.name, "created_at")) created_at_index = col_i;
         if (comptime std.mem.eql(u8, col.name, "updated_at")) updated_at_index = col_i;
         if (comptime std.mem.eql(u8, col.name, "deleted_at")) deleted_at_index = col_i;
+        if (version_field) |name| {
+            if (comptime std.mem.eql(u8, col.field_name, name)) version_index = col_i;
+        }
         col_i += 1;
     }
 
@@ -356,6 +454,20 @@ pub fn tableOf(comptime T: type) Table {
                 @compileError("zorm: model " ++ @typeName(T) ++ " has duplicate column name '" ++ a.name ++ "'");
             }
         }
+    }
+
+    if (@hasField(@TypeOf(opts), "primary_keys") and pk_indexes.len != opts.primary_keys.len)
+        @compileError("zorm: one or more configured primary-key fields do not exist on " ++ @typeName(T));
+    const pk_index: ?usize = if (pk_indexes.len == 1) pk_indexes[0] else null;
+
+    if (version_field != null and version_index == null)
+        @compileError("zorm: configured version field does not exist on " ++ @typeName(T));
+    if (version_index) |index| {
+        const version_col = columns[index];
+        if (version_col.kind != .integer and version_col.kind != .unsigned)
+            @compileError("zorm: version field must be an integer on " ++ @typeName(T));
+        if (version_col.is_optional)
+            @compileError("zorm: version field must be non-optional on " ++ @typeName(T));
     }
 
     comptime var unique: []const []const u8 = &.{};
@@ -373,9 +485,11 @@ pub fn tableOf(comptime T: type) Table {
         .columns = columns,
         .assocs = assocs,
         .pk_index = pk_index,
+        .pk_indexes = pk_indexes,
         .created_at_index = created_at_index,
         .updated_at_index = updated_at_index,
         .deleted_at_index = deleted_at_index,
+        .version_index = version_index,
         .unique = unique,
         .indexes = indexes,
     };

@@ -9,13 +9,49 @@
 //! the builder and release its scratch memory.
 
 const std = @import("std");
-const pq = @import("../pq.zig");
+const pq = @import("../drivers/postgres/root.zig");
 const db_mod = @import("db.zig");
 const schema = @import("schema.zig");
 const time_mod = @import("time.zig");
 const value = @import("value.zig");
 
 pub const Error = pq.Error;
+
+pub const DryRun = struct {
+    sql: []u8,
+    params: []pq.Param,
+    gpa: std.mem.Allocator,
+
+    pub fn deinit(d: *DryRun) void {
+        for (d.params) |param| if (param.data.len > 0) d.gpa.free(param.data);
+        d.gpa.free(d.params);
+        d.gpa.free(d.sql);
+    }
+};
+
+fn writeNamed(w: *std.Io.Writer, frag: []const u8, comptime fields: anytype, start: usize) !void {
+    var i: usize = 0;
+    while (i < frag.len) {
+        if (frag[i] != ':' or (i + 1 < frag.len and frag[i + 1] == ':')) {
+            try w.writeByte(frag[i]);
+            i += 1;
+            continue;
+        }
+        var end = i + 1;
+        while (end < frag.len and (std.ascii.isAlphanumeric(frag[end]) or frag[end] == '_')) end += 1;
+        if (end == i + 1) return error.InvalidQuery;
+        const name = frag[i + 1 .. end];
+        var found = false;
+        inline for (fields, 0..) |field, field_index| {
+            if (std.mem.eql(u8, name, field.name)) {
+                try w.print("${d}", .{start + field_index + 1});
+                found = true;
+            }
+        }
+        if (!found) return error.InvalidQuery;
+        i = end;
+    }
+}
 
 pub fn Query(comptime T: type) type {
     const table = comptime schema.tableOf(T);
@@ -28,6 +64,24 @@ pub fn Query(comptime T: type) type {
             args_start: usize,
         };
 
+        const Fragment = struct {
+            sql: []const u8,
+            args_start: usize,
+        };
+
+        const Cte = struct {
+            name: []const u8,
+            sql: []const u8,
+            args_start: usize,
+            recursive: bool,
+        };
+
+        const Union = struct {
+            sql: []const u8,
+            args_start: usize,
+            all: bool,
+        };
+
         sess: *db_mod.Session,
         /// True when the query owns its (heap) session — one-shot Db queries.
         owns_session: bool = false,
@@ -35,6 +89,10 @@ pub fn Query(comptime T: type) type {
         err: ?Error = null,
 
         cols: ?[]const []const u8 = null,
+        returning_cols: ?[]const []const u8 = null,
+        raw_cols: ?[]const []const u8 = null,
+        distinct_on_cols: ?[]const []const u8 = null,
+        hint_text: ?[]const u8 = null,
         is_distinct: bool = false,
         /// Comptime-verified association field names to preload.
         preloads: std.ArrayList([]const u8) = .empty,
@@ -46,10 +104,14 @@ pub fn Query(comptime T: type) type {
         args: std.ArrayList(pq.Param) = .empty,
         orders: std.ArrayList([]const u8) = .empty,
         groups: std.ArrayList([]const u8) = .empty,
+        joins: std.ArrayList(Fragment) = .empty,
+        ctes: std.ArrayList(Cte) = .empty,
+        unions: std.ArrayList(Union) = .empty,
         having_cond: ?Cond = null,
         limit_n: ?i64 = null,
         offset_n: ?i64 = null,
         for_update_flag: bool = false,
+        timeout_ms: u64 = 0,
 
         fn a(q: *Self) std.mem.Allocator {
             return q.arena.allocator();
@@ -63,6 +125,9 @@ pub fn Query(comptime T: type) type {
             const sess = q.sess;
             const owns_session = q.owns_session;
             q.conds.deinit(gpa);
+            q.joins.deinit(gpa);
+            q.ctes.deinit(gpa);
+            q.unions.deinit(gpa);
             q.args.deinit(gpa);
             arena.deinit();
             gpa.destroy(arena);
@@ -82,8 +147,92 @@ pub fn Query(comptime T: type) type {
             return q;
         }
 
+        /// Selects trusted SQL expressions without identifier quoting. This
+        /// covers CASE, window functions, JSON, and array operators.
+        pub fn selectRaw(q: *Self, expressions: []const []const u8) *Self {
+            q.raw_cols = expressions;
+            return q;
+        }
+
+        pub fn distinctOn(q: *Self, cols: []const []const u8) *Self {
+            q.distinct_on_cols = cols;
+            return q;
+        }
+
+        /// Adds a PostgreSQL optimizer hint comment after SELECT.
+        pub fn hint(q: *Self, text: []const u8) *Self {
+            q.hint_text = text;
+            return q;
+        }
+
+        /// Applies a reusable query scope.
+        pub fn scope(q: *Self, apply: anytype) *Self {
+            return apply(q);
+        }
+
+        /// Adds a trusted JOIN fragment, e.g. `JOIN teams ON teams.id = users.team_id`.
+        pub fn join(q: *Self, sql: []const u8, args: anytype) *Self {
+            return q.addFragment(&q.joins, sql, args);
+        }
+
+        /// Adds `EXISTS (<subquery>)` as a parameterized predicate.
+        pub fn whereExists(q: *Self, sql: []const u8, args: anytype) *Self {
+            const frag = std.fmt.allocPrint(q.a(), "EXISTS ({s})", .{sql}) catch return q.errOut();
+            return q.addCond(frag, args, false);
+        }
+
+        pub fn with(q: *Self, name: []const u8, sql: []const u8, args: anytype) *Self {
+            return q.addCte(name, sql, args, false);
+        }
+
+        pub fn withRecursive(q: *Self, name: []const u8, sql: []const u8, args: anytype) *Self {
+            return q.addCte(name, sql, args, true);
+        }
+
+        pub fn unionWith(q: *Self, sql: []const u8, args: anytype) *Self {
+            return q.addUnion(sql, args, false);
+        }
+
+        pub fn unionAll(q: *Self, sql: []const u8, args: anytype) *Self {
+            return q.addUnion(sql, args, true);
+        }
+
+        /// Adds a predicate using `:field` placeholders from a struct.
+        pub fn whereNamed(q: *Self, frag: []const u8, named: anytype) *Self {
+            const info = @typeInfo(@TypeOf(named));
+            if (info != .@"struct" or info.@"struct".is_tuple)
+                @compileError("zorm: whereNamed expects a named struct");
+            const start = q.args.items.len;
+            inline for (info.@"struct".fields) |field| {
+                const param = value.toParam(@field(named, field.name), q.a()) catch return q.errOut();
+                q.args.append(q.sess.gpa, param) catch return q.errOut();
+            }
+            var aw: std.Io.Writer.Allocating = .init(q.a());
+            writeNamed(&aw.writer, frag, info.@"struct".fields, start) catch {
+                q.err = error.InvalidQuery;
+                return q;
+            };
+            q.conds.append(q.sess.gpa, .{
+                .frag = aw.writer.buffered(),
+                .args_start = 0,
+            }) catch return q.errOut();
+            return q;
+        }
+
+        /// Configures columns emitted by mutation RETURNING clauses.
+        pub fn returning(q: *Self, cols: []const []const u8) *Self {
+            q.returning_cols = cols;
+            return q;
+        }
+
         pub fn distinct(q: *Self) *Self {
             q.is_distinct = true;
+            return q;
+        }
+
+        /// Applies a client-side deadline to this terminal operation.
+        pub fn timeout(q: *Self, timeout_ms: u64) *Self {
+            q.timeout_ms = timeout_ms;
             return q;
         }
 
@@ -108,6 +257,13 @@ pub fn Query(comptime T: type) type {
             comptime validatePreloadPath(T, path);
             q.preloads.append(q.a(), path) catch return q.errOut();
             return q;
+        }
+
+        /// Preloads an association through the association metadata. The
+        /// result contract matches `preload`; singular and many-to-many
+        /// associations use their configured join keys.
+        pub fn joinPreload(q: *Self, comptime path: []const u8) *Self {
+            return q.preload(path);
         }
 
         /// Adds a condition combined with OR with everything before it.
@@ -203,11 +359,39 @@ pub fn Query(comptime T: type) type {
             return q;
         }
 
+        fn addFragment(q: *Self, list: *std.ArrayList(Fragment), sql: []const u8, args: anytype) *Self {
+            const params = value.argsToParams(args, q.a()) catch return q.errOut();
+            const start = q.args.items.len;
+            q.args.appendSlice(q.sess.gpa, params) catch return q.errOut();
+            list.append(q.sess.gpa, .{ .sql = sql, .args_start = start }) catch return q.errOut();
+            return q;
+        }
+
+        fn addCte(q: *Self, name: []const u8, sql: []const u8, args: anytype, recursive: bool) *Self {
+            const params = value.argsToParams(args, q.a()) catch return q.errOut();
+            const start = q.args.items.len;
+            q.args.appendSlice(q.sess.gpa, params) catch return q.errOut();
+            q.ctes.append(q.sess.gpa, .{ .name = name, .sql = sql, .args_start = start, .recursive = recursive }) catch return q.errOut();
+            return q;
+        }
+
+        fn addUnion(q: *Self, sql: []const u8, args: anytype, union_all: bool) *Self {
+            const params = value.argsToParams(args, q.a()) catch return q.errOut();
+            const start = q.args.items.len;
+            q.args.appendSlice(q.sess.gpa, params) catch return q.errOut();
+            q.unions.append(q.sess.gpa, .{ .sql = sql, .args_start = start, .all = union_all }) catch return q.errOut();
+            return q;
+        }
+
         // ------------------------------------------------------------ build
 
         /// Writes `WHERE ...` (or nothing when no conditions) into `w`.
         /// Prepends the soft-delete filter unless unscoped.
         fn buildWhere(q: *Self, w: *std.Io.Writer) !void {
+            return q.buildWhereOffset(w, 0);
+        }
+
+        fn buildWhereOffset(q: *Self, w: *std.Io.Writer, param_offset: usize) !void {
             var wrote_filter = false;
             if (comptime table.softDeletable()) {
                 if (!q.unscoped_flag) {
@@ -223,8 +407,7 @@ pub fn Query(comptime T: type) type {
                     try w.writeAll(if (cond.is_or) " OR " else " AND ");
                 }
                 try w.writeByte('(');
-                const base = cond.args_start;
-                try writeRenumbered(w, cond.frag, base);
+                try writeRenumbered(w, cond.frag, cond.args_start + param_offset);
                 try w.writeByte(')');
             }
         }
@@ -232,45 +415,80 @@ pub fn Query(comptime T: type) type {
         fn buildSelectSql(q: *Self, count_mode: bool) ![]const u8 {
             var aw: std.Io.Writer.Allocating = .init(q.a());
             const w = &aw.writer;
+            if (q.ctes.items.len > 0) {
+                var recursive = false;
+                for (q.ctes.items) |cte| recursive = recursive or cte.recursive;
+                try w.writeAll(if (recursive) "WITH RECURSIVE " else "WITH ");
+                for (q.ctes.items, 0..) |cte, i| {
+                    if (i > 0) try w.writeAll(", ");
+                    try w.print("{s} AS (", .{try quoteIdent(q.a(), cte.name)});
+                    try writeRenumbered(w, cte.sql, cte.args_start);
+                    try w.writeByte(')');
+                }
+                try w.writeByte(' ');
+            }
+
+            try w.writeAll("SELECT ");
+            if (!count_mode and q.hint_text != null) try w.print("/*+ {s} */ ", .{q.hint_text.?});
             if (count_mode) {
-                try w.print("SELECT count(*) FROM {s}", .{try quoteIdent(q.a(), table.name)});
+                try w.writeAll("count(*)");
             } else {
-                try w.writeAll("SELECT ");
-                if (q.is_distinct) try w.writeAll("DISTINCT ");
-                if (q.cols) |cols| {
-                    for (cols, 0..) |c, i| {
+                if (q.distinct_on_cols) |cols| {
+                    try w.writeAll("DISTINCT ON (");
+                    for (cols, 0..) |col, i| {
                         if (i > 0) try w.writeAll(", ");
-                        const quoted = try quoteIdent(q.a(), c);
-                        try w.writeAll(quoted);
+                        try w.writeAll(try quoteIdent(q.a(), col));
+                    }
+                    try w.writeAll(") ");
+                } else if (q.is_distinct) {
+                    try w.writeAll("DISTINCT ");
+                }
+                if (q.raw_cols) |expressions| {
+                    for (expressions, 0..) |expression, i| {
+                        if (i > 0) try w.writeAll(", ");
+                        try w.writeAll(expression);
+                    }
+                } else if (q.cols) |cols| {
+                    for (cols, 0..) |col, i| {
+                        if (i > 0) try w.writeAll(", ");
+                        try w.writeAll(try quoteIdent(q.a(), col));
                     }
                 } else {
                     try w.writeByte('*');
                 }
-                try w.print(" FROM {s}", .{try quoteIdent(q.a(), table.name)});
+            }
+            try w.print(" FROM {s}", .{try quoteIdent(q.a(), table.name)});
+            for (q.joins.items) |join_clause| {
+                try w.writeByte(' ');
+                try writeRenumbered(w, join_clause.sql, join_clause.args_start);
             }
             try q.buildWhere(w);
             if (!count_mode) {
                 if (q.groups.items.len > 0) {
                     try w.writeAll(" GROUP BY ");
-                    for (q.groups.items, 0..) |g, i| {
+                    for (q.groups.items, 0..) |group, i| {
                         if (i > 0) try w.writeAll(", ");
-                        try w.writeAll(g);
+                        try w.writeAll(group);
                     }
                 }
-                if (q.having_cond) |h| {
+                if (q.having_cond) |having_clause| {
                     try w.writeAll(" HAVING (");
-                    try writeRenumbered(w, h.frag, h.args_start);
+                    try writeRenumbered(w, having_clause.frag, having_clause.args_start);
                     try w.writeByte(')');
+                }
+                for (q.unions.items) |union_clause| {
+                    try w.writeAll(if (union_clause.all) " UNION ALL " else " UNION ");
+                    try writeRenumbered(w, union_clause.sql, union_clause.args_start);
                 }
                 if (q.orders.items.len > 0) {
                     try w.writeAll(" ORDER BY ");
-                    for (q.orders.items, 0..) |o, i| {
+                    for (q.orders.items, 0..) |order, i| {
                         if (i > 0) try w.writeAll(", ");
-                        try w.writeAll(o);
+                        try w.writeAll(order);
                     }
                 }
-                if (q.limit_n) |n| try w.print(" LIMIT {d}", .{n});
-                if (q.offset_n) |n| try w.print(" OFFSET {d}", .{n});
+                if (q.limit_n) |limit_value| try w.print(" LIMIT {d}", .{limit_value});
+                if (q.offset_n) |offset_value| try w.print(" OFFSET {d}", .{offset_value});
                 if (q.for_update_flag) try w.writeAll(" FOR UPDATE");
             }
             return aw.writer.buffered();
@@ -297,11 +515,119 @@ pub fn Query(comptime T: type) type {
             return aw.writer.buffered();
         }
 
+        fn writeReturning(q: *Self, w: *std.Io.Writer) !void {
+            try w.writeAll(" RETURNING ");
+            if (q.returning_cols) |cols| {
+                if (cols.len == 0) return error.InvalidQuery;
+                for (cols, 0..) |name, i| {
+                    if (i > 0) try w.writeAll(", ");
+                    try w.writeAll(try quoteIdent(q.a(), name));
+                }
+            } else {
+                try w.writeByte('*');
+            }
+        }
+
+        fn decodeRows(q: *Self, res: *pq.Result, out_gpa: std.mem.Allocator) Error![]T {
+            const rows = out_gpa.alloc(T, res.rows.len) catch return error.OutOfMemory;
+            var decoded: usize = 0;
+            errdefer {
+                for (rows[0..decoded]) |item| value.freeValue(T, item, out_gpa);
+                out_gpa.free(rows);
+            }
+            for (res.rows, 0..) |row, i| {
+                rows[i] = try value.scanRow(T, table, res, row, out_gpa);
+                decoded += 1;
+                try db_mod.Session.callHook(T, "afterFind", &rows[i], q.sess);
+            }
+            return rows;
+        }
+
         fn run(q: *Self, sql: []const u8) Error!pq.Result {
-            return q.sess.runExec(sql, q.args.items);
+            return q.sess.runExecTimeout(sql, q.args.items, q.timeout_ms);
+        }
+
+        /// Starts pull-based model decoding. The returned iterator owns the
+        /// pooled connection until EOF or `deinit`.
+        pub fn stream(q: *Self, out_gpa: std.mem.Allocator) Error!ModelRows(T) {
+            q.startTerminal() catch |err| {
+                q.deinit();
+                return err;
+            };
+            if (q.preloads.items.len != 0) {
+                q.deinit();
+                return error.ProtocolViolation;
+            }
+            const sql = q.buildSelectSql(false) catch {
+                q.deinit();
+                return error.OutOfMemory;
+            };
+            const sess = q.sess;
+            const owns_session = q.owns_session;
+            const conn = sess.acquire() catch |err| {
+                q.deinit();
+                return err;
+            };
+            const rows = conn.queryParamsStream(sql, q.args.items) catch |err| {
+                sess.releaseConn(conn);
+                q.deinit();
+                return err;
+            };
+            q.owns_session = false;
+            q.deinit();
+            return .{
+                .sess = sess,
+                .conn = conn,
+                .rows = rows,
+                .owns_session = owns_session,
+                .out_gpa = out_gpa,
+            };
         }
 
         // -------------------------------------------------------- terminals
+
+        /// Builds SQL and bind parameters without executing the query.
+        pub fn dryRun(q: *Self, out_gpa: std.mem.Allocator) Error!DryRun {
+            q.startTerminal() catch |err| {
+                q.deinit();
+                return err;
+            };
+            errdefer q.deinit();
+            const built = q.buildSelectSql(false) catch return error.OutOfMemory;
+            const sql = out_gpa.dupe(u8, built) catch return error.OutOfMemory;
+            errdefer out_gpa.free(sql);
+            const params = out_gpa.alloc(pq.Param, q.args.items.len) catch return error.OutOfMemory;
+            var copied: usize = 0;
+            errdefer {
+                for (params[0..copied]) |param| if (param.data.len > 0) out_gpa.free(param.data);
+                out_gpa.free(params);
+            }
+            for (q.args.items, 0..) |param, i| {
+                params[i] = param;
+                if (param.data.len > 0) params[i].data = out_gpa.dupe(u8, param.data) catch return error.OutOfMemory;
+                copied += 1;
+            }
+            q.deinit();
+            return .{ .sql = sql, .params = params, .gpa = out_gpa };
+        }
+
+        /// Returns PostgreSQL's EXPLAIN result. `analyze` executes the query.
+        pub fn explain(q: *Self, analyze: bool) Error!pq.Result {
+            q.startTerminal() catch |err| {
+                q.deinit();
+                return err;
+            };
+            errdefer q.deinit();
+            const built = q.buildSelectSql(false) catch return error.OutOfMemory;
+            var aw: std.Io.Writer.Allocating = .init(q.a());
+            aw.writer.print("EXPLAIN ({s}, FORMAT TEXT) {s}", .{
+                if (analyze) "ANALYZE true" else "ANALYZE false",
+                built,
+            }) catch return error.OutOfMemory;
+            const result = try q.run(aw.writer.buffered());
+            q.deinit();
+            return result;
+        }
 
         /// Executes the query and returns all matching rows.
         pub fn all(q: *Self, out_gpa: std.mem.Allocator) Error![]T {
@@ -418,6 +744,118 @@ pub fn Query(comptime T: type) type {
             q.deinit();
             return affected;
         }
+
+        /// Deletes matching rows and returns their post-mutation values.
+        pub fn deleteReturning(q: *Self, out_gpa: std.mem.Allocator) Error![]T {
+            q.startTerminal() catch |e| {
+                q.deinit();
+                return e;
+            };
+            errdefer q.deinit();
+            var aw: std.Io.Writer.Allocating = .init(q.a());
+            const w = &aw.writer;
+            const base = q.buildDeleteSql() catch return error.OutOfMemory;
+            w.writeAll(base) catch return error.OutOfMemory;
+            q.writeReturning(w) catch return error.OutOfMemory;
+            var res = try q.run(aw.writer.buffered());
+            defer res.deinit();
+            const rows = try q.decodeRows(&res, out_gpa);
+            q.deinit();
+            return rows;
+        }
+
+        /// Updates matching rows from a struct/tuple and returns the rows.
+        pub fn updateReturning(q: *Self, sets: anytype, out_gpa: std.mem.Allocator) Error![]T {
+            q.startTerminal() catch |e| {
+                q.deinit();
+                return e;
+            };
+            errdefer q.deinit();
+            const query_gpa = q.sess.gpa;
+            const info = @typeInfo(@TypeOf(sets));
+            if (info != .@"struct" or info.@"struct".fields.len == 0)
+                @compileError("zorm: updateReturning expects a non-empty struct");
+            var params: std.ArrayList(pq.Param) = .empty;
+            defer params.deinit(query_gpa);
+            var aw: std.Io.Writer.Allocating = .init(q.a());
+            const w = &aw.writer;
+            w.print("UPDATE {s} SET ", .{try quoteIdent(q.a(), table.name)}) catch return error.OutOfMemory;
+            inline for (info.@"struct".fields, 0..) |field, i| {
+                if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
+                comptime var column_name: ?[]const u8 = null;
+                inline for (table.columns) |col| {
+                    if (comptime std.mem.eql(u8, col.field_name, field.name)) column_name = col.name;
+                }
+                if (column_name == null) @compileError("zorm: update field is not a model column: " ++ field.name);
+                w.print("{s} = ${d}", .{ try quoteIdent(q.a(), column_name.?), i + 1 }) catch return error.OutOfMemory;
+                params.append(q.sess.gpa, try value.toParam(@field(sets, field.name), q.a())) catch return error.OutOfMemory;
+            }
+            q.buildWhereOffset(w, info.@"struct".fields.len) catch return error.OutOfMemory;
+            q.writeReturning(w) catch return error.OutOfMemory;
+            params.appendSlice(q.sess.gpa, q.args.items) catch return error.OutOfMemory;
+            var res = try q.sess.runExecTimeout(aw.writer.buffered(), params.items, q.timeout_ms);
+            defer res.deinit();
+            const rows = try q.decodeRows(&res, out_gpa);
+            q.deinit();
+            return rows;
+        }
+    };
+}
+
+pub fn ModelRows(comptime T: type) type {
+    const table = comptime schema.tableOf(T);
+    return struct {
+        const Self = @This();
+
+        sess: *db_mod.Session,
+        conn: *pq.Conn,
+        rows: *pq.Rows,
+        owns_session: bool,
+        out_gpa: std.mem.Allocator,
+        closed: bool = false,
+
+        fn close(r: *Self) void {
+            if (r.closed) return;
+            r.closed = true;
+            r.rows.deinit();
+            r.sess.releaseConn(r.conn);
+            if (r.owns_session) r.sess.gpa.destroy(r.sess);
+        }
+
+        /// Decodes and returns one model. The caller owns it and releases it
+        /// with `zorm.free(T, value, allocator)`.
+        pub fn next(r: *Self) Error!?T {
+            if (r.closed) return null;
+            const raw = r.rows.next() catch |err| {
+                r.close();
+                return err;
+            } orelse {
+                r.close();
+                return null;
+            };
+            var result = pq.Result{ .arena = r.rows.arena, .columns = r.rows.columns };
+            var model = value.scanRow(T, table, &result, raw, r.out_gpa) catch |err| {
+                r.close();
+                return err;
+            };
+            db_mod.Session.callHook(T, "afterFind", &model, r.sess) catch |err| {
+                value.freeValue(T, model, r.out_gpa);
+                r.close();
+                return err;
+            };
+            return model;
+        }
+
+        /// Writes all remaining rows as CSV while retaining constant result
+        /// memory. This consumes and closes the iterator.
+        pub fn exportCsv(r: *Self, writer: *std.Io.Writer) !void {
+            defer r.close();
+            try r.rows.writeCsv(writer);
+        }
+
+        pub fn deinit(r: *Self) void {
+            r.close();
+        }
     };
 }
 
@@ -489,8 +927,48 @@ fn loadAssoc(
 ) Error!void {
     const Child = assoc.model;
     const child_table = comptime schema.tableOf(Child);
+    if (assoc.primary_keys.len != assoc.foreign_keys.len)
+        @compileError("zorm: association primary_keys and foreign_keys must have equal length");
+    if (assoc.primary_keys.len > 1)
+        return loadCompositeAssoc(M, rows, assoc, nested, s, gpa);
 
     switch (assoc.kind) {
+        .has_one => {
+            for (rows) |*parent| {
+                var query = s.query(Child);
+                query = query.whereEq(assoc.foreign_key, @field(parent, assoc.primary_key));
+                if (assoc.polymorphic_type.len > 0)
+                    query = query.whereEq(assoc.polymorphic_type, assoc.polymorphic_value);
+                @field(parent, assoc.field_name) = try query.first();
+                if (nested.len > 0 and @field(parent, assoc.field_name) != null) {
+                    var selected = [1]Child{@field(parent, assoc.field_name).?};
+                    try applyPreloadPath(Child, &selected, nested, s, gpa);
+                    @field(parent, assoc.field_name) = selected[0];
+                }
+            }
+        },
+        .many_to_many => {
+            for (rows) |*parent| {
+                var arena_state = std.heap.ArenaAllocator.init(gpa);
+                defer arena_state.deinit();
+                const arena = arena_state.allocator();
+                const join_sql = std.fmt.allocPrint(arena, "JOIN {s} zorm_join ON zorm_join.{s} = {s}.{s}", .{
+                    try quoteIdent(arena, assoc.join_table),
+                    try quoteIdent(arena, assoc.join_association_key),
+                    try quoteIdent(arena, child_table.name),
+                    try quoteIdent(arena, assoc.association_key),
+                }) catch return error.OutOfMemory;
+                const where_sql = std.fmt.allocPrint(arena, "zorm_join.{s} = $1", .{
+                    try quoteIdent(arena, assoc.join_foreign_key),
+                }) catch return error.OutOfMemory;
+                const children = try s.query(Child)
+                    .join(join_sql, .{})
+                    .where(where_sql, .{@field(parent, assoc.primary_key)})
+                    .all(gpa);
+                @field(parent, assoc.field_name) = children;
+                if (nested.len > 0) try applyPreloadPath(Child, children, nested, s, gpa);
+            }
+        },
         .has_many => {
             const pkc = comptime schema.tableOf(M).pk() orelse
                 @compileError("zorm: has_many requires the parent model to declare a primary key");
@@ -513,6 +991,18 @@ fn loadAssoc(
             const arena = arena_state.allocator();
 
             var children = try queryChildren(Child, child_table, assoc.foreign_key, ids.items, s, arena);
+            if (assoc.polymorphic_type.len > 0) {
+                // Polymorphic associations share the foreign key and add a
+                // discriminator column.
+                const filtered = try s.query(Child)
+                    .whereIn(assoc.foreign_key, ids.items)
+                    .whereEq(assoc.polymorphic_type, assoc.polymorphic_value)
+                    .all(arena);
+                children.deinit(arena);
+                children = .empty;
+                children.appendSlice(arena, filtered) catch return error.OutOfMemory;
+                arena.free(filtered);
+            }
             defer children.deinit(arena);
 
             // Per-parent slices are allocated independently so the result
@@ -626,6 +1116,45 @@ fn loadAssoc(
                 if (has[ri]) @field(r, assoc.field_name) = copies[ri];
             }
         },
+    }
+}
+
+fn loadCompositeAssoc(
+    comptime M: type,
+    rows: []M,
+    comptime assoc: schema.Assoc,
+    nested: []const u8,
+    s: *db_mod.Session,
+    gpa: std.mem.Allocator,
+) Error!void {
+    const Child = assoc.model;
+    switch (assoc.kind) {
+        .has_many => {
+            for (rows) |*parent| {
+                var query = s.query(Child);
+                inline for (assoc.foreign_keys, 0..) |foreign_key, i| {
+                    query = query.whereEq(foreign_key, @field(parent, assoc.primary_keys[i]));
+                }
+                const children = try query.all(gpa);
+                @field(parent, assoc.field_name) = children;
+                if (nested.len > 0) try applyPreloadPath(Child, children, nested, s, gpa);
+            }
+        },
+        .belongs_to => {
+            for (rows) |*parent| {
+                var query = s.query(Child);
+                inline for (assoc.primary_keys, 0..) |primary_key, i| {
+                    query = query.whereEq(primary_key, @field(parent, assoc.foreign_keys[i]));
+                }
+                @field(parent, assoc.field_name) = try query.first();
+                if (nested.len > 0 and @field(parent, assoc.field_name) != null) {
+                    var selected = [1]Child{@field(parent, assoc.field_name).?};
+                    try applyPreloadPath(Child, &selected, nested, s, gpa);
+                    @field(parent, assoc.field_name) = selected[0];
+                }
+            }
+        },
+        .has_one, .many_to_many => @compileError("zorm: composite has-one and many-to-many keys are not supported"),
     }
 }
 

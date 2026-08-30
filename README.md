@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-A GORM-inspired ORM for Zig 0.16. **PostgreSQL first**, with a pure-Zig PostgreSQL wire protocol driver built in (no libpq, zero C dependencies).
+A GORM-inspired ORM for Zig 0.16 with first-class PostgreSQL, MySQL/MariaDB, and SQLite drivers. PostgreSQL and MySQL use built-in pure-Zig wire protocol implementations; SQLite uses `libsqlite3`.
 
 ## Features
 
@@ -12,22 +12,24 @@ A GORM-inspired ORM for Zig 0.16. **PostgreSQL first**, with a pure-Zig PostgreS
 - **Binary-format results**: result sets are decoded from PostgreSQL's binary format (arrays, timestamps, jsonb, numeric scalars...) — opt out via `Config.binary_results = false`
 - **Comptime model reflection**: plain Zig structs are models — no macros, no codegen, zero runtime registration
 - **Convention over configuration**: camelCase → snake_case, `id` as the default primary key, auto-filled `created_at`/`updated_at`
-- **GORM-style query builder**: `where` / `orWhere` / `whereEq` / `whereIn` / `order_by` / `limit` / `offset` / `group_by` / `having` / `for_update`, with automatic renumbering of `$1,$2...` placeholders across chained conditions
-- **CRUD + transactions + pool**: `insert` (auto-increment ids filled back), `insertBatch` (auto-chunked, max 65535 params), `update`, `save`, `delete`, `deleteWhere`, `updateWhere`, `find`, transactions `commit/rollback`
-- **autoMigrate**: creates tables, adds missing columns, creates indexes (unique/regular)
-- **Associations & preloading**: `has_many` / `belongs_to` declarations + `query.preload("posts.comments")` nested preloading, batch-loaded per level — no N+1
-- **Model hooks**: `beforeSave` / `beforeCreate` / `afterCreate` / `beforeUpdate` / `afterUpdate` / `beforeDelete` / `afterDelete` / `afterFind`
-- **Savepoints / nested transactions**: `tx.begin()` creates a savepoint, `commit()` releases it, `rollback()` rolls back to it
-- **Soft delete**: models with a `deleted_at` column (including `z.Model`) filter soft-deleted rows from queries and turn `delete` into a stamp; `unscoped()`, `deleteHard` and `restore` opt out
-- **Built-in logger**: every query is timed and reported (errors, slow queries above the threshold, full tracing) — replaceable per `Db` with a custom sink
-- **Migration version management**: `Migrator` applies/rolls back versioned SQL migrations tracked in a `schema_migrations` table
-- **Type mapping**: integers / floats / `bool` / `[]const u8` (text) / `[]u8` / enums (stored by name) / `zorm.Time` (timestamptz, microsecond precision; `std.json` emits RFC 3339 UTC strings) — plus optionals of all of those
+- **Extended query builder**: joins, subqueries, CTE/recursive CTE, unions, `DISTINCT ON`, raw CASE/window/JSON/array expressions, hints, named parameters, scopes, dry-run, `EXPLAIN`, and `RETURNING`
+- **Production pool and execution controls**: prepared-statement LRU caches, query/acquire/network/transaction deadlines, PostgreSQL cancellation, connection lifetime/idle limits, background cleanup, prewarming, health checks, and pool statistics
+- **CRUD, upsert, optimistic locks, and transactions**: chunked batches, configurable `ON CONFLICT`, arbitrary/batch `RETURNING`, composite primary keys, savepoints, and explicit bounded transaction retries
+- **Streaming rows**: model decoding and CSV export begin at the first row, keep large-result memory bounded, propagate iterator errors, and release connections after early termination
+- **Schema management**: additive `autoMigrate`, versioned migrations with advisory locking/checksums/dirty-state validation, schema diffs, type/rename/drop operations, constraints, and composite/partial/expression indexes
+- **Associations**: `belongs_to`, `has_one`, `has_many`, many-to-many and polymorphic declarations; nested and join preloading; association append/replace/delete/clear/count; cascade and auto-save support
+- **Custom codecs**: `zormEncode`/`zormDecode` plus UUID, decimal, IP/CIDR, range, geometry, enum, and JSON helpers
+- **Observability**: structured query events, fingerprints, SQLSTATE/error classes, OpenTelemetry-compatible span hooks, Prometheus metrics, slow-query aggregation, prepared-cache rates, and pool metrics
+- **Routing**: primary/replica read-write routing, round-robin replicas, tenant and shard maps, health-based failover
+- **Plugins**: global query/CRUD callbacks plus tracing, metrics, AES-256-GCM encryption, tenant filtering, audit, pagination, and cache-invalidation helpers
+- **Three first-class drivers**: MySQL/MariaDB supports `mysql_native_password`, `caching_sha2_password` (TLS or RSA full authentication), server prepared statements, pools, and timeouts; SQLite supports bound parameters, pools, busy/query timeouts, WAL, and foreign-key configuration. Both share typed CRUD/upsert, optimistic locking, hooks, associations/preload, query composition, additive migrations, versioned migrations, plugins, routing, observability, and explicit transaction retries.
 - **Errors carry context**: server errors map to typed errors (`UniqueViolation`, `ForeignKeyViolation`, `SerializationFailure`, ...), with SQLSTATE, message and constraint details available via `lastError`
 
 ## Requirements
 
 - Zig **0.16.0**
 - PostgreSQL 10+ (14+ recommended; `trust` / `scram-sha-256` / `md5` password auth supported)
+- SQLite development headers/library when using `z.drivers.sqlite` (`libsqlite3`)
 
 ## Quick start
 
@@ -42,6 +44,7 @@ zig fetch --save <git-url-or-tarball>
 const mod = b.addModule("zorm", .{
     .root_source_file = b.path("src/root.zig"), // omit when consumed as a path dependency
 });
+mod.linkSystemLibrary("sqlite3", .{}); // required only when using z.drivers.sqlite
 // add .{ .name = "zorm", .module = mod } to your module's .imports
 ```
 
@@ -114,7 +117,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Find by primary key (returns ?User; strings are allocated with gpa,
     // release them with z.free)
-    const found = (try db.find(User, u.id.?)).?;
+    var found = (try db.find(User, u.id.?)).?;
     defer z.free(User, found, gpa);
 
     // Update / save (inserts when the primary key is empty)
@@ -295,7 +298,70 @@ m.add(&.{
 _ = try m.applyAll();        // applies pending migrations in ascending order, one txn each
 try m.rollbackLast();        // rolls the latest version back with its down script
 ```
-The tracking table is `schema_migrations (version bigint PK, name text, applied_at timestamptz)`.
+The tracking table stores `version`, `name`, `checksum`, `dirty`, and `applied_at`. `applyAll` serializes runners with a PostgreSQL advisory lock and rejects changed or dirty migrations.
+
+### Plugins and explicit transaction retries
+
+```zig
+var metrics: z.PluginMetrics = .{};
+try db.addPlugin(metrics.plugin());
+
+const Retry = struct {
+    fn run(user: *User, tx: *z.Tx) z.Error!void {
+        try tx.insert(user);
+    }
+};
+var user = User{ .name = "retry-safe" };
+try db.transactionRetry(
+    .{ .max_attempts = 4, .base_delay_ms = 10, .max_delay_ms = 500 },
+    &user,
+    Retry.run,
+);
+```
+
+Only `transactionRetry` replays a transaction, and only for serialization,
+deadlock, and optionally temporary connection failures. Ordinary CRUD and
+`begin` never replay writes.
+
+Tenant filtering and pagination remain explicit query transformations:
+
+```zig
+var q = z.query(User, db);
+q = (z.TenantFilterPlugin{}).apply(q, tenant_id);
+q = (z.PaginationPlugin{ .page = 0, .per_page = 50 }).apply(q);
+const page = try q.all(gpa);
+```
+
+### MySQL/MariaDB and SQLite
+
+```zig
+const sqlite = try z.drivers.sqlite.Db.open(gpa, ":memory:");
+defer sqlite.deinit();
+var sqlite_db = z.drivers.sqlite.orm(sqlite);
+try sqlite_db.autoMigrate(User);
+var local_user = User{ .name = "Ada" };
+try sqlite_db.insert(&local_user);
+const local_rows = try sqlite_db.whereEq(User, "name", "Ada", gpa);
+defer z.freeSlice(User, local_rows, gpa);
+
+const mysql = try z.drivers.mysql.Conn.connect(gpa, io, .{
+    .host = "127.0.0.1", .port = 3306,
+    .user = "app", .password = "secret", .database = "app",
+});
+defer mysql.deinit();
+var mysql_db = z.drivers.mysql.orm(mysql);
+try mysql_db.autoMigrate(User);
+var remote_user = User{ .name = "Grace" };
+try mysql_db.insert(&remote_user);
+```
+
+The MySQL/MariaDB and SQLite ORM has the same shared typed CRUD/upsert,
+optimistic-locking, lifecycle-hook, association/preload, query-builder,
+additive/versioned-migration, pool, plugin, routing, observability, and explicit
+transaction-retry APIs. Dialect-specific SQL remains explicit: PostgreSQL alone
+supports `DISTINCT ON`, advisory migration locks, destructive schema diffs, and
+binary streaming; MySQL emulates mutation `RETURNING`, while SQLite requires
+`libsqlite3`.
 
 ## Error handling
 
@@ -318,16 +384,18 @@ zig build                       # build library + example
 zig build test                  # unit tests
 zig build run -Ddsn='postgres://...'          # run the example
 zig build test-integration -Ddsn='postgres://...'   # integration tests (needs a real PG)
+zig build test-drivers                              # SQLite
+zig build test-drivers -Dmysql-port=3307            # SQLite + live MySQL/MariaDB
 zig build -Doptimize=ReleaseFast              # release build
 ```
 
-Integration tests cover: table creation/migration, insert with id back-fill, unique-constraint errors, find by primary key, update, query building (where/whereIn/orWhere/select subsets/order/limit), enum and `zorm.Time` round trips, chunked batch insert, transaction commit & rollback, conditional update & delete.
+Integration coverage includes CRUD and batches, transactions/savepoints/retries, migrations and schema diffs, prepared caches, deadlines/cancellation, streaming, observability, routing, plugins, composite keys, upsert/returning, custom codecs, and associations. `test-drivers` exercises SQLite in memory and optionally a live MySQL/MariaDB server.
 
 ## Design notes & trade-offs
 
 - **Wire formats**: parameters are binary for scalars (int8/float8/bool/timestamptz/bytea/text with explicit OIDs) and text for arrays/JSON/enums; results are decoded from PostgreSQL's binary format by default (`Config.binary_results = false` to opt out for exotic column types).
 - **Preloading**: any depth via dotted paths; string/array values of preloaded rows are deep-copied per parent. Multi-dimensional arrays are supported for numeric/boolean element types; text arrays are 1-D.
-- **autoMigrate** only creates tables, adds missing columns and single-column indexes — it never drops columns or changes types. Use `Migrator` for anything more involved.
+- **autoMigrate** remains additive. Destructive/type-changing work is explicit through `Migrator` (`alterColumnType`, `dropColumn`, `renameColumn`, constraints and advanced indexes).
 - **SQL injection surface**: values are always parameterized; `order_by`, `group_by`, `having` and `select` column names are string-interpolated (same as GORM) — never pass user input there.
 - **Concurrency**: `Db`/the connection pool are thread-safe (`std.Io.Mutex`/`Condition`); a single `pq.Conn` and a `Session` with an in-flight operation are not.
 - **Full-column updates**: `update` writes every column of the model (GORM `Save` semantics); use `updateWhere` for partial updates.
@@ -342,7 +410,8 @@ Integration tests cover: table creation/migration, insert with id back-fill, uni
 - [x] Nested preloading (v0.3.0)
 - [x] Binary-format result decoding (v0.3.0)
 - [x] Multi-dimensional arrays / full NULL array elements (v0.3.0)
-- [ ] MySQL/SQLite drivers
+- [x] MySQL/SQLite direct drivers and typed CRUD ORM
+- [x] Production execution, routing, plugins, codecs, advanced migrations, and explicit transaction retries
 
 ## License
 

@@ -41,14 +41,41 @@ pub const Post = struct {
     };
 };
 
+const EmbeddedUser = struct {
+    id: ?i64 = null,
+    name: []const u8 = "",
+    active: bool = true,
+
+    pub const zorm = .{ .table = "embedded_users" };
+};
+
+fn sqliteDemo(gpa: std.mem.Allocator) !void {
+    const raw = try z.drivers.sqlite.Db.open(gpa, ":memory:");
+    defer raw.deinit();
+    var db = z.drivers.sqlite.orm(raw);
+    try db.autoMigrate(EmbeddedUser);
+    var user = EmbeddedUser{ .name = "SQLite" };
+    try db.insert(&user);
+    const found = (try db.find(EmbeddedUser, user.id.?, gpa)).?;
+    defer z.free(EmbeddedUser, found, gpa);
+    std.debug.print("sqlite typed ORM: id={d} name={s}\n", .{ user.id.?, found.name });
+}
+
+fn insertRetried(user: *User, tx: *z.Tx) z.Error!void {
+    try tx.insert(user);
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
+    try sqliteDemo(gpa);
 
     const dsn = init.environ_map.get("ZORM_DSN") orelse
         "postgres://zorm:zorm@127.0.0.1:5433/zorm?sslmode=disable";
     const db = try z.Db.connectDsn(gpa, io, dsn, 8);
     defer db.deinit();
+    var plugin_metrics: z.PluginMetrics = .{};
+    try db.addPlugin(plugin_metrics.plugin());
 
     var dropped = try db.execRaw("DROP TABLE IF EXISTS \"user\" CASCADE");
     dropped.deinit();
@@ -91,13 +118,13 @@ pub fn main(init: std.process.Init) !void {
     const ghosts = try z.query(User, db).where("name = $1", .{"Ghost"}).count();
     std.debug.print("ghosts after rollback={d}\n", .{ghosts});
 
-    // Transaction: commit.
-    {
-        var tx = try db.begin();
-        var kept = User{ .name = "Bob", .email = "bob@example.com", .age = 25 };
-        try tx.insert(&kept);
-        try tx.commit();
-    }
+    // Explicit whole-transaction retry; ordinary writes are never replayed.
+    var kept = User{ .name = "Bob", .email = "bob@example.com", .age = 25 };
+    try db.transactionRetry(
+        .{ .max_attempts = 4, .base_delay_ms = 10, .max_delay_ms = 250 },
+        &kept,
+        insertRetried,
+    );
 
     // Batch insert.
     var batch = [_]User{
@@ -148,6 +175,10 @@ pub fn main(init: std.process.Init) !void {
 
     const total = try z.query(User, db).count();
     std.debug.print("total={d}\n", .{total});
+    std.debug.print("observed queries={d} mutations={d}\n", .{
+        plugin_metrics.queries.load(.monotonic),
+        plugin_metrics.mutations.load(.monotonic),
+    });
     z.free(User, one.?, gpa);
     std.debug.print("smoke OK\n", .{});
 }

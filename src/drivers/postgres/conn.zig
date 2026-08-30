@@ -4,76 +4,17 @@
 const std = @import("std");
 const proto = @import("proto.zig");
 const scram_mod = @import("scram.zig");
+const types = @import("../shared/types.zig");
 
 const net = std.Io.net;
 const Io = std.Io;
 
 pub const scram = scram_mod;
 
-/// Driver-level errors. `QueryFailed` and friends carry details in
-/// `Conn.last_error` (also mirrored on `zorm.Db.last_error`).
-pub const Error = error{
-    /// Could not establish a TCP/unix connection.
-    ConnectionFailed,
-    /// The connection was lost or is unusable.
-    ConnectionClosed,
-    /// The server rejected the credentials or the auth method is unsupported.
-    AuthenticationFailed,
-    /// Server demanded SSL but it could not be established.
-    TlsUnsupported,
-    /// Violation of the frontend/backend protocol.
-    ProtocolViolation,
-    /// The DSN could not be parsed.
-    InvalidDsn,
-    /// A NULL was returned for a non-optional destination field.
-    NullValue,
-    /// A value could not be decoded into the requested Zig type.
-    TypeMismatch,
-    /// The server reported an error; see `last_error`.
-    QueryFailed,
-    /// A model hook aborted the operation.
-    HookAborted,
-    OutOfMemory,
+pub const Error = types.Error;
+pub const PgError = types.ServerError;
 
-    // Mapped SQLSTATE classes:
-    UniqueViolation,
-    ForeignKeyViolation,
-    NotNullViolation,
-    CheckViolation,
-    SerializationFailure,
-    DeadlockDetected,
-    UndefinedTable,
-    UndefinedColumn,
-    SyntaxError,
-    InsufficientPrivilege,
-    NumericValueOutOfRange,
-    InvalidTextRepresentation,
-};
-
-/// Parsed ErrorResponse / NoticeResponse payload.
-pub const PgError = struct {
-    severity: []const u8 = "",
-    code: []const u8 = "", // SQLSTATE, e.g. "23505"
-    message: []const u8 = "",
-    detail: []const u8 = "",
-    hint: []const u8 = "",
-    position: []const u8 = "",
-    schema: []const u8 = "",
-    table: []const u8 = "",
-    column: []const u8 = "",
-    constraint: []const u8 = "",
-};
-
-pub const SslMode = enum {
-    /// Plaintext only. Default.
-    disable,
-    /// TLS, but certificate and hostname are not verified.
-    require,
-    /// TLS, verify the server certificate chain.
-    verify_ca,
-    /// TLS, verify certificate chain and hostname.
-    verify_full,
-};
+pub const SslMode = types.SslMode;
 
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
@@ -89,62 +30,47 @@ pub const Config = struct {
     /// CA certificate file (PEM) used by `verify_ca`/`verify_full`. When
     /// null, the system trust store is scanned instead.
     ca_file: ?[]const u8 = null,
+    /// Maximum named prepared statements cached per connection. Zero disables
+    /// caching and keeps using PostgreSQL's unnamed statement.
+    prepared_statement_cache_size: usize = 64,
+    /// Per-query deadline. Zero disables it.
+    query_timeout_ms: u64 = 0,
+    /// Maximum time allowed for one network read. Zero disables it.
+    read_timeout_ms: u64 = 0,
+    /// Maximum time allowed for one network write/flush. Zero disables it.
+    write_timeout_ms: u64 = 0,
 };
 
-/// A query parameter in its driver-level form. The ORM layer converts
-/// comptime-typed values into this struct, pre-encoding binary formats and
-/// declaring the parameter type OID through Parse so the server never has to
-/// infer (or mis-infer) it.
-pub const Param = struct {
-    /// PostgreSQL type OID declared in the Parse message.
-    oid: u32 = proto.Oid.text,
-    /// 0 = text format, 1 = binary format.
-    format: u16 = 0,
-    is_null: bool = false,
-    /// Encoded value: raw bytes for binary format, server-parseable text for
-    /// text format.
-    data: []const u8 = "",
-
-    pub fn nullParam(oid: u32) Param {
-        return .{ .oid = oid, .format = 1, .is_null = true };
-    }
-};
-
-pub const Result = struct {
-    arena: *std.heap.ArenaAllocator,
-    columns: []Column = &.{},
-    rows: []Row = &.{},
-    cmd_tag: []const u8 = "",
-    /// Row count for SELECT, affected rows for INSERT/UPDATE/DELETE.
-    affected: i64 = 0,
-
-    pub const Column = struct {
-        name: []const u8,
-        type_oid: u32,
-        /// 0 = text format, 1 = binary format (mirrors RowDescription).
-        format: u16 = 0,
-    };
-
-    pub const Row = []const ?[]const u8;
-
-    pub fn deinit(r: *Result) void {
-        const child = r.arena.child_allocator;
-        r.arena.deinit();
-        child.destroy(r.arena);
-    }
-
-    pub fn colIndex(r: *const Result, name: []const u8) ?usize {
-        for (r.columns, 0..) |col, i| {
-            if (std.mem.eql(u8, col.name, name)) return i;
-        }
-        return null;
-    }
-};
+pub const Param = types.Param;
+pub const Result = types.Result;
 
 pub const TxnStatus = enum { idle, in_transaction, in_failed_transaction };
 
 const read_buffer_len = 64 * 1024;
 const write_buffer_len = 16 * 1024;
+
+pub const PreparedStats = struct {
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+
+    pub fn hitRate(s: PreparedStats) f64 {
+        const total = s.hits + s.misses;
+        return if (total == 0) 0 else @as(f64, @floatFromInt(s.hits)) / @as(f64, @floatFromInt(total));
+    }
+};
+
+const PreparedStatement = struct {
+    sql: []u8,
+    oids: []u32,
+    name: [32]u8,
+    name_len: u8,
+    last_used: u64,
+
+    fn statementName(s: *const PreparedStatement) []const u8 {
+        return s.name[0..s.name_len];
+    }
+};
 
 pub const Conn = struct {
     /// Optional hook for server notices (e.g. advisory messages).
@@ -176,6 +102,15 @@ pub const Conn = struct {
     broken: bool = false,
     closed: bool = false,
     backend_pid: u32 = 0,
+    backend_secret: u32 = 0,
+    opened_at: Io.Timestamp,
+    last_used_at: Io.Timestamp,
+    prepared: std.ArrayList(PreparedStatement) = .empty,
+    prepared_clock: u64 = 0,
+    prepared_next_id: u64 = 0,
+    prepared_hits: u64 = 0,
+    prepared_misses: u64 = 0,
+    prepared_evictions: u64 = 0,
 
     // ------------------------------------------------------------------ open
 
@@ -194,6 +129,7 @@ pub const Conn = struct {
         // If anything below fails before the Conn takes ownership, these two
         // buffers are freed by the errdefers above.
 
+        const now = Io.Clock.awake.now(io);
         c.* = .{
             .gpa = gpa,
             .io = io,
@@ -202,6 +138,8 @@ pub const Conn = struct {
             .sock_rd = net.Stream.Reader.init(stream, io, rd_buf),
             .sock_wr = net.Stream.Writer.init(stream, io, wr_buf),
             .err_arena_state = std.heap.ArenaAllocator.init(gpa),
+            .opened_at = now,
+            .last_used_at = now,
             .rd = undefined,
             .wr = undefined,
         };
@@ -478,6 +416,7 @@ pub const Conn = struct {
                 proto.Tag.backend_key_data => {
                     if (m.data.len < 8) return error.ProtocolViolation;
                     c.backend_pid = std.mem.readInt(u32, m.data[0..4], .big);
+                    c.backend_secret = std.mem.readInt(u32, m.data[4..8], .big);
                 },
                 proto.Tag.error_response => {
                     try c.storeError(m.data);
@@ -524,28 +463,109 @@ pub const Conn = struct {
     fn writeI32(c: *Conn, v: i32) Error!void {
         try c.writeU32(@bitCast(v));
     }
+    const TransportGuard = struct {
+        conn: *Conn,
+        timeout_ms: u64,
+        done: std.atomic.Value(bool) = .init(false),
+        expired: std.atomic.Value(bool) = .init(false),
+        group: Io.Group = .init,
+
+        fn start(g: *TransportGuard) void {
+            if (g.timeout_ms > 0) g.group.async(g.conn.io, expire, .{g});
+        }
+
+        fn expire(g: *TransportGuard) Io.Cancelable!void {
+            try g.conn.io.sleep(.fromMilliseconds(@intCast(g.timeout_ms)), .awake);
+            if (g.done.swap(true, .acq_rel)) return;
+            g.expired.store(true, .release);
+            g.conn.stream.shutdown(g.conn.io, .both) catch {};
+        }
+
+        fn finish(g: *TransportGuard) bool {
+            _ = g.done.swap(true, .acq_rel);
+            g.group.cancel(g.conn.io);
+            return g.expired.load(.acquire);
+        }
+    };
+
+    const QueryGuard = struct {
+        conn: *Conn,
+        timeout_ms: u64,
+        done: std.atomic.Value(bool) = .init(false),
+        expired: std.atomic.Value(bool) = .init(false),
+        group: Io.Group = .init,
+
+        fn start(g: *QueryGuard) void {
+            if (g.timeout_ms > 0) g.group.async(g.conn.io, expire, .{g});
+        }
+
+        fn expire(g: *QueryGuard) Io.Cancelable!void {
+            try g.conn.io.sleep(.fromMilliseconds(@intCast(g.timeout_ms)), .awake);
+            if (g.done.swap(true, .acq_rel)) return;
+            g.expired.store(true, .release);
+            g.conn.sendCancelRequest() catch {};
+        }
+
+        fn finish(g: *QueryGuard) bool {
+            _ = g.done.swap(true, .acq_rel);
+            g.group.cancel(g.conn.io);
+            return g.expired.load(.acquire);
+        }
+    };
+
+    /// Sends PostgreSQL's out-of-band CancelRequest over a separate socket.
+    pub fn sendCancelRequest(c: *Conn) Error!void {
+        if (c.backend_pid == 0 or c.backend_secret == 0) return error.ProtocolViolation;
+        const stream = try openSocket(c.gpa, c.io, c.cfg);
+        defer stream.close(c.io);
+        var request: [16]u8 = undefined;
+        std.mem.writeInt(u32, request[0..4], 16, .big);
+        std.mem.writeInt(u32, request[4..8], 80877102, .big);
+        std.mem.writeInt(u32, request[8..12], c.backend_pid, .big);
+        std.mem.writeInt(u32, request[12..16], c.backend_secret, .big);
+        var buffer: [16]u8 = undefined;
+        var writer = net.Stream.Writer.init(stream, c.io, &buffer);
+        writer.interface.writeAll(&request) catch return error.ConnectionClosed;
+        writer.interface.flush() catch return error.ConnectionClosed;
+    }
 
     fn send(c: *Conn) Error!void {
+        var guard = TransportGuard{ .conn = c, .timeout_ms = c.cfg.write_timeout_ms };
+        guard.start();
         c.wr.writeAll(c.wbuf.items) catch {
+            const expired = guard.finish();
             c.broken = true;
-            return error.ConnectionClosed;
+            return if (expired) error.NetworkWriteTimeout else error.ConnectionClosed;
         };
         c.wr.flush() catch {
+            const expired = guard.finish();
             c.broken = true;
-            return error.ConnectionClosed;
+            return if (expired) error.NetworkWriteTimeout else error.ConnectionClosed;
         };
+        if (guard.finish()) {
+            c.broken = true;
+            return error.NetworkWriteTimeout;
+        }
         c.wbuf.clearRetainingCapacity();
     }
 
-    fn rawWrite(c: *Conn, bytes: []const u8) !void {
+    fn rawWrite(c: *Conn, bytes: []const u8) Error!void {
+        var guard = TransportGuard{ .conn = c, .timeout_ms = c.cfg.write_timeout_ms };
+        guard.start();
         c.wr.writeAll(bytes) catch {
+            const expired = guard.finish();
             c.broken = true;
-            return error.ConnectionClosed;
+            return if (expired) error.NetworkWriteTimeout else error.ConnectionClosed;
         };
         c.wr.flush() catch {
+            const expired = guard.finish();
             c.broken = true;
-            return error.ConnectionClosed;
+            return if (expired) error.NetworkWriteTimeout else error.ConnectionClosed;
         };
+        if (guard.finish()) {
+            c.broken = true;
+            return error.NetworkWriteTimeout;
+        }
     }
 
     // -------------------------------------------------------- message reading
@@ -556,10 +576,18 @@ pub const Conn = struct {
     };
 
     fn ensureRead(c: *Conn, n: usize) Error!void {
+        var guard = TransportGuard{ .conn = c, .timeout_ms = c.cfg.read_timeout_ms };
+        guard.start();
         c.rd.fill(n) catch {
+            const expired = guard.finish();
             c.broken = true;
-            return error.ConnectionClosed;
+            if (!expired) c.sendCancelRequest() catch {};
+            return if (expired) error.NetworkReadTimeout else error.ConnectionClosed;
         };
+        if (guard.finish()) {
+            c.broken = true;
+            return error.NetworkReadTimeout;
+        }
     }
 
     pub var debug_traffic: bool = false;
@@ -644,6 +672,10 @@ pub const Conn = struct {
         };
     }
 
+    pub fn lastError(c: *const Conn) ?PgError {
+        return c.last_error;
+    }
+
     fn errorForLastError(c: *Conn) Error {
         const e = c.last_error orelse return error.QueryFailed;
         const code = e.code;
@@ -652,6 +684,7 @@ pub const Conn = struct {
         if (std.mem.eql(u8, code, "23502")) return error.NotNullViolation;
         if (std.mem.eql(u8, code, "23514")) return error.CheckViolation;
         if (std.mem.eql(u8, code, "40001")) return error.SerializationFailure;
+        if (std.mem.eql(u8, code, "57014")) return error.QueryCanceled;
         if (std.mem.eql(u8, code, "40P01")) return error.DeadlockDetected;
         if (std.mem.eql(u8, code, "42P01")) return error.UndefinedTable;
         if (std.mem.eql(u8, code, "42703")) return error.UndefinedColumn;
@@ -662,11 +695,146 @@ pub const Conn = struct {
         return error.QueryFailed;
     }
 
+    pub fn preparedStats(c: *const Conn) PreparedStats {
+        return .{
+            .hits = c.prepared_hits,
+            .misses = c.prepared_misses,
+            .evictions = c.prepared_evictions,
+        };
+    }
+
+    fn findPrepared(c: *Conn, sql: []const u8, params: []const Param) ?usize {
+        for (c.prepared.items, 0..) |entry, i| {
+            if (!std.mem.eql(u8, entry.sql, sql) or entry.oids.len != params.len) continue;
+            for (params, entry.oids) |param, oid| {
+                if (param.oid != oid) break;
+            } else return i;
+        }
+        return null;
+    }
+
+    fn freePrepared(c: *Conn, entry: PreparedStatement) void {
+        c.gpa.free(entry.sql);
+        c.gpa.free(entry.oids);
+    }
+
+    fn removePrepared(c: *Conn, index: usize) void {
+        c.freePrepared(c.prepared.orderedRemove(index));
+    }
+
+    fn queueCloseStatement(c: *Conn, name: []const u8) Error!void {
+        const pos = try c.frameStart('C');
+        try c.wbuf.append(c.gpa, 'S');
+        try c.writeCStr(name);
+        try c.frameEndAt(pos);
+    }
+
+    fn planInvalidated(c: *const Conn) bool {
+        const code = if (c.last_error) |e| e.code else return false;
+        return std.mem.eql(u8, code, "0A000") or std.mem.eql(u8, code, "26000");
+    }
+
+    fn execParamsOnce(c: *Conn, sql: []const u8, params: []const Param, close_first: ?[]const u8) Error!Result {
+        c.last_error = null;
+        c.wbuf.clearRetainingCapacity();
+        if (close_first) |name| try c.queueCloseStatement(name);
+
+        const cache_enabled = c.cfg.prepared_statement_cache_size > 0;
+        var statement_name: []const u8 = "";
+        var parse = true;
+        var pending: ?PreparedStatement = null;
+        errdefer if (pending) |entry| c.freePrepared(entry);
+
+        if (cache_enabled) {
+            c.prepared_clock +%= 1;
+            if (c.findPrepared(sql, params)) |index| {
+                c.prepared_hits +%= 1;
+                c.prepared.items[index].last_used = c.prepared_clock;
+                statement_name = c.prepared.items[index].statementName();
+                parse = false;
+            } else {
+                c.prepared_misses +%= 1;
+                if (c.prepared.items.len >= c.cfg.prepared_statement_cache_size) {
+                    var oldest: usize = 0;
+                    for (c.prepared.items[1..], 1..) |entry, i| {
+                        if (entry.last_used < c.prepared.items[oldest].last_used) oldest = i;
+                    }
+                    try c.queueCloseStatement(c.prepared.items[oldest].statementName());
+                    c.removePrepared(oldest);
+                    c.prepared_evictions +%= 1;
+                }
+                try c.prepared.ensureUnusedCapacity(c.gpa, 1);
+                const sql_copy = try c.gpa.dupe(u8, sql);
+                const oids = c.gpa.alloc(u32, params.len) catch {
+                    c.gpa.free(sql_copy);
+                    return error.OutOfMemory;
+                };
+                for (params, oids) |param, *oid| oid.* = param.oid;
+                c.prepared_next_id +%= 1;
+                pending = .{
+                    .sql = sql_copy,
+                    .oids = oids,
+                    .name = undefined,
+                    .name_len = 0,
+                    .last_used = c.prepared_clock,
+                };
+                const name = std.fmt.bufPrint(&pending.?.name, "zorm_{x}", .{c.prepared_next_id}) catch
+                    return error.OutOfMemory;
+                pending.?.name_len = @intCast(name.len);
+                statement_name = pending.?.statementName();
+            }
+        }
+
+        if (parse) {
+            const pos = try c.frameStart('P');
+            try c.writeCStr(statement_name);
+            try c.writeCStr(sql);
+            try c.writeU16(@intCast(params.len));
+            for (params) |p| try c.writeU32(p.oid);
+            try c.frameEndAt(pos);
+        }
+
+        var pos = try c.frameStart('B');
+        try c.writeCStr("");
+        try c.writeCStr(statement_name);
+        try c.writeU16(@intCast(params.len));
+        for (params) |p| try c.writeU16(p.format);
+        try c.writeU16(@intCast(params.len));
+        for (params) |p| try c.writeParam(p);
+        if (c.cfg.binary_results) {
+            try c.writeU16(1);
+            try c.writeU16(1);
+        } else {
+            try c.writeU16(0);
+        }
+        try c.frameEndAt(pos);
+
+        pos = try c.frameStart('D');
+        try c.wbuf.append(c.gpa, 'P');
+        try c.writeCStr("");
+        try c.frameEndAt(pos);
+
+        pos = try c.frameStart('E');
+        try c.writeCStr("");
+        try c.writeU32(0);
+        try c.frameEndAt(pos);
+
+        pos = try c.frameStart('S');
+        try c.frameEndAt(pos);
+        try c.send();
+        const result = try c.collectResults();
+        if (pending) |entry| {
+            c.prepared.appendAssumeCapacity(entry);
+            pending = null;
+        }
+        return result;
+    }
+
     // ---------------------------------------------------------- query paths
 
     /// Runs SQL via the simple query protocol (multiple statements allowed,
     /// no parameters). Best for DDL and transactions.
-    pub fn execSimple(c: *Conn, sql: []const u8) Error!Result {
+    fn execSimpleOnce(c: *Conn, sql: []const u8) Error!Result {
         c.last_error = null;
         c.wbuf.clearRetainingCapacity();
         const pos = c.wbuf.items.len;
@@ -683,61 +851,103 @@ pub const Conn = struct {
         return c.collectResults();
     }
 
+    pub fn execSimple(c: *Conn, sql: []const u8) Error!Result {
+        return c.execSimpleTimeout(sql, c.cfg.query_timeout_ms);
+    }
+
+    /// Runs a simple query and cancels it through PostgreSQL's CancelRequest
+    /// protocol if the deadline expires.
+    pub fn execSimpleTimeout(c: *Conn, sql: []const u8, timeout_ms: u64) Error!Result {
+        const effective = if (c.cfg.query_timeout_ms == 0) timeout_ms else if (timeout_ms == 0) c.cfg.query_timeout_ms else @min(timeout_ms, c.cfg.query_timeout_ms);
+        if (effective == 0) return c.execSimpleOnce(sql);
+        var guard = QueryGuard{ .conn = c, .timeout_ms = effective };
+        guard.start();
+        const result = c.execSimpleOnce(sql) catch |err| {
+            return if (guard.finish()) error.QueryTimeout else err;
+        };
+        if (guard.finish()) {
+            var owned = result;
+            owned.deinit();
+            return error.QueryTimeout;
+        }
+        return result;
+    }
+
     /// Runs one parameterized statement via the extended query protocol.
-    /// Parameters are sent in text format; results come back in text format.
+    /// Named statements are cached per connection by SQL and parameter OIDs.
+    fn execParamsCached(c: *Conn, sql: []const u8, params: []const Param) Error!Result {
+        return c.execParamsOnce(sql, params, null) catch |err| {
+            if (!c.planInvalidated()) return err;
+            const index = c.findPrepared(sql, params) orelse return err;
+            var old_name: [32]u8 = undefined;
+            const name = c.prepared.items[index].statementName();
+            @memcpy(old_name[0..name.len], name);
+            c.removePrepared(index);
+            return c.execParamsOnce(sql, params, old_name[0..name.len]);
+        };
+    }
+
     pub fn execParams(c: *Conn, sql: []const u8, params: []const Param) Error!Result {
+        return c.execParamsTimeout(sql, params, c.cfg.query_timeout_ms);
+    }
+
+    /// Runs one extended-protocol query with an out-of-band cancel deadline.
+    pub fn execParamsTimeout(c: *Conn, sql: []const u8, params: []const Param, timeout_ms: u64) Error!Result {
+        const effective = if (c.cfg.query_timeout_ms == 0) timeout_ms else if (timeout_ms == 0) c.cfg.query_timeout_ms else @min(timeout_ms, c.cfg.query_timeout_ms);
+        if (effective == 0) return c.execParamsCached(sql, params);
+        var guard = QueryGuard{ .conn = c, .timeout_ms = effective };
+        guard.start();
+        const result = c.execParamsCached(sql, params) catch |err| {
+            return if (guard.finish()) error.QueryTimeout else err;
+        };
+        if (guard.finish()) {
+            var owned = result;
+            owned.deinit();
+            return error.QueryTimeout;
+        }
+        return result;
+    }
+
+    /// Starts an extended-protocol query whose rows are pulled one at a time.
+    /// Result values use text format so they can also be exported directly.
+    pub fn queryParamsStream(c: *Conn, sql: []const u8, params: []const Param) Error!*Rows {
         c.last_error = null;
         c.wbuf.clearRetainingCapacity();
 
-        // Parse (unnamed statement) with explicit parameter type OIDs.
-        // Layout: statement-name \0 query \0 i16 count ++ i32 oid per param.
         var pos = try c.frameStart('P');
-        try c.writeCStr(""); // statement name: unnamed
+        try c.writeCStr("");
         try c.writeCStr(sql);
         try c.writeU16(@intCast(params.len));
         for (params) |p| try c.writeU32(p.oid);
         try c.frameEndAt(pos);
 
-        // Bind with per-parameter format codes (binary for scalars, text for
-        // complex types); results stay in text format.
         pos = try c.frameStart('B');
-        try c.writeCStr(""); // portal
-        try c.writeCStr(""); // statement
+        try c.writeCStr("");
+        try c.writeCStr("");
         try c.writeU16(@intCast(params.len));
         for (params) |p| try c.writeU16(p.format);
         try c.writeU16(@intCast(params.len));
         for (params) |p| try c.writeParam(p);
-        // Result format: all-binary when enabled, all-text otherwise.
-        if (c.cfg.binary_results) {
-            try c.writeU16(1);
-            try c.writeU16(1);
-        } else {
-            try c.writeU16(0);
-        }
+        try c.writeU16(0); // text results
         try c.frameEndAt(pos);
 
-        // Describe portal
         pos = try c.frameStart('D');
         try c.wbuf.append(c.gpa, 'P');
         try c.writeCStr("");
         try c.frameEndAt(pos);
-
-        // Execute (no row limit)
         pos = try c.frameStart('E');
         try c.writeCStr("");
         try c.writeU32(0);
         try c.frameEndAt(pos);
-
-        // Sync
         pos = try c.frameStart('S');
         try c.frameEndAt(pos);
-
-        if (debug_traffic) {
-            for (c.wbuf.items) |b| std.debug.print("{x:0>2} ", .{b});
-            std.debug.print("\n", .{});
-        }
         try c.send();
-        return c.collectResults();
+
+        const rows = c.gpa.create(Rows) catch return error.OutOfMemory;
+        rows.* = try Rows.init(c);
+        errdefer rows.deinit();
+        try rows.readDescription();
+        return rows;
     }
 
     fn writeParam(c: *Conn, p: Param) Error!void {
@@ -889,6 +1099,8 @@ pub const Conn = struct {
             c.gpa.destroy(b);
             c.ca_bundle = null;
         }
+        for (c.prepared.items) |entry| c.freePrepared(entry);
+        c.prepared.deinit(c.gpa);
         c.msg.deinit(c.gpa);
         c.wbuf.deinit(c.gpa);
         c.err_arena_state.deinit();
@@ -913,8 +1125,188 @@ pub const Conn = struct {
     }
 
     /// True when the connection can be reused by a pool.
+    pub fn ping(c: *Conn) Error!void {
+        var result = try c.execSimple("SELECT 1");
+        result.deinit();
+    }
+
+    pub fn touch(c: *Conn) void {
+        c.last_used_at = Io.Clock.awake.now(c.io);
+    }
+
+    pub fn ageMilliseconds(c: *const Conn) u64 {
+        const ns = c.opened_at.durationTo(Io.Clock.awake.now(c.io)).nanoseconds;
+        return if (ns <= 0) 0 else @intCast(@as(u128, @intCast(ns)) / std.time.ns_per_ms);
+    }
+
+    pub fn idleMilliseconds(c: *const Conn) u64 {
+        const ns = c.last_used_at.durationTo(Io.Clock.awake.now(c.io)).nanoseconds;
+        return if (ns <= 0) 0 else @intCast(@as(u128, @intCast(ns)) / std.time.ns_per_ms);
+    }
+
     pub fn healthy(c: *const Conn) bool {
         return !c.broken and !c.closed and c.txn_status == .idle;
+    }
+};
+
+/// Pull-based PostgreSQL row cursor. Cell slices remain valid until the next
+/// call to `next`. `deinit` drains the protocol and keeps the connection
+/// reusable; a drain failure marks it broken for pool retirement.
+pub const Rows = struct {
+    conn: *Conn,
+    arena: *std.heap.ArenaAllocator,
+    columns: []Result.Column = &.{},
+    cells: std.ArrayList(?[]const u8) = .empty,
+    affected: i64 = 0,
+    done: bool = false,
+    got_error: bool = false,
+
+    fn init(conn: *Conn) Error!Rows {
+        const arena = conn.gpa.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
+        arena.* = std.heap.ArenaAllocator.init(conn.gpa);
+        return .{ .conn = conn, .arena = arena };
+    }
+
+    fn parseDescription(r: *Rows, data: []const u8) Error!void {
+        if (data.len < 2) return error.ProtocolViolation;
+        const count = std.mem.readInt(i16, data[0..2], .big);
+        if (count < 0) return error.ProtocolViolation;
+        const allocator = r.arena.allocator();
+        const columns = allocator.alloc(Result.Column, @intCast(count)) catch return error.OutOfMemory;
+        var offset: usize = 2;
+        for (columns) |*column| {
+            const name_end = std.mem.indexOfScalarPos(u8, data, offset, 0) orelse return error.ProtocolViolation;
+            if (data.len - name_end < 19) return error.ProtocolViolation;
+            column.* = .{
+                .name = allocator.dupe(u8, data[offset..name_end]) catch return error.OutOfMemory,
+                .type_oid = std.mem.readInt(u32, data[name_end + 7 ..][0..4], .big),
+                .format = std.mem.readInt(u16, data[name_end + 17 ..][0..2], .big),
+            };
+            offset = name_end + 19;
+        }
+        if (offset != data.len) return error.ProtocolViolation;
+        r.columns = columns;
+        r.cells.ensureTotalCapacity(r.conn.gpa, columns.len) catch return error.OutOfMemory;
+    }
+
+    fn readDescription(r: *Rows) Error!void {
+        while (true) {
+            const message = try r.conn.readMessage();
+            switch (message.tag) {
+                proto.Tag.row_description => return r.parseDescription(message.data),
+                proto.Tag.error_response => {
+                    try r.conn.storeError(message.data);
+                    r.got_error = true;
+                },
+                proto.Tag.ready_for_query => {
+                    if (message.data.len != 1) return error.ProtocolViolation;
+                    r.conn.setTxnStatus(message.data);
+                    r.done = true;
+                    return if (r.got_error) r.conn.errorForLastError() else {};
+                },
+                proto.Tag.notice_response => if (Conn.on_notice) |hook| hook(Conn.parseError(message.data)),
+                else => {},
+            }
+        }
+    }
+
+    fn parseRow(r: *Rows, data: []const u8) Error!Result.Row {
+        if (data.len < 2) return error.ProtocolViolation;
+        const count = std.mem.readInt(i16, data[0..2], .big);
+        if (count < 0 or @as(usize, @intCast(count)) != r.columns.len) return error.ProtocolViolation;
+        r.cells.clearRetainingCapacity();
+        var offset: usize = 2;
+        for (0..@as(usize, @intCast(count))) |_| {
+            if (offset + 4 > data.len) return error.ProtocolViolation;
+            const len = std.mem.readInt(i32, data[offset..][0..4], .big);
+            offset += 4;
+            if (len < -1) return error.ProtocolViolation;
+            if (len == -1) {
+                r.cells.appendAssumeCapacity(null);
+            } else {
+                const value_len: usize = @intCast(len);
+                if (offset + value_len > data.len) return error.ProtocolViolation;
+                r.cells.appendAssumeCapacity(data[offset..][0..value_len]);
+                offset += value_len;
+            }
+        }
+        if (offset != data.len) return error.ProtocolViolation;
+        return r.cells.items;
+    }
+
+    /// Returns the next row, or null after ReadyForQuery. Protocol and server
+    /// errors are returned from the iteration point where they are observed.
+    pub fn next(r: *Rows) Error!?Result.Row {
+        if (r.done) return null;
+        while (true) {
+            const message = r.conn.readMessage() catch |err| {
+                r.conn.broken = true;
+                return err;
+            };
+            switch (message.tag) {
+                proto.Tag.data_row => return try r.parseRow(message.data),
+                proto.Tag.command_complete => {
+                    if (message.data.len == 0 or message.data[message.data.len - 1] != 0)
+                        return error.ProtocolViolation;
+                    r.affected = Conn.parseAffected(std.mem.sliceTo(message.data, 0));
+                },
+                proto.Tag.error_response => {
+                    try r.conn.storeError(message.data);
+                    r.got_error = true;
+                },
+                proto.Tag.notice_response => if (Conn.on_notice) |hook| hook(Conn.parseError(message.data)),
+                proto.Tag.ready_for_query => {
+                    if (message.data.len != 1) return error.ProtocolViolation;
+                    r.conn.setTxnStatus(message.data);
+                    r.done = true;
+                    if (r.got_error) return r.conn.errorForLastError();
+                    return null;
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn writeCsvField(writer: *Io.Writer, value: []const u8) !void {
+        const quote = std.mem.indexOfAny(u8, value, ",\"\r\n") != null;
+        if (!quote) return writer.writeAll(value);
+        try writer.writeByte('\"');
+        for (value) |byte| {
+            if (byte == '\"') try writer.writeByte('\"');
+            try writer.writeByte(byte);
+        }
+        try writer.writeByte('\"');
+    }
+
+    /// Streams the remaining rows as RFC 4180-style CSV without buffering the
+    /// complete result set.
+    pub fn writeCsv(r: *Rows, writer: *Io.Writer) !void {
+        for (r.columns, 0..) |column, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writeCsvField(writer, column.name);
+        }
+        try writer.writeAll("\r\n");
+        while (try r.next()) |row| {
+            for (row, 0..) |cell, i| {
+                if (i > 0) try writer.writeByte(',');
+                if (cell) |value_| try writeCsvField(writer, value_);
+            }
+            try writer.writeAll("\r\n");
+        }
+    }
+
+    pub fn deinit(r: *Rows) void {
+        while (!r.done) {
+            _ = r.next() catch {
+                r.conn.broken = true;
+                break;
+            };
+        }
+        const gpa = r.conn.gpa;
+        r.cells.deinit(gpa);
+        r.arena.deinit();
+        gpa.destroy(r.arena);
+        gpa.destroy(r);
     }
 };
 

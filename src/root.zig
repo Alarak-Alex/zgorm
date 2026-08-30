@@ -4,14 +4,19 @@
 
 const std = @import("std");
 
+pub const drivers = @import("drivers.zig");
+
 /// Pure-Zig PostgreSQL driver (no libpq).
-pub const pq = @import("pq.zig");
+pub const pq = drivers.postgres;
 
 pub const db = @import("orm/db.zig");
 pub const logger = @import("orm/logger.zig");
 pub const migrator = @import("orm/migrator.zig");
 pub const pool = @import("orm/pool.zig");
+pub const observability = @import("orm/observability.zig");
+pub const plugins = @import("orm/plugins.zig");
 pub const qb = @import("orm/qb.zig");
+pub const router = @import("orm/router.zig");
 pub const schema = @import("orm/schema.zig");
 pub const value = @import("orm/value.zig");
 pub const naming = @import("orm/naming.zig");
@@ -20,18 +25,47 @@ pub const time = @import("orm/time.zig");
 pub const Db = db.Db;
 pub const Session = db.Session;
 pub const Tx = db.Tx;
+pub const OnConflict = db.OnConflict;
+pub const RetryOptions = db.RetryOptions;
 pub const Migrator = migrator.Migrator;
+pub const PoolOptions = pool.Options;
+pub const PoolStats = pool.PoolStats;
+pub const DryRun = qb.DryRun;
+pub const ModelRows = qb.ModelRows;
 pub const Migration = migrator.Migration;
+pub const SchemaChange = migrator.SchemaChange;
+pub const IndexOptions = migrator.IndexOptions;
+pub const Router = router.Router;
+pub const Plugin = plugins.Plugin;
+pub const PluginMetrics = plugins.Metrics;
+pub const TracePlugin = plugins.Trace;
+pub const AuditPlugin = plugins.Audit;
+pub const CacheInvalidationPlugin = plugins.CacheInvalidation;
+pub const EncryptionPlugin = plugins.Encryption;
+pub const TenantFilterPlugin = plugins.TenantFilter;
+pub const PaginationPlugin = plugins.Pagination;
 pub const Json = value.Json;
+pub const Uuid = value.Uuid;
+pub const Decimal = value.Decimal;
+pub const Inet = value.Inet;
+pub const Cidr = value.Cidr;
+pub const Range = value.Range;
+pub const Geometry = value.Geometry;
+pub const TextScalar = value.TextScalar;
 pub const Bytes = value.Bytes;
 pub const Logger = logger.Logger;
+pub const Observer = observability.Observer;
+pub const QueryEvent = observability.QueryEvent;
+pub const Metrics = observability.Metrics;
+pub const SlowQueryLog = observability.SlowQueryLog;
+pub const ErrorClass = observability.ErrorClass;
 pub const LogLevel = logger.LogLevel;
 pub const Time = time.Time;
 pub const Model = value.Model;
 
 pub const Error = pq.Error;
 
-/// Starts a query builder: `z.query(db, User).where(...)...`
+/// Starts a query builder: `z.query(User, db).where(...)...`
 pub fn query(comptime T: type, d: *Db) *db.Query(T) {
     return Db.query(T, d);
 }
@@ -65,5 +99,6 @@ test {
     _ = @import("orm/naming.zig");
     _ = @import("orm/qb.zig");
     _ = @import("orm/pool.zig");
+    _ = @import("orm/observability.zig");
     _ = @import("orm/db.zig");
 }

@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-一个受 GORM 启发、面向 Zig 0.16 的 ORM。**PostgreSQL 优先**，自带纯 Zig 实现的 PostgreSQL 线协议驱动（无需 libpq，零 C 依赖）。
+一个受 GORM 启发、面向 Zig 0.16 的 ORM，PostgreSQL、MySQL/MariaDB、SQLite 均为一等驱动。PostgreSQL 与 MySQL 使用内置纯 Zig 线协议实现，SQLite 使用 `libsqlite3`。
 
 ## 特性
 
@@ -12,22 +12,24 @@
 - **结果集二进制格式解码**：查询结果默认从 PostgreSQL 二进制格式解码（数组、时间戳、jsonb 等）——`Config.binary_results = false` 可关闭
 - **comptime 模型反射**：普通 Zig 结构体即模型，无宏、无代码生成、运行时零注册
 - **约定优于配置**：驼峰转 snake_case、`id` 默认主键、`created_at`/`updated_at` 自动时间戳
-- **GORM 风格查询构建器**：`where` / `orWhere` / `whereEq` / `whereIn` / `order_by` / `limit` / `offset` / `group_by` / `having` / `for_update`，占位符 `$1,$2...` 跨条件自动重编号
-- **CRUD + 事务 + 连接池**：`insert`（自动回填自增主键）、`insertBatch`（自动分块、最多 65535 参数）、`update`、`save`、`delete`、`deleteWhere`、`updateWhere`、`find`、事务 `commit/rollback`
-- **autoMigrate**：建表、补列、创建索引（唯一/普通）
-- **关联与预加载**：`has_many` / `belongs_to` 声明 + `query.preload("posts.comments")` 嵌套预加载，逐层批量装配，避免 N+1
-- **模型 hook**：`beforeSave` / `beforeCreate` / `afterCreate` / `beforeUpdate` / `afterUpdate` / `beforeDelete` / `afterDelete` / `afterFind`
-- **Savepoint / 嵌套事务**：`tx.begin()` 创建 savepoint，`commit()` 释放、`rollback()` 回滚到保存点
-- **软删除**：模型带 `deleted_at` 列（含 `z.Model`）时，查询自动过滤已删除行，`delete` 变为打戳；`unscoped()`、`deleteHard` 与 `restore` 可绕过或恢复
-- **内置日志**：每条查询自动计时并按结果分级记录（错误 / 慢查询 / 全量 trace）——可按 `Db` 替换为自定义日志宿主
-- **迁移版本管理**：`Migrator` 基于 `schema_migrations` 表按版本应用/回滚 SQL 迁移
-- **类型映射**：整数/浮点/`bool`/`[]const u8`(text)/`[]u8`/枚举(按名存储)/`zorm.Time`（timestamptz、微秒精度；`std.json` 输出 RFC 3339 UTC 字符串）及其可选版本
+- **扩展查询构建器**：JOIN、子查询、CTE/递归 CTE、UNION、`DISTINCT ON`、CASE/窗口/JSON/数组原始表达式、Hint、命名参数、Scope、Dry Run、`EXPLAIN` 与 `RETURNING`
+- **生产级连接与执行控制**：Prepared Statement LRU、查询/获取连接/网络/事务超时、PostgreSQL CancelRequest、连接寿命与空闲限制、后台清理、预热、健康检查与 PoolStats
+- **CRUD、Upsert、乐观锁与事务**：批量分块、可配置 `ON CONFLICT`、任意/批量 `RETURNING`、复合主键、Savepoint 与显式有界事务重试
+- **流式结果**：首行到达即可解码/导出，保持大结果集内存有界，传播迭代器错误并在提前结束时释放连接
+- **Schema 管理**：增量 `autoMigrate`；带 advisory lock、checksum、dirty 检测的版本迁移；Schema Diff、改类型/重命名/删列、约束与复合/部分/表达式索引
+- **完整关联**：`belongs_to`、`has_one`、`has_many`、多对多、多态；嵌套/Join Preload；append/replace/delete/clear/count；级联与自动保存
+- **自定义 Codec**：`zormEncode`/`zormDecode`，以及 UUID、Decimal、IP/CIDR、Range、Geometry、Enum、JSON 辅助类型
+- **可观测性**：结构化事件、SQL 指纹、SQLSTATE/错误分类、OpenTelemetry span hook、Prometheus 指标、慢 SQL 聚合、Prepared Cache 与连接池指标
+- **路由**：Primary/Replica 读写分离、Replica 轮询、租户/分片路由与健康检查 Failover
+- **插件**：全局 Query/CRUD Callback，以及 tracing、metrics、AES-256-GCM 加密、租户过滤、审计、分页、缓存失效辅助插件
+- **三个一等驱动**：MySQL/MariaDB 支持 `mysql_native_password`、`caching_sha2_password`（TLS 或 RSA 完整认证）、服务端 Prepared Statement、连接池与超时；SQLite 支持参数绑定、连接池、busy/query 超时、WAL 与外键配置。二者共享类型化 CRUD/Upsert、乐观锁、Hook、关联/Preload、查询组合、增量迁移、版本迁移、插件、路由、可观测性与显式事务重试。
 - **错误携带上下文**：服务器错误映射为类型化错误（`UniqueViolation`、`ForeignKeyViolation`、`SerializationFailure`…），并可通过 `lastError` 读取 SQLSTATE、消息、约束名等明细
 
 ## 环境要求
 
 - Zig **0.16.0**
 - PostgreSQL 10+（推荐 14+；需允许 `trust`/`scram-sha-256`/`md5` 密码认证）
+- 使用 `z.drivers.sqlite` 时需安装 SQLite 开发头文件与 `libsqlite3`
 
 ## 快速上手
 
@@ -42,6 +44,7 @@ zig fetch --save <git-url-or-tarball>
 const mod = b.addModule("zorm", .{
     .root_source_file = b.path("src/root.zig"), // 若以路径依赖方式使用可省略
 });
+mod.linkSystemLibrary("sqlite3", .{}); // 仅使用 z.drivers.sqlite 时需要
 // 在你的模块 .imports 中加入 .{ .name = "zorm", .module = mod }
 ```
 
@@ -110,7 +113,7 @@ pub fn main(init: std.process.Init) !void {
     try db.insert(&u);
 
     // 按主键查找（返回 ?User；字符串字段用 gpa 分配，配合 z.free 释放）
-    const found = (try db.find(User, u.id.?)).?;
+    var found = (try db.find(User, u.id.?)).?;
     defer z.free(User, found, gpa);
 
     // 更新 / 保存（主键为空则插入）
@@ -287,7 +290,67 @@ m.add(&.{
 _ = try m.applyAll();        // 按版本升序应用待执行迁移，每个迁移一个事务
 try m.rollbackLast();        // 用 down 脚本回滚最近一个版本
 ```
-记录表 `schema_migrations (version bigint PK, name text, applied_at timestamptz)`。
+记录表包含 `version`、`name`、`checksum`、`dirty`、`applied_at`；`applyAll` 通过 PostgreSQL advisory lock 串行化迁移，并拒绝 checksum 变化或 dirty 的记录。
+
+### 插件与显式事务重试
+
+```zig
+var metrics: z.PluginMetrics = .{};
+try db.addPlugin(metrics.plugin());
+
+const Retry = struct {
+    fn run(user: *User, tx: *z.Tx) z.Error!void {
+        try tx.insert(user);
+    }
+};
+var user = User{ .name = "retry-safe" };
+try db.transactionRetry(
+    .{ .max_attempts = 4, .base_delay_ms = 10, .max_delay_ms = 500 },
+    &user,
+    Retry.run,
+);
+```
+
+只有显式调用 `transactionRetry` 才会重放整个事务，且仅重试序列化失败、
+死锁和可选的临时连接错误；普通 CRUD 与 `begin` 绝不会自动重放写操作。
+
+租户过滤与分页是显式的 Query 转换：
+
+```zig
+var q = z.query(User, db);
+q = (z.TenantFilterPlugin{}).apply(q, tenant_id);
+q = (z.PaginationPlugin{ .page = 0, .per_page = 50 }).apply(q);
+const page = try q.all(gpa);
+```
+
+### MySQL/MariaDB 与 SQLite
+
+```zig
+const sqlite = try z.drivers.sqlite.Db.open(gpa, ":memory:");
+defer sqlite.deinit();
+var sqlite_db = z.drivers.sqlite.orm(sqlite);
+try sqlite_db.autoMigrate(User);
+var local_user = User{ .name = "Ada" };
+try sqlite_db.insert(&local_user);
+const local_rows = try sqlite_db.whereEq(User, "name", "Ada", gpa);
+defer z.freeSlice(User, local_rows, gpa);
+
+const mysql = try z.drivers.mysql.Conn.connect(gpa, io, .{
+    .host = "127.0.0.1", .port = 3306,
+    .user = "app", .password = "secret", .database = "app",
+});
+defer mysql.deinit();
+var mysql_db = z.drivers.mysql.orm(mysql);
+try mysql_db.autoMigrate(User);
+var remote_user = User{ .name = "Grace" };
+try mysql_db.insert(&remote_user);
+```
+
+MySQL/MariaDB 与 SQLite ORM 共享同级的类型化 CRUD/Upsert、乐观锁、
+生命周期 Hook、关联/Preload、查询构建、增量/版本迁移、连接池、插件、路由、
+可观测性与显式事务重试 API。方言差异保持显式：`DISTINCT ON`、迁移 advisory
+lock、破坏性 Schema Diff 与二进制流式结果仅适用于 PostgreSQL；MySQL 模拟写操作
+`RETURNING`，SQLite 依赖 `libsqlite3`。
 
 ## 错误处理
 
@@ -310,16 +373,18 @@ zig build                       # 构建库 + example
 zig build test                  # 单元测试
 zig build run -Ddsn='postgres://...'          # 运行 example
 zig build test-integration -Ddsn='postgres://...'   # 集成测试（需真实 PG）
+zig build test-drivers                              # SQLite
+zig build test-drivers -Dmysql-port=3307            # SQLite + 真实 MySQL/MariaDB
 zig build -Doptimize=ReleaseFast              # 发布构建
 ```
 
-集成测试覆盖：建表/迁移、插入回填、唯一约束错误、按主键查找、更新、查询构建（where/whereIn/orWhere/select 子集/order/limit）、枚举与 `zorm.Time` 往返、批量插入分块、事务提交与回滚、条件更新与删除。
+集成测试覆盖 CRUD/批量、事务/Savepoint/重试、迁移与 Schema Diff、Prepared Cache、超时/取消、流式结果、可观测性、路由、插件、复合主键、Upsert/Returning、自定义 Codec 与关联。`test-drivers` 验证内存 SQLite，并可选验证真实 MySQL/MariaDB。
 
 ## 设计与取舍
 
 - **线格式**：参数对标量（int8/float8/bool/timestamptz/bytea/text）用二进制格式并显式声明 OID，数组/JSON/枚举走文本；结果默认按 PostgreSQL 二进制格式解码（`Config.binary_results = false` 可为特殊列类型关闭）。
 - **预加载**：点号路径支持任意深度；预加载行的字符串/数组值会按父行深拷贝。多维数组仅支持数值/布尔元素；text 数组为一维。
-- **autoMigrate** 仅限建表/补列/单列索引，不删列不改类型；更复杂的变更请用 `Migrator`。
+- **autoMigrate** 保持增量语义；改类型、删列、重命名、约束和高级索引通过 `Migrator` 显式执行。
 - **SQL 注入面**：值一律参数化；`order_by`、`group_by`、`having`、`select` 列名为字符串拼接（同 GORM），请勿拼接用户输入。
 - **并发**：`Db`/连接池线程安全（`std.Io.Mutex`/`Condition`）；单个 `pq.Conn` 与进行中的 `Session` 非线程安全。
 - **更新全列**：`update` 写出模型所有列（GORM `Save` 语义）；部分更新用 `updateWhere`。
@@ -334,7 +399,8 @@ zig build -Doptimize=ReleaseFast              # 发布构建
 - [x] 嵌套预加载（v0.3.0）
 - [x] 结果集二进制格式解码（v0.3.0）
 - [x] 多维数组 / 数组元素的 NULL 完整支持（v0.3.0）
-- [ ] MySQL/SQLite 驱动
+- [x] MySQL/SQLite 直接驱动与类型化 CRUD ORM
+- [x] 生产级执行控制、路由、插件、Codec、高级迁移与显式事务重试
 
 ## License
 
