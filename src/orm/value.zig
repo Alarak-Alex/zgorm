@@ -1239,3 +1239,17 @@ test "malformed binary values fail without leaking" {
         decodeBinary([]const i64, &array, pq.proto.Oid.int8_array, testing.allocator),
     );
 }
+
+test "Model JSON timestamps are RFC 3339 strings" {
+    const t = Time.fromUnixMicros(1_800_000_000_123_456);
+    const payload = .{ .base = Model{
+        .id = 1,
+        .created_at = t,
+        .updated_at = t,
+    } };
+    try testing.expectFmt(
+        "{\"base\":{\"id\":1,\"created_at\":\"2027-01-15T08:00:00.123456Z\",\"updated_at\":\"2027-01-15T08:00:00.123456Z\",\"deleted_at\":null}}",
+        "{f}",
+        .{std.json.fmt(payload, .{})},
+    );
+}

@@ -87,6 +87,15 @@ pub const Time = struct {
 
     pub const pg_text_len = 32;
 
+    /// Serializes as an RFC 3339 UTC string instead of exposing `micros`.
+    pub fn jsonStringify(t: Time, jw: anytype) !void {
+        var buf: [pg_text_len]u8 = undefined;
+        const text = t.toPgText(&buf);
+        buf[10] = 'T';
+        buf[text.len - 3] = 'Z';
+        try jw.write(buf[0 .. text.len - 2]);
+    }
+
     /// Parses the text PostgreSQL sends for `timestamp` / `timestamptz`
     /// columns: `2026-08-29 12:34:56.789012+08`, with or without sub-second
     /// precision and timezone (`+08`, `-05:30`, `+0530`, `Z`, or none —

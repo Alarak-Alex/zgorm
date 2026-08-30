@@ -21,7 +21,7 @@
 - **软删除**：模型带 `deleted_at` 列（含 `z.Model`）时，查询自动过滤已删除行，`delete` 变为打戳；`unscoped()`、`deleteHard` 与 `restore` 可绕过或恢复
 - **内置日志**：每条查询自动计时并按结果分级记录（错误 / 慢查询 / 全量 trace）——可按 `Db` 替换为自定义日志宿主
 - **迁移版本管理**：`Migrator` 基于 `schema_migrations` 表按版本应用/回滚 SQL 迁移
-- **类型映射**：整数/浮点/`bool`/`[]const u8`(text)/`[]u8`/枚举(按名存储)/`zorm.Time`(timestamptz, 微秒精度) 及其可选版本
+- **类型映射**：整数/浮点/`bool`/`[]const u8`(text)/`[]u8`/枚举(按名存储)/`zorm.Time`（timestamptz、微秒精度；`std.json` 输出 RFC 3339 UTC 字符串）及其可选版本
 - **错误携带上下文**：服务器错误映射为类型化错误（`UniqueViolation`、`ForeignKeyViolation`、`SerializationFailure`…），并可通过 `lastError` 读取 SQLSTATE、消息、约束名等明细
 
 ## 环境要求
@@ -47,11 +47,11 @@ const mod = b.addModule("zorm", .{
 
 ### 定义模型
 
-模型可以内嵌 `z.Model`（等价于 GORM 的 `gorm.Model`）自动获得 `id`、`created_at`、`updated_at` 三列——内嵌字段在编译期扁平化进表结构：
+模型可以内嵌 `z.Model`（等价于 GORM 的 `gorm.Model`）自动获得 `id`、`created_at`、`updated_at`、`deleted_at` 四列。三个时间戳列均使用 PostgreSQL `timestamptz`（带时区）；内嵌字段在编译期扁平化进表结构：
 
 ```zig
 pub const Post = struct {
-    base: z.Model = .{},     // id, created_at, updated_at
+    base: z.Model = .{},     // id, created_at, updated_at, deleted_at
     title: []const u8 = "",
 
     pub const zorm = .{ .table = "posts" };

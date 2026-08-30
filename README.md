@@ -21,7 +21,7 @@ A GORM-inspired ORM for Zig 0.16. **PostgreSQL first**, with a pure-Zig PostgreS
 - **Soft delete**: models with a `deleted_at` column (including `z.Model`) filter soft-deleted rows from queries and turn `delete` into a stamp; `unscoped()`, `deleteHard` and `restore` opt out
 - **Built-in logger**: every query is timed and reported (errors, slow queries above the threshold, full tracing) — replaceable per `Db` with a custom sink
 - **Migration version management**: `Migrator` applies/rolls back versioned SQL migrations tracked in a `schema_migrations` table
-- **Type mapping**: integers / floats / `bool` / `[]const u8` (text) / `[]u8` / enums (stored by name) / `zorm.Time` (timestamptz, microsecond precision) — plus optionals of all of those
+- **Type mapping**: integers / floats / `bool` / `[]const u8` (text) / `[]u8` / enums (stored by name) / `zorm.Time` (timestamptz, microsecond precision; `std.json` emits RFC 3339 UTC strings) — plus optionals of all of those
 - **Errors carry context**: server errors map to typed errors (`UniqueViolation`, `ForeignKeyViolation`, `SerializationFailure`, ...), with SQLSTATE, message and constraint details available via `lastError`
 
 ## Requirements
@@ -48,8 +48,9 @@ const mod = b.addModule("zorm", .{
 ### Defining a model
 
 Models can embed `z.Model` (GORM `gorm.Model` equivalent) to get `id`,
-`created_at`, `updated_at`, and `deleted_at` columns automatically — the embedded fields are
-flattened into the table at comptime:
+`created_at`, `updated_at`, and `deleted_at` columns automatically. All three
+timestamp columns use PostgreSQL `timestamptz`; embedded fields are flattened
+into the table at comptime:
 
 ```zig
 pub const Post = struct {

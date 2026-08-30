@@ -508,6 +508,7 @@ const EmbModel = struct {
     id: ?i64 = null,
     created_at: ?time_mod.Time = null,
     updated_at: ?time_mod.Time = null,
+    deleted_at: ?time_mod.Time = null,
 
     pub const __zorm_embedded = true;
 };
@@ -521,12 +522,14 @@ const EmbPost = struct {
 
 test "embedded model fields flatten into columns" {
     const t = comptime tableOf(EmbPost);
-    try testing.expectEqual(@as(usize, 4), t.columns.len); // id, created_at, updated_at, title
+    try testing.expectEqual(@as(usize, 5), t.columns.len); // id, three timestamps, title
     try testing.expectEqualStrings("id", t.columns[0].name);
     try testing.expectEqualStrings("base", t.columns[0].embed.?);
     try testing.expect(t.columns[0].is_auto);
     try testing.expectEqualStrings("created_at", t.columns[1].name);
     try testing.expectEqualStrings("updated_at", t.columns[2].name);
-    try testing.expectEqualStrings("title", t.columns[3].name);
-    try testing.expect(t.columns[3].embed == null);
+    try testing.expectEqualStrings("deleted_at", t.columns[3].name);
+    for (t.columns[1..4]) |col| try testing.expectEqualStrings("timestamptz", col.ddl_type);
+    try testing.expectEqualStrings("title", t.columns[4].name);
+    try testing.expect(t.columns[4].embed == null);
 }
