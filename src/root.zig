@@ -8,6 +8,7 @@ const std = @import("std");
 pub const pq = @import("pq.zig");
 
 pub const db = @import("orm/db.zig");
+pub const logger = @import("orm/logger.zig");
 pub const migrator = @import("orm/migrator.zig");
 pub const pool = @import("orm/pool.zig");
 pub const qb = @import("orm/qb.zig");
@@ -23,6 +24,8 @@ pub const Migrator = migrator.Migrator;
 pub const Migration = migrator.Migration;
 pub const Json = value.Json;
 pub const Bytes = value.Bytes;
+pub const Logger = logger.Logger;
+pub const LogLevel = logger.LogLevel;
 pub const Time = time.Time;
 pub const Model = value.Model;
 

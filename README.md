@@ -19,6 +19,7 @@ A GORM-inspired ORM for Zig 0.16. **PostgreSQL first**, with a pure-Zig PostgreS
 - **Model hooks**: `beforeSave` / `beforeCreate` / `afterCreate` / `beforeUpdate` / `afterUpdate` / `beforeDelete` / `afterDelete` / `afterFind`
 - **Savepoints / nested transactions**: `tx.begin()` creates a savepoint, `commit()` releases it, `rollback()` rolls back to it
 - **Soft delete**: models with a `deleted_at` column (including `z.Model`) filter soft-deleted rows from queries and turn `delete` into a stamp; `unscoped()`, `deleteHard` and `restore` opt out
+- **Built-in logger**: every query is timed and reported (errors, slow queries above the threshold, full tracing) — replaceable per `Db` with a custom sink
 - **Migration version management**: `Migrator` applies/rolls back versioned SQL migrations tracked in a `schema_migrations` table
 - **Type mapping**: integers / floats / `bool` / `[]const u8` (text) / `[]u8` / enums (stored by name) / `zorm.Time` (timestamptz, microsecond precision) — plus optionals of all of those
 - **Errors carry context**: server errors map to typed errors (`UniqueViolation`, `ForeignKeyViolation`, `SerializationFailure`, ...), with SQLSTATE, message and constraint details available via `lastError`
@@ -220,6 +221,36 @@ pub const User = struct {
 };
 ```
 Available hooks: `beforeSave`, `beforeCreate`, `afterCreate`, `beforeUpdate`, `afterUpdate`, `beforeDelete`, `afterDelete`, `afterFind` (declare them on the model, all optional; return `z.Error!void`, use `error.HookAborted` to abort the operation).
+
+### Logging
+
+zorm ships with a default stderr logger (GORM-style): failed queries log at
+error level, queries slower than the threshold at warn, and everything traces
+at info. Default level is `warn` with a 200ms slow-query threshold, so normal
+usage stays quiet.
+
+```zig
+// Trace every query:
+db.setLogger(.{ .level = .info });
+
+// Silence:
+db.setLogger(z.Logger.discard);
+
+// Custom sink (e.g. your log framework):
+const MyLogger = struct {
+    fn log(ctx: ?*anyopaque, level: z.LogLevel, msg: []const u8) void {
+        // `msg` contains elapsed time, row count, inlined SQL and params
+        my_log_framework.write(level, msg);
+    }
+};
+db.setLogger(.{ .level = .info, .logFn = MyLogger.log, .context = null });
+
+// Tune the slow-query threshold:
+db.setLogger(.{ .level = .warn, .slow_threshold_ms = 500 });
+```
+
+Logged lines inline the parameter values into the SQL (with `NULL` and
+quoting handled), so they can be copied straight into `psql`.
 
 ### Soft delete
 

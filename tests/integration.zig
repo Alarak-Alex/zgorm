@@ -676,6 +676,63 @@ test "v3: embedded zorm.Model round trip and soft delete" {
     _ = try db.deleteWhereHard(EmbeddedUser, "true", .{});
 }
 
+const CapturingLogger = struct {
+    buf: std.ArrayList(u8) = .empty,
+    level: z.LogLevel = .info,
+    gpa: std.mem.Allocator,
+
+    fn log(ctx: ?*anyopaque, level: z.LogLevel, msg: []const u8) void {
+        const self: *CapturingLogger = @ptrCast(@alignCast(ctx.?));
+        if (@intFromEnum(level) > @intFromEnum(self.level)) return;
+        self.buf.appendSlice(self.gpa, msg) catch {};
+        self.buf.appendSlice(self.gpa, "\n") catch {};
+    }
+
+    fn logger(self: *CapturingLogger) z.Logger {
+        return .{
+            .context = self,
+            .level = self.level,
+            .slow_threshold_ms = 0, // trace everything
+            .logFn = log,
+        };
+    }
+};
+
+test "v4: default logger traces queries and can be replaced" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    defer db.deinit();
+
+    // Default logger: warn level, must stay silent for a successful fast query.
+    var sink = CapturingLogger{ .gpa = gpa, .level = .info };
+    db.setLogger(sink.logger());
+    defer db.setLogger(z.Logger.default);
+
+    var r1 = try db.execRaw("SELECT 1");
+    r1.deinit();
+    try std.testing.expect(sink.buf.items.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf.items, "SELECT 1") != null);
+
+    // Errors are logged at error level with the server message (custom sinks
+    // receive the raw message without the default logger's tag prefix).
+    sink.buf.clearRetainingCapacity();
+    _ = db.execRaw("SELECT * FROM __no_such_table__") catch {};
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf.items, "SQL error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf.items, "__no_such_table__") != null);
+
+    // Silent logger: nothing is emitted.
+    db.setLogger(z.Logger.discard);
+    sink.buf.clearRetainingCapacity();
+    var r3 = try db.execRaw("SELECT 2");
+    r3.deinit();
+    try std.testing.expectEqual(@as(usize, 0), sink.buf.items.len);
+    sink.buf.deinit(gpa);
+}
+
 test "v3: issue fixes regression" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

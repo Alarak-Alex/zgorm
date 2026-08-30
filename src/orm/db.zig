@@ -7,6 +7,7 @@ const qb_mod = @import("qb.zig");
 const schema = @import("schema.zig");
 const value = @import("value.zig");
 const time_mod = @import("time.zig");
+pub const logger_mod = @import("logger.zig");
 
 const Time = time_mod.Time;
 pub const Error = pq.Error;
@@ -56,7 +57,7 @@ pub const Session = struct {
     /// Non-null while inside a transaction.
     pinned: ?*pq.Conn = null,
     savepoint_depth: usize = 0,
-    logger: ?*const fn (sql: []const u8, params: []const pq.Param) void = null,
+    logger: logger_mod.Logger = logger_mod.Logger.default,
 
     pub fn acquire(s: *Session) Error!*pq.Conn {
         return s.pinned orelse s.pool.acquire();
@@ -75,14 +76,16 @@ pub const Session = struct {
     }
 
     fn runExec(s: *Session, sql: []const u8, params: []const pq.Param) Error!pq.Result {
-        if (s.logger) |log| log(sql, params);
+        const started = std.Io.Clock.awake.now(s.io);
         const conn = try s.acquire();
         const res = conn.execParams(sql, params) catch |e| {
             s.captureError(conn);
             s.releaseConn(conn);
+            s.logQuery(sql, params, started, 0, e);
             return e;
         };
         s.releaseConn(conn);
+        s.logQuery(sql, params, started, res.affected, null);
         return res;
     }
 
@@ -105,15 +108,39 @@ pub const Session = struct {
     /// Executes raw SQL without parameters (simple query protocol; several
     /// statements allowed).
     pub fn execRaw(s: *Session, sql: []const u8) Error!pq.Result {
-        if (s.logger) |log| log(sql, &.{});
+        const started = std.Io.Clock.awake.now(s.io);
         const conn = try s.acquire();
         const res = conn.execSimple(sql) catch |e| {
             s.captureError(conn);
             s.releaseConn(conn);
+            s.logQuery(sql, &.{}, started, 0, e);
             return e;
         };
         s.releaseConn(conn);
+        s.logQuery(sql, &.{}, started, res.affected, null);
         return res;
+    }
+
+    /// Times and reports one query through the session's logger.
+    fn logQuery(
+        s: *Session,
+        sql: []const u8,
+        params: []const pq.Param,
+        started: std.Io.Timestamp,
+        rows: i64,
+        err: ?anyerror,
+    ) void {
+        const elapsed_ns: u128 = @intCast(started.durationTo(std.Io.Clock.awake.now(s.io)).nanoseconds);
+        var buf: [4096]u8 = undefined;
+        const msg = logger_mod.formatQuery(&s.logger, &buf, sql, params, elapsed_ns, rows, err);
+        const level: logger_mod.LogLevel = if (err != null)
+            .err
+        else if (s.logger.slow_threshold_ms > 0 and
+            elapsed_ns / std.time.ns_per_ms >= s.logger.slow_threshold_ms)
+            .warn
+        else
+            .info;
+        s.logger.log(level, msg);
     }
 
     // ---------------------------------------------------------------- CRUD
@@ -1011,8 +1038,9 @@ pub const Db = struct {
     pool: pool_mod.Pool,
     gpa: std.mem.Allocator,
     io: std.Io,
-    /// Optional SQL logger (debug aid).
-    logger: ?*const fn (sql: []const u8, params: []const pq.Param) void = null,
+    /// Logger used for every query issued through this handle.
+    /// Replace with `setLogger`; defaults to the stderr logger at warn level.
+    logger: logger_mod.Logger = logger_mod.Logger.default,
     /// Owns the parsed Config strings for DSN-based connections so they live
     /// as long as the pool (the pool only copies the slices).
     cfg_arena: ?*std.heap.ArenaAllocator = null,
@@ -1139,6 +1167,13 @@ pub const Db = struct {
     /// strings are deep-copied into `arena`.
     pub fn lastErrorCopy(d: *Db, arena: std.mem.Allocator) ?pq.PgError {
         return d.pool.lastErrorCopy(arena);
+    }
+
+    /// Replaces the logger used for every query issued through this handle.
+    /// Pass `z.Logger.discard` to silence, or a custom `Logger` with your own
+    /// sink. Defaults to the stderr logger at warn level.
+    pub fn setLogger(d: *Db, logger: logger_mod.Logger) void {
+        d.logger = logger;
     }
     pub fn exec(d: *Db, sql: []const u8, args: anytype) Error!pq.Result {
         var s = d.session();

@@ -19,6 +19,7 @@
 - **模型 hook**：`beforeSave` / `beforeCreate` / `afterCreate` / `beforeUpdate` / `afterUpdate` / `beforeDelete` / `afterDelete` / `afterFind`
 - **Savepoint / 嵌套事务**：`tx.begin()` 创建 savepoint，`commit()` 释放、`rollback()` 回滚到保存点
 - **软删除**：模型带 `deleted_at` 列（含 `z.Model`）时，查询自动过滤已删除行，`delete` 变为打戳；`unscoped()`、`deleteHard` 与 `restore` 可绕过或恢复
+- **内置日志**：每条查询自动计时并按结果分级记录（错误 / 慢查询 / 全量 trace）——可按 `Db` 替换为自定义日志宿主
 - **迁移版本管理**：`Migrator` 基于 `schema_migrations` 表按版本应用/回滚 SQL 迁移
 - **类型映射**：整数/浮点/`bool`/`[]const u8`(text)/`[]u8`/枚举(按名存储)/`zorm.Time`(timestamptz, 微秒精度) 及其可选版本
 - **错误携带上下文**：服务器错误映射为类型化错误（`UniqueViolation`、`ForeignKeyViolation`、`SerializationFailure`…），并可通过 `lastError` 读取 SQLSTATE、消息、约束名等明细
@@ -217,6 +218,32 @@ pub const User = struct {
 };
 ```
 可用 hook：`beforeSave`、`beforeCreate`、`afterCreate`、`beforeUpdate`、`afterUpdate`、`beforeDelete`、`afterDelete`、`afterFind`（在模型上声明即可，可选实现；返回 `z.Error!void`，可用 `error.HookAborted` 中止操作）。
+
+### 日志
+
+zorm 自带默认的 stderr 日志（类 GORM）：失败的查询以 error 级别记录，超过慢查询阈值的以 warn 记录，全部查询可在 info 级别 trace。默认级别 `warn`、慢查询阈值 200ms，常规使用保持安静。
+
+```zig
+// trace 每条查询：
+db.setLogger(.{ .level = .info });
+
+// 静默：
+db.setLogger(z.Logger.discard);
+
+// 自定义宿主（对接你自己的日志框架）：
+const MyLogger = struct {
+    fn log(ctx: ?*anyopaque, level: z.LogLevel, msg: []const u8) void {
+        // `msg` 包含耗时、行数、内联参数后的 SQL
+        my_log_framework.write(level, msg);
+    }
+};
+db.setLogger(.{ .level = .info, .logFn = MyLogger.log, .context = null });
+
+// 调整慢查询阈值：
+db.setLogger(.{ .level = .warn, .slow_threshold_ms = 500 });
+```
+
+日志行会把参数值内联进 SQL（自动处理 NULL 与引号转义），可直接复制到 `psql` 执行。
 
 ### 软删除
 
