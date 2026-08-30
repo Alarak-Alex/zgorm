@@ -227,7 +227,7 @@ Available hooks: `beforeSave`, `beforeCreate`, `afterCreate`, `beforeUpdate`, `a
 zorm ships with a default stderr logger (GORM-style): failed queries log at
 error level, queries slower than the threshold at warn, and everything traces
 at info. Default level is `warn` with a 200ms slow-query threshold, so normal
-usage stays quiet.
+usage stays quiet. Its level tags use ANSI colors; custom sinks receive plain messages.
 
 ```zig
 // Trace every query:

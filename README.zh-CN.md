@@ -221,7 +221,7 @@ pub const User = struct {
 
 ### 日志
 
-zorm 自带默认的 stderr 日志（类 GORM）：失败的查询以 error 级别记录，超过慢查询阈值的以 warn 记录，全部查询可在 info 级别 trace。默认级别 `warn`、慢查询阈值 200ms，常规使用保持安静。
+zorm 自带默认的 stderr 日志（类 GORM）：失败的查询以 error 级别记录，超过慢查询阈值的以 warn 记录，全部查询可在 info 级别 trace。默认级别 `warn`、慢查询阈值 200ms，常规使用保持安静。默认输出的级别标签带 ANSI 颜色；自定义日志宿主收到的消息不含颜色码。
 
 ```zig
 // trace 每条查询：

@@ -18,6 +18,20 @@ pub const LogLevel = enum(u8) {
     info = 3,
 };
 
+const LevelStyle = struct {
+    color: []const u8,
+    tag: []const u8,
+};
+
+fn levelStyle(level: LogLevel) LevelStyle {
+    return switch (level) {
+        .silent => .{ .color = "", .tag = "SILENT" },
+        .err => .{ .color = "\x1b[31;1m", .tag = "ERROR" },
+        .warn => .{ .color = "\x1b[33;1m", .tag = "WARN " },
+        .info => .{ .color = "\x1b[32m", .tag = "INFO " },
+    };
+}
+
 /// A replaceable logger. Wrap your own sink in `logFn` (and optionally pass
 /// a context pointer through). The default implementation writes to stderr.
 pub const Logger = struct {
@@ -57,13 +71,9 @@ pub const Logger = struct {
 
     fn defaultLog(ctx: ?*anyopaque, level: LogLevel, msg: []const u8) void {
         _ = ctx;
-        const tag = switch (level) {
-            .silent => "SILENT",
-            .err => "ERROR",
-            .warn => "WARN ",
-            .info => "INFO ",
-        };
-        std.debug.print("[zorm] [{s}] {s}\n", .{ tag, msg });
+        const style = levelStyle(level);
+        const reset = if (style.color.len == 0) "" else "\x1b[0m";
+        std.debug.print("[zorm] [{s}{s}{s}] {s}\n", .{ style.color, style.tag, reset, msg });
     }
 };
 
@@ -191,6 +201,13 @@ fn inlineSqlParams(w: *std.Io.Writer, sql: []const u8, params: []const pq.Param)
             else => try w.writeByte(ch),
         }
     }
+}
+
+test "default logger uses GORM-style level colors" {
+    try std.testing.expectEqualStrings("\x1b[31;1m", levelStyle(.err).color);
+    try std.testing.expectEqualStrings("\x1b[33;1m", levelStyle(.warn).color);
+    try std.testing.expectEqualStrings("\x1b[32m", levelStyle(.info).color);
+    try std.testing.expectEqualStrings("", levelStyle(.silent).color);
 }
 
 test "formatQuery inlines params and reports timing" {
