@@ -413,6 +413,10 @@ Integration coverage includes CRUD and batches, transactions/savepoints/retries,
 - [x] MySQL/SQLite direct drivers and typed CRUD ORM
 - [x] Production execution, routing, plugins, codecs, advanced migrations, and explicit transaction retries
 
+## Acknowledgements
+
+zorm is inspired by [GORM](https://github.com/go-gorm/gorm), especially its approachable model conventions, chainable query API, hooks, associations, preloading, soft deletes, and migration ergonomics. Thanks to the GORM maintainers and contributors for building and evolving an excellent ORM for the Go ecosystem.
+
 ## License
 
 MIT

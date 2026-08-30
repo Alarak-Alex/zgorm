@@ -198,6 +198,45 @@ fn containsName(comptime names: []const []const u8, comptime needle: []const u8)
     return false;
 }
 
+fn FindPredicates(comptime T: type, comptime index: usize) type {
+    const table = schema.tableOf(T);
+    if (index == table.pk_indexes.len) return struct {
+        pub const value = [0]u8{};
+    };
+    const column = table.columns[table.pk_indexes[index]];
+    const separator = if (index == 0) "" else " AND ";
+    return struct {
+        pub const value = separator ++
+            qb_mod.QuotedIdent(column.name).value ++
+            " = $" ++
+            std.fmt.comptimePrint("{d}", .{index + 1}) ++
+            FindPredicates(T, index + 1).value;
+    };
+}
+
+fn FindSoftDelete(comptime T: type, comptime unscoped: bool) type {
+    const table = schema.tableOf(T);
+    if (!table.softDeletable() or unscoped) return struct {
+        pub const value = [0]u8{};
+    };
+    const column = table.columns[table.deleted_at_index.?];
+    return struct {
+        pub const value = " AND " ++ qb_mod.QuotedIdent(column.name).value ++ " IS NULL";
+    };
+}
+
+fn FindSql(comptime T: type, comptime unscoped: bool) type {
+    const table = schema.tableOf(T);
+    return struct {
+        pub const value = "SELECT * FROM " ++
+            qb_mod.QuotedIdent(table.name).value ++
+            " WHERE " ++
+            FindPredicates(T, 0).value ++
+            FindSoftDelete(T, unscoped).value ++
+            " LIMIT 1";
+    };
+}
+
 /// One unit of work against the database. Db hands out sessions; a session
 /// inside a transaction pins a single connection.
 pub const Session = struct {
@@ -242,12 +281,53 @@ pub const Session = struct {
         const remaining = std.Io.Clock.awake.now(s.io).durationTo(s.transaction_deadline.?).nanoseconds;
         return if (remaining <= 0) error.TransactionTimeout else err;
     }
+    fn instrumentationEnabled(s: *const Session) bool {
+        return s.logger.level != .silent or
+            s.observer.on_query != null or
+            s.observer.on_span != null or
+            s.observer.metrics != null or
+            s.observer.slow_queries != null or
+            s.plugins.len != 0;
+    }
+
+    fn runExecFast(s: *Session, sql: []const u8, params: []const pq.Param, timeout_ms: u64) Error!pq.Result {
+        const conn = try s.acquire();
+        const effective = s.transactionTimeout(timeout_ms) catch |err| {
+            s.releaseConn(conn);
+            return err;
+        };
+        const res = conn.execParamsTimeout(sql, params, effective) catch |err| {
+            s.captureError(conn);
+            const mapped = s.mapDeadlineError(err);
+            s.releaseConn(conn);
+            return mapped;
+        };
+        s.releaseConn(conn);
+        return res;
+    }
+
+    fn execRawFast(s: *Session, sql: []const u8, timeout_ms: u64) Error!pq.Result {
+        const conn = try s.acquire();
+        const effective = s.transactionTimeout(timeout_ms) catch |err| {
+            s.releaseConn(conn);
+            return err;
+        };
+        const res = conn.execSimpleTimeout(sql, effective) catch |err| {
+            s.captureError(conn);
+            const mapped = s.mapDeadlineError(err);
+            s.releaseConn(conn);
+            return mapped;
+        };
+        s.releaseConn(conn);
+        return res;
+    }
 
     pub fn runExec(s: *Session, sql: []const u8, params: []const pq.Param) Error!pq.Result {
         return s.runExecTimeout(sql, params, 0);
     }
 
     pub fn runExecTimeout(s: *Session, sql: []const u8, params: []const pq.Param, timeout_ms: u64) Error!pq.Result {
+        if (!s.instrumentationEnabled()) return s.runExecFast(sql, params, timeout_ms);
         if (!s.plugins.runBeforeQuery(sql) or !s.plugins.runBeforeCrud(sql)) return error.HookAborted;
         const started = std.Io.Clock.awake.now(s.io);
         const conn = s.acquire() catch |err| {
@@ -278,6 +358,70 @@ pub const Session = struct {
         s.releaseConn(conn);
         s.reportQuery(sql, params, started, wait_ns, res.affected, res.rows.len, null, "");
         return res;
+    }
+    /// Executes a typed query and decodes rows into models. With logging,
+    /// observers, plugins, or deadlines enabled it retains the fully
+    /// instrumented result path; otherwise cells are decoded directly from
+    /// the PostgreSQL cursor.
+    pub fn runModels(
+        s: *Session,
+        comptime T: type,
+        sql: []const u8,
+        params: []const pq.Param,
+        timeout_ms: u64,
+        out_gpa: std.mem.Allocator,
+    ) Error![]T {
+        const table = comptime schema.tableOf(T);
+        if (s.instrumentationEnabled() or timeout_ms != 0 or s.transaction_deadline != null) {
+            var res = try s.runExecTimeout(sql, params, timeout_ms);
+            defer res.deinit();
+            const models = out_gpa.alloc(T, res.rows.len) catch return error.OutOfMemory;
+            var decoded: usize = 0;
+            errdefer {
+                for (models[0..decoded]) |model| value.freeValue(T, model, out_gpa);
+                out_gpa.free(models);
+            }
+            for (res.rows, 0..) |row, i| {
+                models[i] = try value.scanRow(T, table, &res, row, out_gpa);
+                decoded = i + 1;
+            }
+            for (models) |*model| try callHook(T, "afterFind", model, s);
+            return models;
+        }
+
+        const conn = try s.acquire();
+        const rows = conn.queryParamsBinary(sql, params) catch |err| {
+            s.captureError(conn);
+            s.releaseConn(conn);
+            return err;
+        };
+        var cursor_open = true;
+        defer if (cursor_open) {
+            rows.deinit();
+            s.releaseConn(conn);
+        };
+
+        var models: std.ArrayList(T) = .empty;
+        errdefer {
+            for (models.items) |model| value.freeValue(T, model, out_gpa);
+            models.deinit(out_gpa);
+        }
+        while (rows.next() catch |err| {
+            s.captureError(conn);
+            return err;
+        }) |row| {
+            const model = try value.scanCells(T, table, rows.columns, row, out_gpa);
+            models.append(out_gpa, model) catch {
+                value.freeValue(T, model, out_gpa);
+                return error.OutOfMemory;
+            };
+        }
+        rows.deinit();
+        s.releaseConn(conn);
+        cursor_open = false;
+
+        for (models.items) |*model| try callHook(T, "afterFind", model, s);
+        return models.toOwnedSlice(out_gpa) catch return error.OutOfMemory;
     }
 
     /// Copies the connection's server error into pool-owned storage.
@@ -311,6 +455,7 @@ pub const Session = struct {
     }
 
     pub fn execRawTimeout(s: *Session, sql: []const u8, timeout_ms: u64) Error!pq.Result {
+        if (!s.instrumentationEnabled()) return s.execRawFast(sql, timeout_ms);
         if (!s.plugins.runBeforeQuery(sql) or !s.plugins.runBeforeCrud(sql)) return error.HookAborted;
         const started = std.Io.Clock.awake.now(s.io);
         const conn = s.acquire() catch |err| {
@@ -357,8 +502,6 @@ pub const Session = struct {
         sqlstate: []const u8,
     ) void {
         const elapsed_ns: u128 = @intCast(started.durationTo(std.Io.Clock.awake.now(s.io)).nanoseconds);
-        var buf: [4096]u8 = undefined;
-        const msg = logger_mod.formatQuery(&s.logger, &buf, sql, params, elapsed_ns, affected_rows, err);
         const level: logger_mod.LogLevel = if (err != null)
             .err
         else if (s.logger.slow_threshold_ms > 0 and
@@ -366,7 +509,11 @@ pub const Session = struct {
             .warn
         else
             .info;
-        s.logger.log(level, msg);
+        if (s.logger.enabled(level)) {
+            var buf: [4096]u8 = undefined;
+            const msg = logger_mod.formatQuery(&s.logger, &buf, sql, params, elapsed_ns, affected_rows, err);
+            s.logger.log(level, msg);
+        }
         const pool = s.pool.stats();
         const event = observability.QueryEvent{
             .sql = sql,
@@ -1178,26 +1325,12 @@ pub const Session = struct {
         const params = try value.argsToParams(pk, arena);
         if (params.len != table.pk_indexes.len) return error.InvalidQuery;
 
-        var b = SqlBuf.init(arena);
-        b.w().print("SELECT * FROM {s} WHERE ", .{
-            try qb_mod.quoteIdent(arena, table.name),
-        }) catch return error.OutOfMemory;
-        inline for (table.pk_indexes, 0..) |pk_index, i| {
-            if (i > 0) b.w().writeAll(" AND ") catch return error.OutOfMemory;
-            b.w().print("{s} = ${d}", .{ try qb_mod.quoteIdent(arena, table.columns[pk_index].name), i + 1 }) catch return error.OutOfMemory;
-        }
-        if (comptime table.softDeletable() and !unscoped) {
-            const del_col = table.columns[table.deleted_at_index.?];
-            b.w().print(" AND {s} IS NULL", .{try qb_mod.quoteIdent(arena, del_col.name)}) catch return error.OutOfMemory;
-        }
-        b.w().writeAll(" LIMIT 1") catch return error.OutOfMemory;
+        const sql = FindSql(T, unscoped).value[0..];
 
-        var res = try s.runExec(b.slice(), params);
-        defer res.deinit();
-        if (res.rows.len == 0) return null;
-        var out = try value.scanRow(T, table, &res, res.rows[0], s.gpa);
-        try callHook(T, "afterFind", &out, s);
-        return out;
+        const models = try s.runModels(T, sql, params, 0, s.gpa);
+        defer s.gpa.free(models);
+        if (models.len == 0) return null;
+        return models[0];
     }
     pub fn association(s: *Session, parent: anytype, comptime field_name: []const u8) Association(@typeInfo(@TypeOf(parent)).pointer.child, field_name) {
         const M = @typeInfo(@TypeOf(parent)).pointer.child;

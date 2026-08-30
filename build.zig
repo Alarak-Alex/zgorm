@@ -103,4 +103,7 @@ pub fn build(b: *std.Build) void {
     if (dsn_opt) |dsn| run_benchmark.setEnvironmentVariable("ZORM_DSN", dsn);
     const benchmark_step = b.step("benchmark", "Run the zorm PostgreSQL benchmark suite");
     benchmark_step.dependOn(&run_benchmark.step);
+    const install_benchmark = b.addInstallArtifact(benchmark, .{});
+    const benchmark_build_step = b.step("benchmark-build", "Build the zorm benchmark executable");
+    benchmark_build_step.dependOn(&install_benchmark.step);
 }

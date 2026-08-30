@@ -1064,15 +1064,31 @@ pub fn scanRow(
     row: pq.Result.Row,
     gpa: std.mem.Allocator,
 ) DecodeError!T {
+    return scanCells(T, table, res.columns, row, gpa);
+}
+
+/// Decodes a cursor row directly, without first materializing a `pq.Result`.
+pub fn scanCells(
+    comptime T: type,
+    comptime table: schema.Table,
+    columns: []const pq.Result.Column,
+    row: pq.Result.Row,
+    gpa: std.mem.Allocator,
+) DecodeError!T {
     var out = std.mem.zeroInit(T, .{});
     errdefer value_freePartiallyBuilt(T, &out, gpa);
     inline for (table.columns) |col| {
-        if (res.colIndex(col.name)) |ci| {
+        var column_index: ?usize = null;
+        for (columns, 0..) |result_column, i| {
+            if (std.mem.eql(u8, result_column.name, col.name)) {
+                column_index = i;
+                break;
+            }
+        }
+        if (column_index) |ci| {
             const V = columnFieldType(T, col);
-            setColumn(&out, col, try decodeCell(V, row[ci], res.columns[ci].type_oid, res.columns[ci].format, gpa));
+            setColumn(&out, col, try decodeCell(V, row[ci], columns[ci].type_oid, columns[ci].format, gpa));
         } else {
-            // Column not selected: fall back to the field default (embedded
-            // models resolve their leaf field defaults too).
             const d = columnDefault(T, col);
             if (d) |dv| setColumn(&out, col, dv);
         }

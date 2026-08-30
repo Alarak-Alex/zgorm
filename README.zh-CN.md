@@ -402,6 +402,10 @@ zig build -Doptimize=ReleaseFast              # 发布构建
 - [x] MySQL/SQLite 直接驱动与类型化 CRUD ORM
 - [x] 生产级执行控制、路由、插件、Codec、高级迁移与显式事务重试
 
+## 致谢
+
+zorm 受到 [GORM](https://github.com/go-gorm/gorm) 的启发，尤其借鉴了其易用的模型约定、链式查询 API、Hook、关联、预加载、软删除与迁移体验。感谢 GORM 的维护者和贡献者为 Go 生态打造并持续演进这一优秀 ORM。
+
 ## License
 
 MIT

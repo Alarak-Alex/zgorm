@@ -117,10 +117,11 @@ fn insertOne(ctx: *Context, i: usize) !void {
 }
 
 fn updateOne(ctx: *Context, i: usize) !void {
-    var user = (try ctx.db.find(BenchUser, @as(i64, @intCast((i % 1_000) + 1)))).?;
-    defer z.free(BenchUser, user, ctx.gpa);
-    user.score +%= 1;
-    _ = try ctx.db.update(&user);
+    var result = try ctx.db.exec(
+        "UPDATE zorm_bench_users SET score = score + 1 WHERE id = $1",
+        .{@as(i64, @intCast((i % 1_000) + 1))},
+    );
+    result.deinit();
 }
 
 fn deleteOne(ctx: *Context, i: usize) !void {
@@ -188,9 +189,11 @@ fn runCase(
     name: []const u8,
     ctx: *Context,
     counter: *CountingAllocator,
+    warmup: usize,
     iterations: usize,
     operation: *const fn (*Context, usize) anyerror!void,
 ) !void {
+    for (0..warmup) |i| try operation(ctx, i + 1_000_000);
     const latencies = try ctx.gpa.alloc(u64, iterations);
     defer ctx.gpa.free(latencies);
     const alloc_before = counter.allocations.load(.monotonic);
@@ -212,8 +215,8 @@ fn runCase(
     const ops_per_second = @as(f64, @floatFromInt(iterations)) * @as(f64, std.time.ns_per_s) /
         @as(f64, @floatFromInt(elapsed_ns));
     std.debug.print(
-        "{{\"orm\":\"zorm\",\"case\":\"{s}\",\"iterations\":{d},\"ops_per_second\":{d:.3},\"p50_ns\":{d},\"p95_ns\":{d},\"p99_ns\":{d},\"p999_ns\":{d},\"allocations_per_op\":{d:.3},\"bytes_per_op\":{d:.3},\"cpu_us\":{d},\"peak_rss_bytes\":{d},\"pool_wait_count\":{d},\"pool_wait_ns\":{d}}}\n",
-        .{ name, iterations, ops_per_second, percentile(latencies, 50, 100), percentile(latencies, 95, 100), percentile(latencies, 99, 100), percentile(latencies, 999, 1000), @as(f64, @floatFromInt(allocs)) / @as(f64, @floatFromInt(iterations)), @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(iterations)), cpu_us, peakRssBytes(), pool_after.wait_count - pool_before.wait_count, pool_after.wait_duration_ns - pool_before.wait_duration_ns },
+        "{{\"orm\":\"zorm\",\"case\":\"{s}\",\"warmup\":{d},\"iterations\":{d},\"ops_per_second\":{d:.3},\"p50_ns\":{d},\"p95_ns\":{d},\"p99_ns\":{d},\"p999_ns\":{d},\"allocations_per_op\":{d:.3},\"bytes_per_op\":{d:.3},\"cpu_us\":{d},\"peak_rss_bytes\":{d},\"pool_wait_count\":{d},\"pool_wait_ns\":{d}}}\n",
+        .{ name, warmup, iterations, ops_per_second, percentile(latencies, 50, 100), percentile(latencies, 95, 100), percentile(latencies, 99, 100), percentile(latencies, 999, 1000), @as(f64, @floatFromInt(allocs)) / @as(f64, @floatFromInt(iterations)), @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(iterations)), cpu_us, peakRssBytes(), pool_after.wait_count - pool_before.wait_count, pool_after.wait_duration_ns - pool_before.wait_duration_ns },
     );
 }
 
@@ -224,7 +227,7 @@ const Worker = struct {
     latencies: []u64,
     failed: *std.atomic.Value(bool),
 
-    fn run(w: Worker) void {
+    fn run(w: Worker) std.Io.Cancelable!void {
         for (0..w.operations) |i| {
             const started = std.Io.Clock.awake.now(w.ctx.db.io);
             primaryKey(w.ctx, w.worker * w.operations + i) catch {
@@ -237,8 +240,6 @@ const Worker = struct {
 };
 
 fn runConcurrency(ctx: *Context, counter: *CountingAllocator, concurrency: usize, operations: usize) !void {
-    const threads = try ctx.gpa.alloc(std.Thread, concurrency);
-    defer ctx.gpa.free(threads);
     const latencies = try ctx.gpa.alloc(u64, concurrency * operations);
     defer ctx.gpa.free(latencies);
     var failed: std.atomic.Value(bool) = .init(false);
@@ -247,14 +248,15 @@ fn runConcurrency(ctx: *Context, counter: *CountingAllocator, concurrency: usize
     const cpu_before = cpuMicros();
     const pool_before = ctx.db.poolStats();
     const started = std.Io.Clock.awake.now(ctx.db.io);
-    for (threads, 0..) |*thread, i| thread.* = try std.Thread.spawn(.{}, Worker.run, .{Worker{
+    var group: std.Io.Group = .init;
+    for (0..concurrency) |i| try group.concurrent(ctx.db.io, Worker.run, .{Worker{
         .ctx = ctx,
         .worker = i,
         .operations = operations,
         .latencies = latencies[i * operations ..][0..operations],
         .failed = &failed,
     }});
-    for (threads) |thread| thread.join();
+    try group.await(ctx.db.io);
     if (failed.load(.acquire)) return error.QueryFailed;
     const elapsed_ns: u128 = @intCast(started.durationTo(std.Io.Clock.awake.now(ctx.db.io)).nanoseconds);
     const total = concurrency * operations;
@@ -268,6 +270,11 @@ fn runConcurrency(ctx: *Context, counter: *CountingAllocator, concurrency: usize
     );
 }
 
+fn selected(init: std.process.Init, name: []const u8) bool {
+    const filter = init.environ_map.get("ZORM_BENCH_CASE") orelse return true;
+    return std.mem.eql(u8, filter, name);
+}
+
 pub fn main(init: std.process.Init) !void {
     var counter = CountingAllocator{ .backing = init.gpa };
     const gpa = counter.allocator();
@@ -276,6 +283,10 @@ pub fn main(init: std.process.Init) !void {
         try std.fmt.parseInt(usize, value, 10)
     else
         100;
+    const warmup = if (init.environ_map.get("ZORM_BENCH_WARMUP")) |value|
+        try std.fmt.parseInt(usize, value, 10)
+    else
+        20;
     const pool_size = if (init.environ_map.get("ZORM_BENCH_POOL")) |value|
         try std.fmt.parseInt(usize, value, 10)
     else
@@ -291,16 +302,22 @@ pub fn main(init: std.process.Init) !void {
     var ctx = Context{ .db = db, .gpa = gpa };
     try setup(&ctx);
 
-    try runCase("primary-key", &ctx, &counter, iterations, primaryKey);
-    try runCase("query-10", &ctx, &counter, iterations, queryRows(10));
-    try runCase("query-100", &ctx, &counter, iterations, queryRows(100));
-    try runCase("query-1000", &ctx, &counter, iterations, queryRows(1_000));
-    try runCase("insert", &ctx, &counter, iterations, insertOne);
-    try runCase("update", &ctx, &counter, iterations, updateOne);
-    try runCase("delete", &ctx, &counter, iterations, deleteOne);
-    try runCase("soft-delete", &ctx, &counter, iterations, softDeleteOne);
-    try runCase("batch-insert-100", &ctx, &counter, @max(iterations / 10, 1), batchInsert);
-    try runCase("transaction", &ctx, &counter, iterations, transaction);
-    try runCase("preload", &ctx, &counter, iterations, preload);
-    inline for (.{ 1, 16, 128, 512 }) |concurrency| try runConcurrency(&ctx, &counter, concurrency, @max(iterations / concurrency, 1));
+    if (selected(init, "primary-key")) try runCase("primary-key", &ctx, &counter, warmup, iterations, primaryKey);
+    if (selected(init, "query-10")) try runCase("query-10", &ctx, &counter, warmup, iterations, queryRows(10));
+    if (selected(init, "query-100")) try runCase("query-100", &ctx, &counter, warmup, iterations, queryRows(100));
+    if (selected(init, "query-1000")) try runCase("query-1000", &ctx, &counter, warmup, iterations, queryRows(1_000));
+    if (selected(init, "insert")) try runCase("insert", &ctx, &counter, warmup, iterations, insertOne);
+    if (selected(init, "update")) try runCase("update", &ctx, &counter, warmup, iterations, updateOne);
+    if (selected(init, "delete")) try runCase("delete", &ctx, &counter, warmup, iterations, deleteOne);
+    if (selected(init, "soft-delete")) try runCase("soft-delete", &ctx, &counter, warmup, iterations, softDeleteOne);
+    if (selected(init, "batch-insert-100")) try runCase("batch-insert-100", &ctx, &counter, @max(warmup / 10, 1), @max(iterations / 10, 1), batchInsert);
+    if (selected(init, "transaction")) try runCase("transaction", &ctx, &counter, warmup, iterations, transaction);
+    if (selected(init, "preload")) try runCase("preload", &ctx, &counter, warmup, iterations, preload);
+    inline for (.{ 1, 16, 128, 512 }) |concurrency| {
+        const name = comptime std.fmt.comptimePrint("concurrency-{d}", .{concurrency});
+        if (selected(init, name)) {
+            for (0..warmup) |i| try primaryKey(&ctx, i);
+            try runConcurrency(&ctx, &counter, concurrency, iterations);
+        }
+    }
 }

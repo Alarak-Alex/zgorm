@@ -8,6 +8,8 @@ pub const Error = pq.Error;
 
 pub const Options = struct {
     max_connections: usize = 4,
+    /// Bounds simultaneous PostgreSQL handshakes during burst growth.
+    max_connecting: usize = 8,
     min_idle_connections: usize = 0,
     max_idle_connections: ?usize = null,
     max_connection_lifetime_ms: u64 = 0,
@@ -33,6 +35,15 @@ pub const PoolStats = struct {
         return if (total == 0) 0 else @as(f64, @floatFromInt(s.prepared_hits)) / @as(f64, @floatFromInt(total));
     }
 };
+const Waiter = struct {
+    next: ?*Waiter = null,
+    event: std.Io.Event = .unset,
+    conn: ?*pq.Conn = null,
+    retry: bool = false,
+    closed: bool = false,
+    started: std.Io.Timestamp = undefined,
+    queued: bool = false,
+};
 
 pub const Pool = struct {
     gpa: std.mem.Allocator,
@@ -42,9 +53,11 @@ pub const Pool = struct {
     max_size: usize,
 
     mutex: std.Io.Mutex = .init,
-    cond: std.Io.Condition = .init,
+    wait_head: ?*Waiter = null,
+    wait_tail: ?*Waiter = null,
     free: std.ArrayList(*pq.Conn) = .empty,
     total: usize = 0,
+    connecting: usize = 0,
     closed: bool = false,
     wait_count: u64 = 0,
     wait_duration_ns: u128 = 0,
@@ -68,6 +81,7 @@ pub const Pool = struct {
     pub fn initWithOptions(gpa: std.mem.Allocator, io: std.Io, cfg: pq.Config, requested: Options) Pool {
         var options = requested;
         options.max_connections = @max(options.max_connections, 1);
+        options.max_connecting = @min(@max(options.max_connecting, 1), options.max_connections);
         const max_idle = @min(options.max_idle_connections orelse options.max_connections, options.max_connections);
         options.max_idle_connections = max_idle;
         options.min_idle_connections = @min(options.min_idle_connections, max_idle);
@@ -115,16 +129,76 @@ pub const Pool = struct {
                 return;
             }
             p.total += 1;
+            p.connecting += 1;
             p.mutex.unlock(p.io);
 
             const conn = pq.Conn.connect(p.gpa, p.io, p.cfg) catch |err| {
                 p.mutex.lockUncancelable(p.io);
                 p.total -= 1;
+                p.connecting -= 1;
+                p.wakeConnectorLocked();
                 p.mutex.unlock(p.io);
-                p.cond.signal(p.io);
                 return err;
             };
+            p.mutex.lockUncancelable(p.io);
+            p.connecting -= 1;
+            p.wakeConnectorLocked();
+            p.mutex.unlock(p.io);
             p.release(conn);
+        }
+    }
+
+    fn enqueueWaiterLocked(p: *Pool, waiter: *Waiter) void {
+        waiter.queued = true;
+        if (p.wait_tail) |tail| {
+            tail.next = waiter;
+        } else {
+            p.wait_head = waiter;
+        }
+        p.wait_tail = waiter;
+    }
+
+    fn popWaiterLocked(p: *Pool) ?*Waiter {
+        const waiter = p.wait_head orelse return null;
+        p.wait_head = waiter.next;
+        if (p.wait_head == null) p.wait_tail = null;
+        waiter.next = null;
+        waiter.queued = false;
+        return waiter;
+    }
+
+    fn removeWaiterLocked(p: *Pool, target: *Waiter) bool {
+        var previous: ?*Waiter = null;
+        var current = p.wait_head;
+        while (current) |waiter| {
+            if (waiter == target) {
+                if (previous) |prev| {
+                    prev.next = waiter.next;
+                } else {
+                    p.wait_head = waiter.next;
+                }
+                if (p.wait_tail == waiter) p.wait_tail = previous;
+                waiter.next = null;
+                waiter.queued = false;
+                return true;
+            }
+            previous = waiter;
+            current = waiter.next;
+        }
+        return false;
+    }
+
+    /// Gives the oldest waiter first chance to fill newly available capacity.
+    /// The event is set while holding the mutex so its stack node cannot time
+    /// out and disappear before the wakeup is published.
+    fn wakeRetryLocked(p: *Pool) void {
+        const waiter = p.popWaiterLocked() orelse return;
+        waiter.retry = true;
+        waiter.event.set(p.io);
+    }
+    fn wakeConnectorLocked(p: *Pool) void {
+        if (p.total < p.max_size and p.connecting < p.options.max_connecting) {
+            p.wakeRetryLocked();
         }
     }
 
@@ -133,9 +207,13 @@ pub const Pool = struct {
         return if (ns <= 0) 0 else @intCast(ns);
     }
 
+    fn recordWaitLocked(p: *Pool, started: std.Io.Timestamp) void {
+        p.wait_duration_ns +|= elapsedNs(started, p.io);
+    }
+
     fn recordWait(p: *Pool, started: std.Io.Timestamp) void {
         p.mutex.lockUncancelable(p.io);
-        p.wait_duration_ns +|= elapsedNs(started, p.io);
+        p.recordWaitLocked(started);
         p.mutex.unlock(p.io);
     }
 
@@ -157,9 +235,9 @@ pub const Pool = struct {
         p.mutex.lockUncancelable(p.io);
         p.total -= 1;
         p.absorbPrepared(c);
+        p.wakeConnectorLocked();
         p.mutex.unlock(p.io);
         c.close();
-        p.cond.signal(p.io);
     }
 
     fn pruneExpired(p: *Pool) void {
@@ -171,13 +249,13 @@ pub const Pool = struct {
                     expired = p.free.orderedRemove(i);
                     p.total -= 1;
                     p.absorbPrepared(c);
+                    p.wakeConnectorLocked();
                     break;
                 }
             }
             p.mutex.unlock(p.io);
             const c = expired orelse return;
             c.close();
-            p.cond.signal(p.io);
         }
     }
 
@@ -187,6 +265,8 @@ pub const Pool = struct {
     pub fn acquire(p: *Pool) Error!*pq.Conn {
         const started = std.Io.Clock.awake.now(p.io);
         var waited = false;
+        var priority = false;
+        var waiter: Waiter = .{};
         while (true) {
             p.mutex.lockUncancelable(p.io);
             if (p.closed) {
@@ -194,65 +274,108 @@ pub const Pool = struct {
                 if (waited) p.recordWait(started);
                 return error.ConnectionClosed;
             }
-            if (p.free.items.len > 0) {
-                const c = p.free.pop().?;
-                if (p.isExpired(c) or !c.healthy()) {
-                    p.total -= 1;
-                    p.absorbPrepared(c);
-                    p.mutex.unlock(p.io);
-                    c.close();
-                    p.cond.signal(p.io);
-                    continue;
-                }
-                p.mutex.unlock(p.io);
-                if (p.options.health_check_interval_ms > 0 and
-                    c.idleMilliseconds() >= p.options.health_check_interval_ms)
-                {
-                    c.ping() catch {
-                        p.retire(c);
+
+            // Once a queue exists, new callers join it instead of taking a
+            // just-returned connection ahead of an older waiter.
+            if (priority or p.wait_head == null) {
+                if (p.free.items.len > 0) {
+                    const c = p.free.pop().?;
+                    if (p.isExpired(c) or !c.healthy()) {
+                        p.total -= 1;
+                        p.absorbPrepared(c);
+                        p.wakeConnectorLocked();
+                        p.mutex.unlock(p.io);
+                        c.close();
+                        priority = false;
                         continue;
-                    };
-                }
-                c.touch();
-                if (waited) p.recordWait(started);
-                return c;
-            }
-            if (p.total < p.max_size) {
-                p.total += 1;
-                p.mutex.unlock(p.io);
-                const c = pq.Conn.connect(p.gpa, p.io, p.cfg) catch |err| {
-                    p.mutex.lockUncancelable(p.io);
-                    p.total -= 1;
+                    }
                     p.mutex.unlock(p.io);
-                    p.cond.signal(p.io);
+                    if (p.options.health_check_interval_ms > 0 and
+                        c.idleMilliseconds() >= p.options.health_check_interval_ms)
+                    {
+                        c.ping() catch {
+                            p.retire(c);
+                            priority = false;
+                            continue;
+                        };
+                    }
+                    c.touch();
                     if (waited) p.recordWait(started);
-                    return err;
-                };
-                if (waited) p.recordWait(started);
-                return c;
+                    return c;
+                }
+                if (p.total < p.max_size and p.connecting < p.options.max_connecting) {
+                    p.total += 1;
+                    p.connecting += 1;
+                    p.mutex.unlock(p.io);
+                    const c = pq.Conn.connect(p.gpa, p.io, p.cfg) catch |err| {
+                        p.mutex.lockUncancelable(p.io);
+                        p.total -= 1;
+                        p.connecting -= 1;
+                        p.wakeConnectorLocked();
+                        if (waited) p.recordWaitLocked(started);
+                        p.mutex.unlock(p.io);
+                        return err;
+                    };
+                    p.mutex.lockUncancelable(p.io);
+                    p.connecting -= 1;
+                    p.wakeConnectorLocked();
+                    if (waited) p.recordWaitLocked(started);
+                    p.mutex.unlock(p.io);
+                    return c;
+                }
             }
+
             if (!waited) {
                 waited = true;
                 p.wait_count +|= 1;
             }
-            const timeout_ms = p.options.acquire_timeout_ms;
-            if (timeout_ms == 0) {
-                p.cond.waitUncancelable(p.io, &p.mutex);
-                p.mutex.unlock(p.io);
-                continue;
-            }
+            priority = false;
+            waiter = .{ .started = started };
+            p.enqueueWaiterLocked(&waiter);
             p.mutex.unlock(p.io);
 
-            const elapsed_ms = elapsedNs(started, p.io) / std.time.ns_per_ms;
-            if (elapsed_ms >= timeout_ms) {
-                p.recordWait(started);
-                return error.AcquireTimeout;
+            const timeout_ms = p.options.acquire_timeout_ms;
+            if (timeout_ms == 0) {
+                waiter.event.waitUncancelable(p.io);
+            } else {
+                while (!waiter.event.isSet()) {
+                    const elapsed_ms = elapsedNs(started, p.io) / std.time.ns_per_ms;
+                    if (elapsed_ms >= timeout_ms) {
+                        p.mutex.lockUncancelable(p.io);
+                        if (waiter.queued) {
+                            _ = p.removeWaiterLocked(&waiter);
+                            p.recordWaitLocked(started);
+                            p.mutex.unlock(p.io);
+                            return error.AcquireTimeout;
+                        }
+                        p.mutex.unlock(p.io);
+                        break;
+                    }
+                    const remaining: u64 = @intCast(timeout_ms - elapsed_ms);
+                    waiter.event.waitTimeout(p.io, .{ .duration = .{
+                        .raw = .fromMilliseconds(@intCast(remaining)),
+                        .clock = .awake,
+                    } }) catch |err| switch (err) {
+                        error.Timeout => continue,
+                        error.Canceled => {
+                            p.mutex.lockUncancelable(p.io);
+                            const removed = if (waiter.queued) p.removeWaiterLocked(&waiter) else false;
+                            if (removed) p.recordWaitLocked(started);
+                            p.mutex.unlock(p.io);
+                            if (removed) return error.AcquireTimeout;
+                            break;
+                        },
+                    };
+                }
             }
-            const remaining: u64 = @intCast(timeout_ms - elapsed_ms);
-            p.io.sleep(.fromMilliseconds(@intCast(@min(remaining, 2))), .awake) catch {
-                p.recordWait(started);
-                return error.AcquireTimeout;
-            };
+
+            if (waiter.conn) |c| return c;
+            if (waiter.closed) return error.ConnectionClosed;
+            if (waiter.retry) {
+                priority = true;
+                continue;
+            }
+            unreachable;
         }
     }
 
@@ -264,25 +387,33 @@ pub const Pool = struct {
         const max_idle = p.options.max_idle_connections.?;
         if (!p.closed and c.healthy() and
             (p.options.max_connection_lifetime_ms == 0 or
-                c.ageMilliseconds() < p.options.max_connection_lifetime_ms) and
-            p.free.items.len < max_idle)
+                c.ageMilliseconds() < p.options.max_connection_lifetime_ms))
         {
-            p.free.append(p.gpa, c) catch {
-                p.total -= 1;
-                p.absorbPrepared(c);
+            if (p.popWaiterLocked()) |waiter| {
+                p.recordWaitLocked(waiter.started);
+                waiter.conn = c;
+                waiter.event.set(p.io);
                 p.mutex.unlock(p.io);
-                c.close();
-                p.cond.signal(p.io);
                 return;
-            };
-            p.mutex.unlock(p.io);
-        } else {
-            p.total -= 1;
-            p.absorbPrepared(c);
-            p.mutex.unlock(p.io);
-            c.close();
+            }
+            if (p.free.items.len < max_idle) {
+                p.free.append(p.gpa, c) catch {
+                    p.total -= 1;
+                    p.absorbPrepared(c);
+                    p.wakeConnectorLocked();
+                    p.mutex.unlock(p.io);
+                    c.close();
+                    return;
+                };
+                p.mutex.unlock(p.io);
+                return;
+            }
         }
-        p.cond.signal(p.io);
+        p.total -= 1;
+        p.absorbPrepared(c);
+        p.wakeConnectorLocked();
+        p.mutex.unlock(p.io);
+        c.close();
     }
 
     pub fn ping(p: *Pool) Error!void {
@@ -368,6 +499,11 @@ pub const Pool = struct {
         }
         p.mutex.lockUncancelable(p.io);
         p.closed = true;
+        while (p.popWaiterLocked()) |waiter| {
+            p.recordWaitLocked(waiter.started);
+            waiter.closed = true;
+            waiter.event.set(p.io);
+        }
         while (p.free.pop()) |c| {
             p.total -= 1;
             p.absorbPrepared(c);
@@ -375,7 +511,6 @@ pub const Pool = struct {
         }
         p.mutex.unlock(p.io);
         p.free.deinit(p.gpa);
-        p.cond.broadcast(p.io);
     }
 };
 
@@ -386,9 +521,11 @@ test "pool options normalize idle bounds" {
         .max_connections = 2,
         .min_idle_connections = 9,
         .max_idle_connections = 7,
+        .max_connecting = 9,
     });
     try std.testing.expectEqual(@as(usize, 2), p.options.min_idle_connections);
     try std.testing.expectEqual(@as(usize, 2), p.options.max_idle_connections.?);
+    try std.testing.expectEqual(@as(usize, 2), p.options.max_connecting);
 }
 
 test "pool acquire failure releases reserved slot" {
@@ -402,4 +539,5 @@ test "pool acquire failure releases reserved slot" {
     defer p.deinit();
     try std.testing.expectError(error.ConnectionFailed, p.acquire());
     try std.testing.expectEqual(@as(usize, 0), p.stats().open);
+    try std.testing.expectEqual(@as(usize, 0), p.connecting);
 }

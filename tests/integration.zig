@@ -1417,6 +1417,117 @@ test "pool acquire and transaction deadlines return distinct errors" {
     try db.ping();
 }
 
+test "pool hands connections to waiters in FIFO order without barging" {
+    const dsn = test_options.dsn orelse return;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const cfg = try z.pq.parseDsn(arena_state.allocator(), dsn);
+    const db = try z.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
+        .max_connections = 1,
+        .min_idle_connections = 1,
+        .max_idle_connections = 1,
+        .cleanup_interval_ms = 0,
+    });
+    defer db.deinit();
+
+    const held = try db.pool.acquire();
+    const Pool = @TypeOf(db.pool);
+    const waiter_count = 8;
+    const Worker = struct {
+        pool: *Pool,
+        id: usize,
+        next: *std.atomic.Value(usize),
+        order: *[waiter_count]usize,
+        failed: *std.atomic.Value(bool),
+
+        fn run(worker: @This()) std.Io.Cancelable!void {
+            const conn = worker.pool.acquire() catch {
+                worker.failed.store(true, .release);
+                return;
+            };
+            const position = worker.next.fetchAdd(1, .monotonic);
+            worker.order[position] = worker.id;
+            worker.pool.release(conn);
+        }
+    };
+
+    var next: std.atomic.Value(usize) = .init(0);
+    var failed: std.atomic.Value(bool) = .init(false);
+    var order: [waiter_count]usize = undefined;
+    var group: std.Io.Group = .init;
+    for (0..waiter_count) |id| {
+        try group.concurrent(std.testing.io, Worker.run, .{Worker{
+            .pool = &db.pool,
+            .id = id,
+            .next = &next,
+            .order = &order,
+            .failed = &failed,
+        }});
+        while (db.poolStats().wait_count < id + 1) {
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+
+    db.pool.release(held);
+    const barger = try db.pool.acquire();
+    db.pool.release(barger);
+    try group.await(std.testing.io);
+    try std.testing.expect(!failed.load(.acquire));
+    for (order, 0..) |id, expected| try std.testing.expectEqual(expected, id);
+}
+
+test "pool bounds concurrent connection establishment" {
+    const dsn = test_options.dsn orelse return;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const cfg = try z.pq.parseDsn(arena_state.allocator(), dsn);
+    const db = try z.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
+        .max_connections = 32,
+        .max_connecting = 2,
+        .max_idle_connections = 32,
+        .cleanup_interval_ms = 0,
+    });
+    defer db.deinit();
+
+    const Pool = @TypeOf(db.pool);
+    const worker_count = 32;
+    const Worker = struct {
+        pool: *Pool,
+        done: *std.atomic.Value(usize),
+        failed: *std.atomic.Value(bool),
+
+        fn run(worker: @This()) std.Io.Cancelable!void {
+            const conn = worker.pool.acquire() catch {
+                worker.failed.store(true, .release);
+                _ = worker.done.fetchAdd(1, .release);
+                return;
+            };
+            worker.pool.release(conn);
+            _ = worker.done.fetchAdd(1, .release);
+        }
+    };
+
+    var done: std.atomic.Value(usize) = .init(0);
+    var failed: std.atomic.Value(bool) = .init(false);
+    var group: std.Io.Group = .init;
+    for (0..worker_count) |_| try group.concurrent(std.testing.io, Worker.run, .{Worker{
+        .pool = &db.pool,
+        .done = &done,
+        .failed = &failed,
+    }});
+
+    var peak_connecting: usize = 0;
+    while (done.load(.acquire) < worker_count) {
+        db.pool.mutex.lockUncancelable(std.testing.io);
+        peak_connecting = @max(peak_connecting, db.pool.connecting);
+        db.pool.mutex.unlock(std.testing.io);
+        try std.testing.io.sleep(.fromMicroseconds(100), .awake);
+    }
+    try group.await(std.testing.io);
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expect(peak_connecting <= 2);
+}
+
 test "pool prewarms minimum idle and enforces maximum idle" {
     const dsn = test_options.dsn orelse return;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1535,6 +1646,15 @@ test "streaming model rows support early close, CSV, and iterator errors" {
         model.* = .{ .name = try std.fmt.bufPrint(name_buf, "row-{d}", .{i}) };
     }
     try db.insertBatch(&models);
+    const before_find = db.poolStats();
+    const found_first = (try db.find(StreamRow, @as(i64, 1))).?;
+    try std.testing.expectEqualStrings("row-0", found_first.name);
+    z.free(StreamRow, found_first, std.testing.allocator);
+    const found_again = (try db.find(StreamRow, @as(i64, 1))).?;
+    z.free(StreamRow, found_again, std.testing.allocator);
+    const after_find = db.poolStats();
+    try std.testing.expectEqual(@as(u64, 1), after_find.prepared_misses - before_find.prepared_misses);
+    try std.testing.expectEqual(@as(u64, 1), after_find.prepared_hits - before_find.prepared_hits);
 
     var early = try z.query(StreamRow, db).order_by("id").stream(std.testing.allocator);
     const first = (try early.next()).?;

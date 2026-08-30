@@ -40,6 +40,7 @@ type result struct {
 	ORM              string  `json:"orm"`
 	Mode             string  `json:"mode"`
 	Case             string  `json:"case"`
+	Warmup           int     `json:"warmup"`
 	Iterations       int     `json:"iterations"`
 	OpsPerSecond     float64 `json:"ops_per_second"`
 	P50NS            int64   `json:"p50_ns"`
@@ -108,7 +109,12 @@ func percentile(values []int64, numerator, denominator int) int64 {
 	return values[index]
 }
 
-func runCase(mode, name string, db *gorm.DB, iterations int, operation func(int) error) error {
+func runCase(mode, name string, db *gorm.DB, warmup, iterations int, operation func(int) error) error {
+	for i := range warmup {
+		if err := operation(i + 1_000_000); err != nil {
+			return fmt.Errorf("%s warmup: %w", name, err)
+		}
+	}
 	latencies := make([]int64, iterations)
 	mallocsBefore, bytesBefore := memory()
 	cpuBefore, _ := resources()
@@ -131,7 +137,7 @@ func runCase(mode, name string, db *gorm.DB, iterations int, operation func(int)
 	mallocsAfter, bytesAfter := memory()
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	return json.NewEncoder(os.Stdout).Encode(result{
-		ORM: "gorm", Mode: mode, Case: name, Iterations: iterations,
+		ORM: "gorm", Mode: mode, Case: name, Warmup: warmup, Iterations: iterations,
 		OpsPerSecond: float64(iterations) / elapsed.Seconds(),
 		P50NS:        percentile(latencies, 50, 100), P95NS: percentile(latencies, 95, 100),
 		P99NS: percentile(latencies, 99, 100), P999NS: percentile(latencies, 999, 1000),
@@ -192,7 +198,7 @@ func runConcurrency(mode string, db *gorm.DB, concurrency, operations int) error
 	})
 }
 
-func run(mode, dsn string, iterations, poolSize int) error {
+func run(mode, dsn string, warmup, iterations, poolSize int) error {
 	config := &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)}
 	if mode == "tuned" {
 		config.SkipDefaultTransaction = true
@@ -213,31 +219,31 @@ func run(mode, dsn string, iterations, poolSize int) error {
 		return err
 	}
 
-	if err := runCase(mode, "primary-key", db, iterations, func(i int) error {
+	if err := runCase(mode, "primary-key", db, warmup, iterations, func(i int) error {
 		var user BenchUser
 		return db.First(&user, int64(i%1000+1)).Error
 	}); err != nil {
 		return err
 	}
 	for _, count := range []int{10, 100, 1000} {
-		if err := runCase(mode, fmt.Sprintf("query-%d", count), db, iterations, func(_ int) error {
+		if err := runCase(mode, fmt.Sprintf("query-%d", count), db, warmup, iterations, func(_ int) error {
 			var users []BenchUser
 			return db.Limit(count).Find(&users).Error
 		}); err != nil {
 			return err
 		}
 	}
-	if err := runCase(mode, "insert", db, iterations, func(i int) error {
+	if err := runCase(mode, "insert", db, warmup, iterations, func(i int) error {
 		return db.Create(&BenchUser{Name: fmt.Sprintf("insert-%d", i)}).Error
 	}); err != nil {
 		return err
 	}
-	if err := runCase(mode, "update", db, iterations, func(i int) error {
+	if err := runCase(mode, "update", db, warmup, iterations, func(i int) error {
 		return db.Model(&BenchUser{}).Where("id = ?", i%1000+1).Update("score", gorm.Expr("score + 1")).Error
 	}); err != nil {
 		return err
 	}
-	if err := runCase(mode, "delete", db, iterations, func(i int) error {
+	if err := runCase(mode, "delete", db, warmup, iterations, func(i int) error {
 		user := BenchUser{Name: fmt.Sprintf("delete-%d", i)}
 		if err := db.Create(&user).Error; err != nil {
 			return err
@@ -246,7 +252,7 @@ func run(mode, dsn string, iterations, poolSize int) error {
 	}); err != nil {
 		return err
 	}
-	if err := runCase(mode, "soft-delete", db, iterations, func(i int) error {
+	if err := runCase(mode, "soft-delete", db, warmup, iterations, func(i int) error {
 		user := BenchUser{Name: fmt.Sprintf("soft-%d", i)}
 		if err := db.Create(&user).Error; err != nil {
 			return err
@@ -255,7 +261,7 @@ func run(mode, dsn string, iterations, poolSize int) error {
 	}); err != nil {
 		return err
 	}
-	if err := runCase(mode, "batch-insert-100", db, max(iterations/10, 1), func(i int) error {
+	if err := runCase(mode, "batch-insert-100", db, max(warmup/10, 1), max(iterations/10, 1), func(i int) error {
 		users := make([]BenchUser, 100)
 		for j := range users {
 			users[j].Name = fmt.Sprintf("batch-%d-%d", i, j)
@@ -264,19 +270,25 @@ func run(mode, dsn string, iterations, poolSize int) error {
 	}); err != nil {
 		return err
 	}
-	if err := runCase(mode, "transaction", db, iterations, func(_ int) error {
+	if err := runCase(mode, "transaction", db, warmup, iterations, func(_ int) error {
 		return db.Transaction(func(tx *gorm.DB) error { return tx.Exec("SELECT 1").Error })
 	}); err != nil {
 		return err
 	}
-	if err := runCase(mode, "preload", db, iterations, func(_ int) error {
+	if err := runCase(mode, "preload", db, warmup, iterations, func(_ int) error {
 		var users []BenchUser
 		return db.Preload("Posts").Limit(10).Find(&users).Error
 	}); err != nil {
 		return err
 	}
+	for i := range warmup {
+		var user BenchUser
+		if err := db.First(&user, int64(i%1000+1)).Error; err != nil {
+			return err
+		}
+	}
 	for _, concurrency := range []int{1, 16, 128, 512} {
-		if err := runConcurrency(mode, db, concurrency, max(iterations/concurrency, 1)); err != nil {
+		if err := runConcurrency(mode, db, concurrency, iterations); err != nil {
 			return err
 		}
 	}
@@ -303,6 +315,14 @@ func main() {
 			panic(err)
 		}
 	}
+	warmup := 20
+	if value := os.Getenv("ZORM_BENCH_WARMUP"); value != "" {
+		var err error
+		warmup, err = strconv.Atoi(value)
+		if err != nil {
+			panic(err)
+		}
+	}
 	poolSize := 32
 	if value := os.Getenv("ZORM_BENCH_POOL"); value != "" {
 		var err error
@@ -311,13 +331,11 @@ func main() {
 			panic(err)
 		}
 	}
-	modes := []string{"default", "tuned"}
-	if mode := os.Getenv("GORM_BENCH_MODE"); mode != "" {
-		modes = []string{mode}
+	mode := os.Getenv("GORM_BENCH_MODE")
+	if mode == "" {
+		mode = "default"
 	}
-	for _, mode := range modes {
-		if err := run(mode, dsn, iterations, poolSize); err != nil {
-			panic(err)
-		}
+	if err := run(mode, dsn, warmup, iterations, poolSize); err != nil {
+		panic(err)
 	}
 }

@@ -734,7 +734,13 @@ pub const Conn = struct {
         return std.mem.eql(u8, code, "0A000") or std.mem.eql(u8, code, "26000");
     }
 
-    fn execParamsOnce(c: *Conn, sql: []const u8, params: []const Param, close_first: ?[]const u8) Error!Result {
+    fn sendParams(
+        c: *Conn,
+        sql: []const u8,
+        params: []const Param,
+        result_format: u16,
+        close_first: ?[]const u8,
+    ) Error!?PreparedStatement {
         c.last_error = null;
         c.wbuf.clearRetainingCapacity();
         if (close_first) |name| try c.queueCloseStatement(name);
@@ -801,11 +807,11 @@ pub const Conn = struct {
         for (params) |p| try c.writeU16(p.format);
         try c.writeU16(@intCast(params.len));
         for (params) |p| try c.writeParam(p);
-        if (c.cfg.binary_results) {
-            try c.writeU16(1);
-            try c.writeU16(1);
-        } else {
+        if (result_format == 0) {
             try c.writeU16(0);
+        } else {
+            try c.writeU16(1);
+            try c.writeU16(result_format);
         }
         try c.frameEndAt(pos);
 
@@ -822,6 +828,12 @@ pub const Conn = struct {
         pos = try c.frameStart('S');
         try c.frameEndAt(pos);
         try c.send();
+        return pending;
+    }
+
+    fn execParamsOnce(c: *Conn, sql: []const u8, params: []const Param, close_first: ?[]const u8) Error!Result {
+        var pending = try c.sendParams(sql, params, if (c.cfg.binary_results) 1 else 0, close_first);
+        errdefer if (pending) |entry| c.freePrepared(entry);
         const result = try c.collectResults();
         if (pending) |entry| {
             c.prepared.appendAssumeCapacity(entry);
@@ -908,46 +920,55 @@ pub const Conn = struct {
         return result;
     }
 
+    fn queryParamsRowsOnce(
+        c: *Conn,
+        sql: []const u8,
+        params: []const Param,
+        result_format: u16,
+        close_first: ?[]const u8,
+    ) Error!*Rows {
+        const rows = c.gpa.create(Rows) catch return error.OutOfMemory;
+        rows.* = Rows.init(c) catch |err| {
+            c.gpa.destroy(rows);
+            return err;
+        };
+        var sent = false;
+        errdefer {
+            if (!sent) rows.done = true;
+            rows.deinit();
+        }
+        var pending = try c.sendParams(sql, params, result_format, close_first);
+        sent = true;
+        errdefer if (pending) |entry| c.freePrepared(entry);
+        try rows.readDescription();
+        if (pending) |entry| {
+            c.prepared.appendAssumeCapacity(entry);
+            pending = null;
+        }
+        return rows;
+    }
+
+    fn queryParamsRowsCached(c: *Conn, sql: []const u8, params: []const Param, result_format: u16) Error!*Rows {
+        return c.queryParamsRowsOnce(sql, params, result_format, null) catch |err| {
+            if (!c.planInvalidated()) return err;
+            const index = c.findPrepared(sql, params) orelse return err;
+            var old_name: [32]u8 = undefined;
+            const name = c.prepared.items[index].statementName();
+            @memcpy(old_name[0..name.len], name);
+            c.removePrepared(index);
+            return c.queryParamsRowsOnce(sql, params, result_format, old_name[0..name.len]);
+        };
+    }
+
     /// Starts an extended-protocol query whose rows are pulled one at a time.
     /// Result values use text format so they can also be exported directly.
     pub fn queryParamsStream(c: *Conn, sql: []const u8, params: []const Param) Error!*Rows {
-        c.last_error = null;
-        c.wbuf.clearRetainingCapacity();
+        return c.queryParamsRowsCached(sql, params, 0);
+    }
 
-        var pos = try c.frameStart('P');
-        try c.writeCStr("");
-        try c.writeCStr(sql);
-        try c.writeU16(@intCast(params.len));
-        for (params) |p| try c.writeU32(p.oid);
-        try c.frameEndAt(pos);
-
-        pos = try c.frameStart('B');
-        try c.writeCStr("");
-        try c.writeCStr("");
-        try c.writeU16(@intCast(params.len));
-        for (params) |p| try c.writeU16(p.format);
-        try c.writeU16(@intCast(params.len));
-        for (params) |p| try c.writeParam(p);
-        try c.writeU16(0); // text results
-        try c.frameEndAt(pos);
-
-        pos = try c.frameStart('D');
-        try c.wbuf.append(c.gpa, 'P');
-        try c.writeCStr("");
-        try c.frameEndAt(pos);
-        pos = try c.frameStart('E');
-        try c.writeCStr("");
-        try c.writeU32(0);
-        try c.frameEndAt(pos);
-        pos = try c.frameStart('S');
-        try c.frameEndAt(pos);
-        try c.send();
-
-        const rows = c.gpa.create(Rows) catch return error.OutOfMemory;
-        rows.* = try Rows.init(c);
-        errdefer rows.deinit();
-        try rows.readDescription();
-        return rows;
+    /// Starts a cached binary-result cursor for typed ORM decoding.
+    pub fn queryParamsBinary(c: *Conn, sql: []const u8, params: []const Param) Error!*Rows {
+        return c.queryParamsRowsCached(sql, params, 1);
     }
 
     fn writeParam(c: *Conn, p: Param) Error!void {

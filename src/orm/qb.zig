@@ -428,36 +428,47 @@ pub fn Query(comptime T: type) type {
                 try w.writeByte(' ');
             }
 
-            try w.writeAll("SELECT ");
-            if (!count_mode and q.hint_text != null) try w.print("/*+ {s} */ ", .{q.hint_text.?});
-            if (count_mode) {
-                try w.writeAll("count(*)");
+            const default_select = !count_mode and
+                q.hint_text == null and
+                q.distinct_on_cols == null and
+                !q.is_distinct and
+                q.raw_cols == null and
+                q.cols == null;
+            if (default_select) {
+                try w.writeAll(DefaultSelectPrefix(T).value[0..]);
             } else {
-                if (q.distinct_on_cols) |cols| {
-                    try w.writeAll("DISTINCT ON (");
-                    for (cols, 0..) |col, i| {
-                        if (i > 0) try w.writeAll(", ");
-                        try w.writeAll(try quoteIdent(q.a(), col));
-                    }
-                    try w.writeAll(") ");
-                } else if (q.is_distinct) {
-                    try w.writeAll("DISTINCT ");
-                }
-                if (q.raw_cols) |expressions| {
-                    for (expressions, 0..) |expression, i| {
-                        if (i > 0) try w.writeAll(", ");
-                        try w.writeAll(expression);
-                    }
-                } else if (q.cols) |cols| {
-                    for (cols, 0..) |col, i| {
-                        if (i > 0) try w.writeAll(", ");
-                        try w.writeAll(try quoteIdent(q.a(), col));
-                    }
+                try w.writeAll("SELECT ");
+                if (!count_mode and q.hint_text != null) try w.print("/*+ {s} */ ", .{q.hint_text.?});
+                if (count_mode) {
+                    try w.writeAll("count(*)");
                 } else {
-                    try w.writeByte('*');
+                    if (q.distinct_on_cols) |cols| {
+                        try w.writeAll("DISTINCT ON (");
+                        for (cols, 0..) |col, i| {
+                            if (i > 0) try w.writeAll(", ");
+                            try w.writeAll(try quoteIdent(q.a(), col));
+                        }
+                        try w.writeAll(") ");
+                    } else if (q.is_distinct) {
+                        try w.writeAll("DISTINCT ");
+                    }
+                    if (q.raw_cols) |expressions| {
+                        for (expressions, 0..) |expression, i| {
+                            if (i > 0) try w.writeAll(", ");
+                            try w.writeAll(expression);
+                        }
+                    } else if (q.cols) |cols| {
+                        for (cols, 0..) |col, i| {
+                            if (i > 0) try w.writeAll(", ");
+                            try w.writeAll(try quoteIdent(q.a(), col));
+                        }
+                    } else {
+                        try w.writeByte('*');
+                    }
                 }
+                try w.writeAll(" FROM ");
+                try w.writeAll(QuotedIdent(table.name).value[0..]);
             }
-            try w.print(" FROM {s}", .{try quoteIdent(q.a(), table.name)});
             for (q.joins.items) |join_clause| {
                 try w.writeByte(' ');
                 try writeRenumbered(w, join_clause.sql, join_clause.args_start);
@@ -526,21 +537,6 @@ pub fn Query(comptime T: type) type {
             } else {
                 try w.writeByte('*');
             }
-        }
-
-        fn decodeRows(q: *Self, res: *pq.Result, out_gpa: std.mem.Allocator) Error![]T {
-            const rows = out_gpa.alloc(T, res.rows.len) catch return error.OutOfMemory;
-            var decoded: usize = 0;
-            errdefer {
-                for (rows[0..decoded]) |item| value.freeValue(T, item, out_gpa);
-                out_gpa.free(rows);
-            }
-            for (res.rows, 0..) |row, i| {
-                rows[i] = try value.scanRow(T, table, res, row, out_gpa);
-                decoded += 1;
-                try db_mod.Session.callHook(T, "afterFind", &rows[i], q.sess);
-            }
-            return rows;
         }
 
         fn run(q: *Self, sql: []const u8) Error!pq.Result {
@@ -637,20 +633,10 @@ pub fn Query(comptime T: type) type {
             };
             errdefer q.deinit();
             const sql = q.buildSelectSql(false) catch return error.OutOfMemory;
-            var res = try q.run(sql);
-            defer res.deinit();
-
-            const rows = out_gpa.alloc(T, res.rows.len) catch return error.OutOfMemory;
-            var decoded: usize = 0;
+            const rows = try q.sess.runModels(T, sql, q.args.items, q.timeout_ms, out_gpa);
             errdefer {
-                // Free every fully decoded row plus the row array itself.
-                for (rows[0..decoded]) |*r| value.freeValue(T, r.*, out_gpa);
+                for (rows) |row| value.freeValue(T, row, out_gpa);
                 out_gpa.free(rows);
-            }
-            for (res.rows, 0..) |row, i| {
-                rows[i] = try value.scanRow(T, table, &res, row, out_gpa);
-                decoded = i + 1;
-                try db_mod.Session.callHook(T, "afterFind", &rows[i], q.sess);
             }
             try q.applyPreloads(rows, out_gpa);
             q.deinit();
@@ -666,16 +652,16 @@ pub fn Query(comptime T: type) type {
             errdefer q.deinit();
             if (q.limit_n == null) q.limit_n = 1;
             const sql = q.buildSelectSql(false) catch return error.OutOfMemory;
-            var res = try q.run(sql);
-            defer res.deinit();
-            if (res.rows.len == 0) {
+            const out_gpa = q.sess.gpa;
+            const rows = try q.sess.runModels(T, sql, q.args.items, q.timeout_ms, out_gpa);
+            defer out_gpa.free(rows);
+            if (rows.len == 0) {
                 q.deinit();
                 return null;
             }
-            var one = [1]T{try value.scanRow(T, table, &res, res.rows[0], q.sess.gpa)};
-            errdefer value.freeValue(T, one[0], q.sess.gpa);
-            try db_mod.Session.callHook(T, "afterFind", &one[0], q.sess);
-            try q.applyPreloads(&one, q.sess.gpa);
+            var one = [1]T{rows[0]};
+            errdefer value.freeValue(T, one[0], out_gpa);
+            try q.applyPreloads(&one, out_gpa);
             q.deinit();
             return one[0];
         }
@@ -757,9 +743,7 @@ pub fn Query(comptime T: type) type {
             const base = q.buildDeleteSql() catch return error.OutOfMemory;
             w.writeAll(base) catch return error.OutOfMemory;
             q.writeReturning(w) catch return error.OutOfMemory;
-            var res = try q.run(aw.writer.buffered());
-            defer res.deinit();
-            const rows = try q.decodeRows(&res, out_gpa);
+            const rows = try q.sess.runModels(T, aw.writer.buffered(), q.args.items, q.timeout_ms, out_gpa);
             q.deinit();
             return rows;
         }
@@ -793,9 +777,7 @@ pub fn Query(comptime T: type) type {
             q.buildWhereOffset(w, info.@"struct".fields.len) catch return error.OutOfMemory;
             q.writeReturning(w) catch return error.OutOfMemory;
             params.appendSlice(q.sess.gpa, q.args.items) catch return error.OutOfMemory;
-            var res = try q.sess.runExecTimeout(aw.writer.buffered(), params.items, q.timeout_ms);
-            defer res.deinit();
-            const rows = try q.decodeRows(&res, out_gpa);
+            const rows = try q.sess.runModels(T, aw.writer.buffered(), params.items, q.timeout_ms, out_gpa);
             q.deinit();
             return rows;
         }
@@ -833,8 +815,7 @@ pub fn ModelRows(comptime T: type) type {
                 r.close();
                 return null;
             };
-            var result = pq.Result{ .arena = r.rows.arena, .columns = r.rows.columns };
-            var model = value.scanRow(T, table, &result, raw, r.out_gpa) catch |err| {
+            var model = value.scanCells(T, table, r.rows.columns, raw, r.out_gpa) catch |err| {
                 r.close();
                 return err;
             };
@@ -1223,6 +1204,38 @@ pub fn FieldOfT(comptime M: type, comptime name: []const u8) type {
     @compileError("zorm: model " ++ @typeName(M) ++ " has no field " ++ name);
 }
 
+/// A compile-time quoted SQL identifier. Model and column metadata are
+/// comptime values, so hot paths can reuse these bytes without allocation.
+pub fn QuotedIdent(comptime name: []const u8) type {
+    comptime var escaped_len: usize = 2;
+    inline for (name) |ch| escaped_len += if (ch == '"') 2 else 1;
+    return struct {
+        pub const value: [escaped_len]u8 = blk: {
+            var out: [escaped_len]u8 = undefined;
+            var n: usize = 0;
+            out[n] = '"';
+            n += 1;
+            for (name) |ch| {
+                if (ch == '"') {
+                    out[n] = '"';
+                    n += 1;
+                }
+                out[n] = ch;
+                n += 1;
+            }
+            out[n] = '"';
+            break :blk out;
+        };
+    };
+}
+
+fn DefaultSelectPrefix(comptime T: type) type {
+    const table = schema.tableOf(T);
+    return struct {
+        pub const value = "SELECT * FROM " ++ QuotedIdent(table.name).value;
+    };
+}
+
 /// Quotes an SQL identifier, escaping embedded double quotes.
 pub fn quoteIdent(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
     if (std.mem.indexOfScalar(u8, name, '"') == null) {
@@ -1287,6 +1300,8 @@ test "quoteIdent escapes quotes" {
     const a = arena_state.allocator();
     try testing.expectEqualStrings("\"users\"", try quoteIdent(a, "users"));
     try testing.expectEqualStrings("\"we\"\"ird\"", try quoteIdent(a, "we\"ird"));
+    try testing.expectEqualStrings("\"users\"", QuotedIdent("users").value[0..]);
+    try testing.expectEqualStrings("\"we\"\"ird\"", QuotedIdent("we\"ird").value[0..]);
 }
 
 test "association IDs outside i64 are ignored" {
