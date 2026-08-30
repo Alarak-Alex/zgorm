@@ -298,14 +298,7 @@ pub fn Query(comptime T: type) type {
         }
 
         fn run(q: *Self, sql: []const u8) Error!pq.Result {
-            const conn = try q.sess.acquire();
-            const res = conn.execParams(sql, q.args.items) catch |e| {
-                q.sess.captureError(conn);
-                q.sess.releaseConn(conn);
-                return e;
-            };
-            q.sess.releaseConn(conn);
-            return res;
+            return q.sess.runExec(sql, q.args.items);
         }
 
         // -------------------------------------------------------- terminals

@@ -75,7 +75,7 @@ pub const Session = struct {
         if (s.pinned == null) s.pool.release(c);
     }
 
-    fn runExec(s: *Session, sql: []const u8, params: []const pq.Param) Error!pq.Result {
+    pub fn runExec(s: *Session, sql: []const u8, params: []const pq.Param) Error!pq.Result {
         const started = std.Io.Clock.awake.now(s.io);
         const conn = try s.acquire();
         const res = conn.execParams(sql, params) catch |e| {

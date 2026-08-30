@@ -676,14 +676,23 @@ test "v3: embedded zorm.Model round trip and soft delete" {
     _ = try db.deleteWhereHard(EmbeddedUser, "true", .{});
 }
 
+const QueryLogEntry = struct {
+    id: ?i64 = null,
+    name: []const u8 = "",
+};
+
 const CapturingLogger = struct {
     buf: std.ArrayList(u8) = .empty,
     level: z.LogLevel = .info,
+    calls: usize = 0,
+    last_level: z.LogLevel = .silent,
     gpa: std.mem.Allocator,
 
     fn log(ctx: ?*anyopaque, level: z.LogLevel, msg: []const u8) void {
         const self: *CapturingLogger = @ptrCast(@alignCast(ctx.?));
         if (@intFromEnum(level) > @intFromEnum(self.level)) return;
+        self.calls += 1;
+        self.last_level = level;
         self.buf.appendSlice(self.gpa, msg) catch {};
         self.buf.appendSlice(self.gpa, "\n") catch {};
     }
@@ -695,6 +704,17 @@ const CapturingLogger = struct {
             .slow_threshold_ms = 0, // trace everything
             .logFn = log,
         };
+    }
+
+    fn reset(self: *CapturingLogger) void {
+        self.buf.clearRetainingCapacity();
+        self.calls = 0;
+        self.last_level = .silent;
+    }
+
+    fn expectOne(self: *const CapturingLogger, level: z.LogLevel) !void {
+        try std.testing.expectEqual(@as(usize, 1), self.calls);
+        try std.testing.expectEqual(level, self.last_level);
     }
 };
 
@@ -731,6 +751,78 @@ test "v4: default logger traces queries and can be replaced" {
     r3.deinit();
     try std.testing.expectEqual(@as(usize, 0), sink.buf.items.len);
     sink.buf.deinit(gpa);
+}
+
+test "query builder logs every terminal operation" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    defer db.deinit();
+
+    drop(try db.execRaw("DROP TABLE IF EXISTS query_log_entry CASCADE"));
+    try db.autoMigrate(QueryLogEntry);
+    var entry = QueryLogEntry{ .name = "logged" };
+    try db.insert(&entry);
+
+    var sink = CapturingLogger{ .gpa = gpa };
+    defer sink.buf.deinit(gpa);
+    db.setLogger(sink.logger());
+    defer db.setLogger(z.Logger.default);
+
+    const rows = try z.query(QueryLogEntry, db).whereEq("name", "logged").all(gpa);
+    defer z.freeSlice(QueryLogEntry, rows, gpa);
+    try sink.expectOne(.info);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf.items, "ms, rows=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf.items, "\"name\" = 'logged'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf.items, "$1='logged'") != null);
+
+    sink.reset();
+    const first = (try z.query(QueryLogEntry, db).whereEq("name", "logged").first()).?;
+    defer z.free(QueryLogEntry, first, gpa);
+    try sink.expectOne(.info);
+
+    sink.reset();
+    try std.testing.expectEqual(@as(i64, 1), try z.query(QueryLogEntry, db).count());
+    try sink.expectOne(.info);
+
+    sink.reset();
+    try std.testing.expect(try z.query(QueryLogEntry, db).exists());
+    try sink.expectOne(.info);
+
+    sink.reset();
+    try std.testing.expectEqual(@as(i64, 1), try z.query(QueryLogEntry, db).whereEq("name", "logged").delete());
+    try sink.expectOne(.info);
+
+    sink.reset();
+    try std.testing.expectError(
+        error.UndefinedColumn,
+        z.query(QueryLogEntry, db).where("definitely_missing_column = $1::bigint", .{@as(i64, 1)}).count(),
+    );
+    try sink.expectOne(.err);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf.items, "SQL error") != null);
+
+    var slow_entry = QueryLogEntry{ .name = "slow" };
+    try db.insert(&slow_entry);
+    sink.reset();
+    var slow_logger = sink.logger();
+    slow_logger.slow_threshold_ms = 1;
+    db.setLogger(slow_logger);
+    _ = try z.query(QueryLogEntry, db)
+        .where("EXISTS (SELECT 1 FROM pg_sleep(0.01))", .{})
+        .count();
+    try sink.expectOne(.warn);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf.items, "SLOW SQL") != null);
+
+    sink.reset();
+    var silent_logger = sink.logger();
+    silent_logger.level = .silent;
+    db.setLogger(silent_logger);
+    _ = try z.query(QueryLogEntry, db).count();
+    try std.testing.expectEqual(@as(usize, 0), sink.calls);
+    try std.testing.expectEqual(@as(usize, 0), sink.buf.items.len);
 }
 
 test "v3: issue fixes regression" {
