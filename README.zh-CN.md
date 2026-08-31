@@ -208,13 +208,12 @@ pub const Author = struct {
     base: z.Model = .{},
     posts: []Post = &.{},
 
-    pub const zorm = z.ModelConfig{
-        .associations = &.{
-            z.hasManyWith("posts", Post, .{
-                .foreign_key = "owner_id",
-            }),
+    pub const posts_relation = z.hasManyWith(
+        Post,
+        z.AssociationOptions{
+            .foreign_key = "owner_id",
         },
-    };
+    );
 };
 ```
 

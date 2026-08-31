@@ -63,6 +63,7 @@ pub const LogLevel = logger.LogLevel;
 pub const Time = time.Time;
 pub const ModelConfig = schema.ModelConfig;
 pub const AssociationConfig = schema.AssociationConfig;
+pub const Association = schema.Association;
 pub const associations = schema.associations;
 pub const AssociationOptions = schema.AssociationOptions;
 pub const belongsTo = schema.belongsTo;

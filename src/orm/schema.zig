@@ -126,7 +126,7 @@ pub const Assoc = struct {
 };
 /// Typed association entry used by `ModelConfig`.
 pub const AssociationConfig = struct {
-    field: []const u8,
+    field: []const u8 = "",
     model: type,
     kind: Assoc.Kind,
     foreign_key: []const u8 = "",
@@ -141,6 +141,9 @@ pub const AssociationConfig = struct {
     polymorphic_value: []const u8 = "",
     cascade_delete: bool = false,
 };
+
+/// Explicitly named association type for fully typed array literals.
+pub const Association = AssociationConfig;
 
 /// Short name for one typed association entry.
 pub const associations = AssociationConfig;
@@ -184,36 +187,36 @@ fn associationConfig(
     };
 }
 
-pub fn belongsTo(comptime field: []const u8, comptime M: type) AssociationConfig {
-    return associationConfig(field, M, .belongs_to, .{});
+pub fn belongsTo(comptime M: type) AssociationConfig {
+    return associationConfig("", M, .belongs_to, .{});
 }
 
-pub fn belongsToWith(comptime field: []const u8, comptime M: type, options: AssociationOptions) AssociationConfig {
-    return associationConfig(field, M, .belongs_to, options);
+pub fn belongsToWith(comptime M: type, options: AssociationOptions) AssociationConfig {
+    return associationConfig("", M, .belongs_to, options);
 }
 
-pub fn hasOne(comptime field: []const u8, comptime M: type) AssociationConfig {
-    return associationConfig(field, M, .has_one, .{});
+pub fn hasOne(comptime M: type) AssociationConfig {
+    return associationConfig("", M, .has_one, .{});
 }
 
-pub fn hasOneWith(comptime field: []const u8, comptime M: type, options: AssociationOptions) AssociationConfig {
-    return associationConfig(field, M, .has_one, options);
+pub fn hasOneWith(comptime M: type, options: AssociationOptions) AssociationConfig {
+    return associationConfig("", M, .has_one, options);
 }
 
-pub fn hasMany(comptime field: []const u8, comptime M: type) AssociationConfig {
-    return associationConfig(field, M, .has_many, .{});
+pub fn hasMany(comptime M: type) AssociationConfig {
+    return associationConfig("", M, .has_many, .{});
 }
 
-pub fn hasManyWith(comptime field: []const u8, comptime M: type, options: AssociationOptions) AssociationConfig {
-    return associationConfig(field, M, .has_many, options);
+pub fn hasManyWith(comptime M: type, options: AssociationOptions) AssociationConfig {
+    return associationConfig("", M, .has_many, options);
 }
 
-pub fn manyToMany(comptime field: []const u8, comptime M: type) AssociationConfig {
-    return associationConfig(field, M, .many_to_many, .{});
+pub fn manyToMany(comptime M: type) AssociationConfig {
+    return associationConfig("", M, .many_to_many, .{});
 }
 
-pub fn manyToManyWith(comptime field: []const u8, comptime M: type, options: AssociationOptions) AssociationConfig {
-    return associationConfig(field, M, .many_to_many, options);
+pub fn manyToManyWith(comptime M: type, options: AssociationOptions) AssociationConfig {
+    return associationConfig("", M, .many_to_many, options);
 }
 
 pub const Table = struct {
@@ -461,6 +464,30 @@ pub fn tableOf(comptime T: type) Table {
         }
 
         comptime var is_assoc = false;
+        const relation_name = fname ++ "_relation";
+        if (@hasDecl(T, relation_name)) {
+            const cfg = @field(T, relation_name);
+            const foreign_key = if (cfg.foreign_key.len > 0) cfg.foreign_key else modelForeignKey(T, cfg.model, cfg.kind);
+            const foreign_keys = if (cfg.foreign_keys.len > 0) cfg.foreign_keys else &.{foreign_key};
+            const primary_keys = if (cfg.primary_keys.len > 0) cfg.primary_keys else &.{cfg.primary_key};
+            assocs = assocs ++ &[_]Assoc{.{
+                .field_name = fname,
+                .model = cfg.model,
+                .foreign_key = foreign_key,
+                .primary_key = cfg.primary_key,
+                .foreign_keys = foreign_keys,
+                .primary_keys = primary_keys,
+                .join_table = cfg.join_table,
+                .join_foreign_key = cfg.join_foreign_key,
+                .join_association_key = cfg.join_association_key,
+                .association_key = cfg.association_key,
+                .polymorphic_type = cfg.polymorphic_type,
+                .polymorphic_value = cfg.polymorphic_value,
+                .cascade_delete = cfg.cascade_delete,
+                .kind = cfg.kind,
+            }};
+            is_assoc = true;
+        }
         if (@hasField(@TypeOf(opts), "associations")) {
             inline for (opts.associations) |cfg| {
                 if (comptime std.mem.eql(u8, cfg.field, fname)) {
@@ -700,14 +727,9 @@ const InferredChild = struct {
 const InferredParent = struct {
     id: ?i64 = null,
     children: []InferredChild = &.{},
-
-    pub const zorm = ModelConfig{
-        .associations = &.{
-            hasManyWith("children", InferredChild, .{
-                .foreign_key = "person_id",
-            }),
-        },
-    };
+    pub const children_relation = hasManyWith(InferredChild, AssociationOptions{
+        .foreign_key = "person_id",
+    });
 };
 
 test "typed options and convention associations" {
