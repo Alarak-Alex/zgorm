@@ -210,12 +210,9 @@ pub const Author = struct {
 
     pub const zorm = z.ModelConfig{
         .associations = &.{
-            .{
-                .field = "posts",
-                .model = Post,
-                .kind = .has_many,
+            z.hasManyWith("posts", Post, .{
                 .foreign_key = "owner_id",
-            },
+            }),
         },
     };
 };

@@ -63,6 +63,16 @@ pub const LogLevel = logger.LogLevel;
 pub const Time = time.Time;
 pub const ModelConfig = schema.ModelConfig;
 pub const AssociationConfig = schema.AssociationConfig;
+pub const associations = schema.associations;
+pub const AssociationOptions = schema.AssociationOptions;
+pub const belongsTo = schema.belongsTo;
+pub const hasOne = schema.hasOne;
+pub const hasMany = schema.hasMany;
+pub const manyToMany = schema.manyToMany;
+pub const belongsToWith = schema.belongsToWith;
+pub const hasOneWith = schema.hasOneWith;
+pub const hasManyWith = schema.hasManyWith;
+pub const manyToManyWith = schema.manyToManyWith;
 pub const Model = value.Model;
 
 pub const Error = pq.Error;

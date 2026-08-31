@@ -35,7 +35,7 @@ pub const ModelConfig = struct {
     table: []const u8 = "",
     unique: []const []const u8 = &.{},
     indexes: []const []const u8 = &.{},
-    associations: []const AssociationConfig = &.{},
+    associations: []const associations = &.{},
 };
 
 pub const FieldKind = enum {
@@ -141,6 +141,80 @@ pub const AssociationConfig = struct {
     polymorphic_value: []const u8 = "",
     cascade_delete: bool = false,
 };
+
+/// Short name for one typed association entry.
+pub const associations = AssociationConfig;
+
+/// Shared options template for typed association constructors.
+pub const AssociationOptions = struct {
+    foreign_key: []const u8 = "",
+    primary_key: []const u8 = "id",
+    foreign_keys: []const []const u8 = &.{},
+    primary_keys: []const []const u8 = &.{},
+    join_table: []const u8 = "",
+    join_foreign_key: []const u8 = "",
+    join_association_key: []const u8 = "",
+    association_key: []const u8 = "id",
+    polymorphic_type: []const u8 = "",
+    polymorphic_value: []const u8 = "",
+    cascade_delete: bool = false,
+};
+
+fn associationConfig(
+    comptime field: []const u8,
+    comptime M: type,
+    comptime kind: Assoc.Kind,
+    options: AssociationOptions,
+) AssociationConfig {
+    return .{
+        .field = field,
+        .model = M,
+        .kind = kind,
+        .foreign_key = options.foreign_key,
+        .primary_key = options.primary_key,
+        .foreign_keys = options.foreign_keys,
+        .primary_keys = options.primary_keys,
+        .join_table = options.join_table,
+        .join_foreign_key = options.join_foreign_key,
+        .join_association_key = options.join_association_key,
+        .association_key = options.association_key,
+        .polymorphic_type = options.polymorphic_type,
+        .polymorphic_value = options.polymorphic_value,
+        .cascade_delete = options.cascade_delete,
+    };
+}
+
+pub fn belongsTo(comptime field: []const u8, comptime M: type) AssociationConfig {
+    return associationConfig(field, M, .belongs_to, .{});
+}
+
+pub fn belongsToWith(comptime field: []const u8, comptime M: type, options: AssociationOptions) AssociationConfig {
+    return associationConfig(field, M, .belongs_to, options);
+}
+
+pub fn hasOne(comptime field: []const u8, comptime M: type) AssociationConfig {
+    return associationConfig(field, M, .has_one, .{});
+}
+
+pub fn hasOneWith(comptime field: []const u8, comptime M: type, options: AssociationOptions) AssociationConfig {
+    return associationConfig(field, M, .has_one, options);
+}
+
+pub fn hasMany(comptime field: []const u8, comptime M: type) AssociationConfig {
+    return associationConfig(field, M, .has_many, .{});
+}
+
+pub fn hasManyWith(comptime field: []const u8, comptime M: type, options: AssociationOptions) AssociationConfig {
+    return associationConfig(field, M, .has_many, options);
+}
+
+pub fn manyToMany(comptime field: []const u8, comptime M: type) AssociationConfig {
+    return associationConfig(field, M, .many_to_many, .{});
+}
+
+pub fn manyToManyWith(comptime field: []const u8, comptime M: type, options: AssociationOptions) AssociationConfig {
+    return associationConfig(field, M, .many_to_many, options);
+}
 
 pub const Table = struct {
     model: type,
@@ -629,12 +703,9 @@ const InferredParent = struct {
 
     pub const zorm = ModelConfig{
         .associations = &.{
-            .{
-                .field = "children",
-                .model = InferredChild,
-                .kind = .has_many,
+            hasManyWith("children", InferredChild, .{
                 .foreign_key = "person_id",
-            },
+            }),
         },
     };
 };
