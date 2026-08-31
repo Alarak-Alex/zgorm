@@ -1060,8 +1060,8 @@ test "params from args tuple" {
 pub fn scanRow(
     comptime T: type,
     comptime table: schema.Table,
-    res: *pq.Result,
-    row: pq.Result.Row,
+    res: anytype,
+    row: anytype,
     gpa: std.mem.Allocator,
 ) DecodeError!T {
     return scanCells(T, table, res.columns, row, gpa);
@@ -1071,21 +1071,45 @@ pub fn scanRow(
 pub fn scanCells(
     comptime T: type,
     comptime table: schema.Table,
-    columns: []const pq.Result.Column,
-    row: pq.Result.Row,
+    columns: anytype,
+    row: anytype,
+    gpa: std.mem.Allocator,
+) DecodeError!T {
+    var column_map: [table.columns.len]?usize = undefined;
+    buildColumnMap(table, columns, &column_map);
+    return scanCellsMapped(T, table, columns, row, &column_map, gpa);
+}
+
+/// Builds the result-column lookup once for all rows in a result set.
+pub fn buildColumnMap(
+    comptime table: schema.Table,
+    columns: anytype,
+    map: []?usize,
+) void {
+    @memset(map, null);
+    inline for (table.columns, 0..) |col, i| {
+        for (columns, 0..) |result_column, column_index| {
+            if (std.mem.eql(u8, result_column.name, col.name)) {
+                map[i] = column_index;
+                break;
+            }
+        }
+    }
+}
+
+/// Decodes a row using a column map prepared by `buildColumnMap`.
+pub fn scanCellsMapped(
+    comptime T: type,
+    comptime table: schema.Table,
+    columns: anytype,
+    row: anytype,
+    column_map: []const ?usize,
     gpa: std.mem.Allocator,
 ) DecodeError!T {
     var out = std.mem.zeroInit(T, .{});
     errdefer value_freePartiallyBuilt(T, &out, gpa);
-    inline for (table.columns) |col| {
-        var column_index: ?usize = null;
-        for (columns, 0..) |result_column, i| {
-            if (std.mem.eql(u8, result_column.name, col.name)) {
-                column_index = i;
-                break;
-            }
-        }
-        if (column_index) |ci| {
+    inline for (table.columns, 0..) |col, i| {
+        if (column_map[i]) |ci| {
             const V = columnFieldType(T, col);
             setColumn(&out, col, try decodeCell(V, row[ci], columns[ci].type_oid, columns[ci].format, gpa));
         } else {

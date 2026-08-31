@@ -136,6 +136,8 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
         }
 
         pub fn runParams(db: *Self, sql: []const u8, params: []const types.Param, timeout_ms: u64) Error!types.Result {
+            const instrumented = db.observer.on_query != null or db.plugin_registry.len != 0;
+            if (!instrumented) return db.backend.execParamsTimeout(sql, params, timeout_ms);
             if (!db.plugin_registry.before(sql)) return error.HookAborted;
             const io = backendIo(db);
             const started = if (io) |active_io| std.Io.Clock.awake.now(active_io) else null;

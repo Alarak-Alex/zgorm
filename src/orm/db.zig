@@ -377,12 +377,14 @@ pub const Session = struct {
             defer res.deinit();
             const models = out_gpa.alloc(T, res.rows.len) catch return error.OutOfMemory;
             var decoded: usize = 0;
+            var column_map: [table.columns.len]?usize = undefined;
+            value.buildColumnMap(table, res.columns, &column_map);
             errdefer {
                 for (models[0..decoded]) |model| value.freeValue(T, model, out_gpa);
                 out_gpa.free(models);
             }
             for (res.rows, 0..) |row, i| {
-                models[i] = try value.scanRow(T, table, &res, row, out_gpa);
+                models[i] = try value.scanCellsMapped(T, table, res.columns, row, &column_map, out_gpa);
                 decoded = i + 1;
             }
             for (models) |*model| try callHook(T, "afterFind", model, s);
@@ -401,6 +403,8 @@ pub const Session = struct {
             s.releaseConn(conn);
         };
 
+        var column_map: [table.columns.len]?usize = undefined;
+        value.buildColumnMap(table, rows.columns, &column_map);
         var models: std.ArrayList(T) = .empty;
         errdefer {
             for (models.items) |model| value.freeValue(T, model, out_gpa);
@@ -410,7 +414,7 @@ pub const Session = struct {
             s.captureError(conn);
             return err;
         }) |row| {
-            const model = try value.scanCells(T, table, rows.columns, row, out_gpa);
+            const model = try value.scanCellsMapped(T, table, rows.columns, row, &column_map, out_gpa);
             models.append(out_gpa, model) catch {
                 value.freeValue(T, model, out_gpa);
                 return error.OutOfMemory;
@@ -514,6 +518,12 @@ pub const Session = struct {
             const msg = logger_mod.formatQuery(&s.logger, &buf, sql, params, elapsed_ns, affected_rows, err);
             s.logger.log(level, msg);
         }
+        const needs_observer = s.observer.on_query != null or
+            s.observer.on_span != null or
+            s.observer.metrics != null or
+            s.observer.slow_queries != null or
+            s.plugins.len != 0;
+        if (!needs_observer) return;
         const pool = s.pool.stats();
         const event = observability.QueryEvent{
             .sql = sql,
@@ -1347,10 +1357,12 @@ pub const Session = struct {
         const gpa = s.gpa;
         const sess_copy = gpa.create(Session) catch @panic("zorm: out of memory");
         sess_copy.* = s.*;
-        const arena = gpa.create(std.heap.ArenaAllocator) catch @panic("zorm: out of memory");
-        arena.* = std.heap.ArenaAllocator.init(gpa);
         const q = gpa.create(Query(T)) catch @panic("zorm: out of memory");
-        q.* = .{ .sess = sess_copy, .owns_session = true, .arena = arena };
+        q.* = .{
+            .sess = sess_copy,
+            .owns_session = true,
+            .arena = std.heap.ArenaAllocator.init(gpa),
+        };
         return q;
     }
 
@@ -1806,10 +1818,12 @@ pub const Tx = struct {
     }
     pub fn query(t: *Tx, comptime T: type) *Query(T) {
         const gpa = t.sess.gpa;
-        const arena = gpa.create(std.heap.ArenaAllocator) catch @panic("zorm: out of memory");
-        arena.* = std.heap.ArenaAllocator.init(gpa);
         const q = gpa.create(Query(T)) catch @panic("zorm: out of memory");
-        q.* = .{ .sess = t.sess, .owns_session = false, .arena = arena };
+        q.* = .{
+            .sess = t.sess,
+            .owns_session = false,
+            .arena = std.heap.ArenaAllocator.init(gpa),
+        };
         return q;
     }
     pub fn execTimeout(t: *Tx, sql: []const u8, args: anytype, timeout_ms: u64) Error!pq.Result {

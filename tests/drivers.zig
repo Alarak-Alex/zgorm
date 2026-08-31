@@ -267,15 +267,28 @@ test "SQLite association manager appends counts and clears children" {
     try children.append(&child);
     try std.testing.expectEqual(parent.id, child.parent_id);
     try std.testing.expectEqual(@as(i64, 1), try children.count());
+
+    var parent2 = AssocParent{ .name = "parent-2" };
+    try db.insert(&parent2);
+    var child2 = AssocChild{ .name = "child-2" };
+    var children2 = db.association(&parent2, "children");
+    try children2.append(&child2);
+
+    observed_queries = 0;
+    db.setObserver(.{ .on_query = observeQuery });
     const loaded = try db.query(AssocParent).preload("children").all(std.testing.allocator);
     defer z.freeSlice(AssocParent, loaded, std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+    try std.testing.expectEqual(@as(usize, 2), observed_queries);
     try std.testing.expectEqual(@as(usize, 1), loaded[0].children.len);
     try std.testing.expectEqualStrings("child", loaded[0].children[0].name);
+    try std.testing.expectEqual(@as(usize, 1), loaded[1].children.len);
+    try std.testing.expectEqualStrings("child-2", loaded[1].children[0].name);
     try children.clear();
+    try children2.clear();
     try std.testing.expectEqual(@as(i64, 0), try children.count());
+    try std.testing.expectEqual(@as(i64, 0), try children2.count());
 }
-
 test "SQLite ORM executes typed lifecycle" {
     const gpa = std.testing.allocator;
     const raw = try z.drivers.sqlite.Db.open(gpa, ":memory:");

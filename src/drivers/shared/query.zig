@@ -36,7 +36,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
         const Self = @This();
 
         db: *Db,
-        arena: *std.heap.ArenaAllocator,
+        arena: std.heap.ArenaAllocator,
         conditions: std.ArrayList(Fragment) = .empty,
         joins: std.ArrayList(Fragment) = .empty,
         ctes: std.ArrayList(Fragment) = .empty,
@@ -60,10 +60,11 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
         build_error: ?Error = null,
 
         pub fn init(db: *Db) *Self {
-            const arena = db.backend.gpa.create(std.heap.ArenaAllocator) catch @panic("zorm: out of memory");
-            arena.* = std.heap.ArenaAllocator.init(db.backend.gpa);
             const query = db.backend.gpa.create(Self) catch @panic("zorm: out of memory");
-            query.* = .{ .db = db, .arena = arena };
+            query.* = .{
+                .db = db,
+                .arena = std.heap.ArenaAllocator.init(db.backend.gpa),
+            };
             return query;
         }
 
@@ -72,7 +73,6 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
             q.consumed = true;
             const gpa = q.db.backend.gpa;
             q.arena.deinit();
-            gpa.destroy(q.arena);
             gpa.destroy(q);
         }
 
@@ -440,71 +440,253 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
                 for (output[0..initialized]) |item| value.freeValue(T, item, gpa);
                 gpa.free(output);
             }
+            var column_map: [table.columns.len]?usize = undefined;
+            value.buildColumnMap(table, result.columns, &column_map);
             for (result.rows, 0..) |row, i| {
-                output[i] = try value.scanRow(T, table, result, row, gpa);
+                output[i] = try value.scanCellsMapped(T, table, result.columns, row, &column_map, gpa);
                 initialized += 1;
                 try q.db.runAfterFind(&output[i]);
-                inline for (table.assocs, 0..) |association, index| {
-                    if (q.preload_flags[index]) try q.loadAssociation(&output[i], association, gpa);
-                }
+            }
+            inline for (table.assocs, 0..) |association, index| {
+                if (q.preload_flags[index]) try q.loadAssociations(output, association, gpa);
             }
             return output;
         }
 
-        fn loadAssociation(q: *Self, parent: *T, comptime association: schema.Assoc, gpa: std.mem.Allocator) Error!void {
-            const Child = association.model;
-            switch (association.kind) {
-                .belongs_to => {
-                    const foreign = @field(parent, association.foreign_key);
-                    switch (@typeInfo(@TypeOf(foreign))) {
-                        .optional => {
-                            const key = foreign orelse {
-                                @field(parent, association.field_name) = null;
-                                return;
-                            };
-                            @field(parent, association.field_name) =
-                                try q.db.query(Child).whereEq(association.primary_key, key).first(gpa);
-                        },
-                        else => @field(parent, association.field_name) =
-                            try q.db.query(Child).whereEq(association.primary_key, foreign).first(gpa),
+        fn loadAssociations(
+            q: *Self,
+            rows: []T,
+            comptime association: schema.Assoc,
+            gpa: std.mem.Allocator,
+        ) Error!void {
+            if (association.primary_keys.len != 1)
+                return error.InvalidQuery;
+            if (association.kind == .many_to_many)
+                return loadManyToManyBatch(q, rows, association, gpa);
+            return loadSingleAssociationBatch(q, rows, association, gpa);
+        }
+
+        fn SharedJoinedChild(comptime Child: type, comptime ParentKey: type) type {
+            return struct {
+                child: Child,
+                parent_key: ParentKey,
+            };
+        }
+
+        fn keyPresent(comptime K: type, value_: K) bool {
+            return switch (@typeInfo(K)) {
+                .optional => if (value_) |unwrapped| keyPresent(@TypeOf(unwrapped), unwrapped) else false,
+                else => true,
+            };
+        }
+
+        fn keyEqual(comptime A: type, a: A, comptime B: type, b: B) bool {
+            if (A == B) {
+                return switch (@typeInfo(A)) {
+                    .pointer => |info| if (info.size == .slice and info.child == u8)
+                        std.mem.eql(u8, a, b)
+                    else
+                        std.meta.eql(a, b),
+                    else => std.meta.eql(a, b),
+                };
+            }
+            return switch (@typeInfo(A)) {
+                .optional => if (a) |unwrapped| keyEqual(@TypeOf(unwrapped), unwrapped, B, b) else false,
+                else => switch (@typeInfo(B)) {
+                    .optional => if (b) |unwrapped| keyEqual(A, a, @TypeOf(unwrapped), unwrapped) else false,
+                    else => false,
+                },
+            };
+        }
+
+        fn loadSingleAssociationBatch(q: anytype, rows: anytype, comptime assoc: schema.Assoc, gpa: std.mem.Allocator) Error!void {
+            const Parent = @TypeOf(rows[0]);
+            const Child = assoc.model;
+            const parent_key = if (assoc.kind == .belongs_to) assoc.foreign_key else assoc.primary_key;
+            const child_key = if (assoc.kind == .belongs_to) assoc.primary_key else assoc.foreign_key;
+            const ParentKey = @TypeOf(@field(@as(Parent, undefined), parent_key));
+
+            var keys: std.ArrayList(ParentKey) = .empty;
+            defer keys.deinit(gpa);
+            for (rows) |*parent| {
+                const key = @field(parent, parent_key);
+                if (keyPresent(ParentKey, key)) keys.append(gpa, key) catch return error.OutOfMemory;
+            }
+            if (keys.items.len == 0) {
+                if (assoc.kind != .has_many) {
+                    for (rows) |*parent| @field(parent, assoc.field_name) = null;
+                }
+                return;
+            }
+
+            var arena_state = std.heap.ArenaAllocator.init(gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var child_query = q.db.query(Child).whereIn(child_key, keys.items);
+            if (assoc.polymorphic_type.len > 0)
+                child_query = child_query.whereEq(assoc.polymorphic_type, assoc.polymorphic_value);
+            const children = try child_query.all(arena);
+
+            if (assoc.kind == .has_many) {
+                const slices = gpa.alloc(@TypeOf(@field(@as(Parent, undefined), assoc.field_name)), rows.len) catch
+                    return error.OutOfMemory;
+                defer gpa.free(slices);
+                const fill = gpa.alloc(usize, rows.len) catch return error.OutOfMemory;
+                defer gpa.free(fill);
+                const counts = gpa.alloc(usize, rows.len) catch return error.OutOfMemory;
+                defer gpa.free(counts);
+                @memset(counts, 0);
+                const owners = gpa.alloc(usize, children.len) catch return error.OutOfMemory;
+                defer gpa.free(owners);
+                for (children, 0..) |*child, child_index| {
+                    owners[child_index] = std.math.maxInt(usize);
+                    for (rows, 0..) |*parent, parent_index| {
+                        if (keyEqual(
+                            @TypeOf(@field(child, child_key)),
+                            @field(child, child_key),
+                            ParentKey,
+                            @field(parent, parent_key),
+                        )) {
+                            owners[child_index] = parent_index;
+                            counts[parent_index] += 1;
+                            break;
+                        }
                     }
-                },
-                .has_one => {
-                    @field(parent, association.field_name) = try q.db.query(Child)
-                        .whereEq(association.foreign_key, @field(parent, association.primary_key))
-                        .first(gpa);
-                },
-                .has_many => {
-                    @field(parent, association.field_name) = try q.db.query(Child)
-                        .whereEq(association.foreign_key, @field(parent, association.primary_key))
-                        .all(gpa);
-                },
-                .many_to_many => {
-                    const child_table = comptime schema.tableOf(Child);
-                    const arena = q.allocator();
-                    var join_sql: std.Io.Writer.Allocating = .init(arena);
-                    const jw = &join_sql.writer;
-                    try jw.writeAll("JOIN ");
-                    try writeIdent(jw, association.join_table);
-                    try jw.writeAll(" ON ");
-                    try writeQualifiedIdent(jw, child_table.name, association.association_key);
-                    try jw.writeAll(" = ");
-                    try writeQualifiedIdent(jw, association.join_table, association.join_association_key);
-                    var where_sql: std.Io.Writer.Allocating = .init(arena);
-                    try writeQualifiedIdent(&where_sql.writer, association.join_table, association.join_foreign_key);
-                    try where_sql.writer.writeAll(" = ?");
-                    const selected = arena.alloc([]const u8, child_table.columns.len) catch return error.OutOfMemory;
-                    inline for (child_table.columns, 0..) |column, index| {
-                        var expression: std.Io.Writer.Allocating = .init(arena);
-                        try writeQualifiedIdent(&expression.writer, child_table.name, column.name);
-                        selected[index] = expression.writer.buffered();
+                }
+                for (rows, 0..) |*parent, parent_index| {
+                    slices[parent_index] = gpa.alloc(Child, counts[parent_index]) catch return error.OutOfMemory;
+                    fill[parent_index] = 0;
+                    @field(parent, assoc.field_name) = slices[parent_index];
+                }
+                for (children, 0..) |*child, child_index| {
+                    const owner = owners[child_index];
+                    if (owner != std.math.maxInt(usize)) {
+                        slices[owner][fill[owner]] = try value.deepCopy(Child, child.*, gpa);
+                        fill[owner] += 1;
                     }
-                    @field(parent, association.field_name) = try q.db.query(Child)
-                        .selectRaw(selected)
-                        .join(join_sql.writer.buffered(), .{})
-                        .where(where_sql.writer.buffered(), .{@field(parent, association.primary_key)})
-                        .all(gpa);
-                },
+                }
+                return;
+            }
+
+            for (rows) |*parent| {
+                @field(parent, assoc.field_name) = null;
+                for (children) |*child| {
+                    if (keyEqual(
+                        @TypeOf(@field(child, child_key)),
+                        @field(child, child_key),
+                        ParentKey,
+                        @field(parent, parent_key),
+                    )) {
+                        @field(parent, assoc.field_name) = try value.deepCopy(Child, child.*, gpa);
+                        break;
+                    }
+                }
+            }
+        }
+
+        fn loadManyToManyBatch(q: anytype, rows: anytype, comptime assoc: schema.Assoc, gpa: std.mem.Allocator) Error!void {
+            const Parent = @TypeOf(rows[0]);
+            const Child = assoc.model;
+            const child_table = comptime schema.tableOf(Child);
+            const ParentKey = @TypeOf(@field(@as(Parent, undefined), assoc.primary_key));
+            const Joined = SharedJoinedChild(Child, ParentKey);
+
+            var keys: std.ArrayList(ParentKey) = .empty;
+            defer keys.deinit(gpa);
+            for (rows) |*parent| {
+                const key = @field(parent, assoc.primary_key);
+                if (keyPresent(ParentKey, key)) keys.append(gpa, key) catch return error.OutOfMemory;
+            }
+            if (keys.items.len == 0) {
+                for (rows) |*parent| @field(parent, assoc.field_name) = &.{};
+                return;
+            }
+
+            var arena_state = std.heap.ArenaAllocator.init(gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var sql: std.Io.Writer.Allocating = .init(arena);
+            const w = &sql.writer;
+            w.writeAll("SELECT ") catch return error.OutOfMemory;
+            inline for (child_table.columns, 0..) |column, i| {
+                if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
+                try writeQualifiedIdent(w, child_table.name, column.name);
+            }
+            w.writeAll(", ") catch return error.OutOfMemory;
+            try writeQualifiedIdent(w, assoc.join_table, assoc.join_foreign_key);
+            w.writeAll(" AS ") catch return error.OutOfMemory;
+            try writeIdent(w, "__zorm_parent_key");
+            w.writeAll(" FROM ") catch return error.OutOfMemory;
+            try writeIdent(w, child_table.name);
+            w.writeAll(" JOIN ") catch return error.OutOfMemory;
+            try writeIdent(w, assoc.join_table);
+            w.writeAll(" ON ") catch return error.OutOfMemory;
+            try writeQualifiedIdent(w, assoc.join_table, assoc.join_association_key);
+            w.writeAll(" = ") catch return error.OutOfMemory;
+            try writeQualifiedIdent(w, child_table.name, assoc.association_key);
+            w.writeAll(" WHERE ") catch return error.OutOfMemory;
+            try writeQualifiedIdent(w, assoc.join_table, assoc.join_foreign_key);
+            w.writeAll(" IN (") catch return error.OutOfMemory;
+            for (keys, 0..) |_, i| {
+                if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
+                w.writeByte('?') catch return error.OutOfMemory;
+            }
+            w.writeByte(')') catch return error.OutOfMemory;
+            const params = arena.alloc(types.Param, keys.items.len) catch return error.OutOfMemory;
+            for (keys.items, 0..) |key, i| params[i] = try value.toParam(key, arena);
+            var result = try q.db.runParams(w.buffered(), params, q.timeout_ms);
+            defer result.deinit();
+            const key_index = result.colIndex("__zorm_parent_key") orelse return error.ProtocolViolation;
+            var column_map: [child_table.columns.len]?usize = undefined;
+            value.buildColumnMap(child_table, result.columns, &column_map);
+
+            var joined: std.ArrayList(Joined) = .empty;
+            for (result.rows) |row| {
+                var item = Joined{
+                    .child = try value.scanCellsMapped(Child, child_table, result.columns, row, &column_map, arena),
+                    .parent_key = try value.decodeCell(
+                        ParentKey,
+                        row[key_index],
+                        result.columns[key_index].type_oid,
+                        result.columns[key_index].format,
+                        arena,
+                    ),
+                };
+                try q.db.runAfterFind(&item.child);
+                joined.append(arena, item) catch return error.OutOfMemory;
+            }
+
+            const slices = gpa.alloc(@TypeOf(@field(@as(Parent, undefined), assoc.field_name)), rows.len) catch
+                return error.OutOfMemory;
+            defer gpa.free(slices);
+            const fill = gpa.alloc(usize, rows.len) catch return error.OutOfMemory;
+            defer gpa.free(fill);
+            const counts = gpa.alloc(usize, rows.len) catch return error.OutOfMemory;
+            defer gpa.free(counts);
+            @memset(counts, 0);
+            const owners = gpa.alloc(usize, joined.items.len) catch return error.OutOfMemory;
+            defer gpa.free(owners);
+            for (joined.items, 0..) |item, child_index| {
+                owners[child_index] = std.math.maxInt(usize);
+                for (rows, 0..) |*parent, parent_index| {
+                    if (keyEqual(ParentKey, item.parent_key, ParentKey, @field(parent, assoc.primary_key))) {
+                        owners[child_index] = parent_index;
+                        counts[parent_index] += 1;
+                        break;
+                    }
+                }
+            }
+            for (rows, 0..) |*parent, parent_index| {
+                slices[parent_index] = gpa.alloc(Child, counts[parent_index]) catch return error.OutOfMemory;
+                fill[parent_index] = 0;
+                @field(parent, assoc.field_name) = slices[parent_index];
+            }
+            for (joined.items, 0..) |*item, child_index| {
+                const owner = owners[child_index];
+                if (owner != std.math.maxInt(usize)) {
+                    slices[owner][fill[owner]] = try value.deepCopy(Child, item.child, gpa);
+                    fill[owner] += 1;
+                }
             }
         }
 

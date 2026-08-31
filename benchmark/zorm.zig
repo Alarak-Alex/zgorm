@@ -65,6 +65,51 @@ const BenchUser = struct {
     };
 };
 
+fn buildQueryOnly(gpa: std.mem.Allocator, i: usize) !void {
+    var session: z.Session = undefined;
+    session.gpa = gpa;
+    const q = gpa.create(z.qb.Query(BenchUser)) catch return error.OutOfMemory;
+    q.* = .{
+        .sess = &session,
+        .arena = std.heap.ArenaAllocator.init(gpa),
+    };
+    var dry = try q
+        .whereEq("score", @as(i64, @intCast(i)))
+        .where("name LIKE $1", .{"user%"})
+        .order_by("id DESC")
+        .limit(10)
+        .dryRun(gpa);
+    dry.deinit();
+}
+
+fn runQueryBuildCase(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    counter: *CountingAllocator,
+    warmup: usize,
+    iterations: usize,
+) !void {
+    for (0..warmup) |i| try buildQueryOnly(gpa, i);
+    const alloc_before = counter.allocations.load(.monotonic);
+    const bytes_before = counter.bytes.load(.monotonic);
+    const cpu_before = cpuMicros();
+    const started = std.Io.Clock.awake.now(io);
+    for (0..iterations) |i| try buildQueryOnly(gpa, i);
+    const elapsed_ns: u128 = @intCast(started.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+    const allocs = counter.allocations.load(.monotonic) - alloc_before;
+    const bytes = counter.bytes.load(.monotonic) - bytes_before;
+    std.debug.print(
+        "{{\"orm\":\"zorm\",\"case\":\"query-build\",\"iterations\":{d},\"ns_per_op\":{d:.3},\"allocations_per_op\":{d:.3},\"bytes_per_op\":{d:.3},\"cpu_us\":{d}}}\n",
+        .{
+            iterations,
+            @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(iterations)),
+            @as(f64, @floatFromInt(allocs)) / @as(f64, @floatFromInt(iterations)),
+            @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(iterations)),
+            cpuMicros() - cpu_before,
+        },
+    );
+}
+
 const Context = struct {
     db: *z.Db,
     gpa: std.mem.Allocator,
@@ -94,6 +139,17 @@ fn setup(ctx: *Context) !void {
         post.* = .{ .user_id = @intCast((i % 1_000) + 1), .title = title };
     }
     try ctx.db.insertBatch(&posts);
+}
+
+fn acquireOnly(ctx: *Context, _: usize) !void {
+    const conn = try ctx.db.pool.acquire();
+    ctx.db.pool.release(conn);
+}
+
+fn acquirePing(ctx: *Context, _: usize) !void {
+    const conn = try ctx.db.pool.acquire();
+    defer ctx.db.pool.release(conn);
+    try conn.ping();
 }
 
 fn primaryKey(ctx: *Context, i: usize) !void {
@@ -278,6 +334,20 @@ fn selected(init: std.process.Init, name: []const u8) bool {
 pub fn main(init: std.process.Init) !void {
     var counter = CountingAllocator{ .backing = init.gpa };
     const gpa = counter.allocator();
+    if (init.environ_map.get("ZORM_BENCH_CASE")) |filter| {
+        if (std.mem.eql(u8, filter, "query-build")) {
+            const iterations = if (init.environ_map.get("ZORM_BENCH_ITERS")) |value|
+                try std.fmt.parseInt(usize, value, 10)
+            else
+                10_000;
+            const warmup = if (init.environ_map.get("ZORM_BENCH_WARMUP")) |value|
+                try std.fmt.parseInt(usize, value, 10)
+            else
+                1_000;
+            try runQueryBuildCase(init.io, gpa, &counter, warmup, iterations);
+            return;
+        }
+    }
     const dsn = init.environ_map.get("ZORM_DSN") orelse "postgres://zorm:zorm@127.0.0.1:5433/zorm?sslmode=disable";
     const iterations = if (init.environ_map.get("ZORM_BENCH_ITERS")) |value|
         try std.fmt.parseInt(usize, value, 10)
@@ -291,16 +361,23 @@ pub fn main(init: std.process.Init) !void {
         try std.fmt.parseInt(usize, value, 10)
     else
         32;
+    const health_check_interval_ms = if (init.environ_map.get("ZORM_BENCH_HEALTH_CHECK_MS")) |value|
+        try std.fmt.parseInt(u64, value, 10)
+    else
+        30_000;
     const db = try z.Db.connectDsnWithOptions(gpa, init.io, dsn, .{
         .max_connections = pool_size,
         .min_idle_connections = @min(pool_size, 4),
         .max_idle_connections = pool_size,
+        .health_check_interval_ms = health_check_interval_ms,
         .cleanup_interval_ms = 1_000,
     });
     defer db.deinit();
     db.setLogger(z.Logger.discard);
     var ctx = Context{ .db = db, .gpa = gpa };
     try setup(&ctx);
+    if (selected(init, "acquire")) try runCase("acquire", &ctx, &counter, warmup, iterations, acquireOnly);
+    if (selected(init, "acquire-ping")) try runCase("acquire-ping", &ctx, &counter, warmup, iterations, acquirePing);
 
     if (selected(init, "primary-key")) try runCase("primary-key", &ctx, &counter, warmup, iterations, primaryKey);
     if (selected(init, "query-10")) try runCase("query-10", &ctx, &counter, warmup, iterations, queryRows(10));
