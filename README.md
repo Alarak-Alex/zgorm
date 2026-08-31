@@ -189,28 +189,37 @@ const authors = try z.query(Author, db).preload("posts.comments").all(gpa);
 
 ```zig
 pub const Author = struct {
-    id: ?i64 = null,
+    base: z.Model = .{},
     name: []const u8 = "",
-    posts: []Post = &.{},                       // has_many field
-    pub const zorm = .{
-        .has_many = .{ .posts = .{ .model = Post, .foreign_key = "author_id" } },
-    };
+    posts: []Post = &.{},                       // inferred has_many
 };
 
 pub const Post = struct {
-    id: ?i64 = null,
-    author_id: ?i64 = null,                     // belongs_to foreign key
+    base: z.Model = .{},
+    author_id: ?i64 = null,
     title: []const u8 = "",
-    author: ?Author = null,                     // belongs_to field
-    tags: []const []const u8 = &.{},            // text[]
-    meta: ?z.Json = null,                       // jsonb
-    pub const zorm = .{
-        .belongs_to = .{ .author = .{ .model = Author, .foreign_key = "author_id" } },
-    };
+    author: ?Author = null,                     // inferred belongs_to
 };
 
-const authors = try z.query(Author, db).preload("posts").all(gpa);   // batch-loaded, no N+1
+// Default inference:
+// Author.posts -> Post.author_id
+// Post.author  -> Post.author_id
+const authors = try z.query(Author, db).preload("posts").all(gpa);
 const posts   = try z.query(Post, db).preload("author").all(gpa);
+
+// Explicit configuration when naming does not follow convention:
+pub const ExplicitAuthor = struct {
+    base: z.Model = .{},
+    posts: []Post = &.{},
+
+    pub const posts_relation = z.hasManyWith(
+        Post,
+        z.AssociationOptions{
+            .foreign_key = "owner_id",
+        },
+    );
+};
+
 ```
 
 ### Model hooks
