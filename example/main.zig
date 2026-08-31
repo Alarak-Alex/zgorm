@@ -8,37 +8,29 @@ const std = @import("std");
 const z = @import("zorm");
 
 pub const User = struct {
-    id: ?i64 = null,
+    base: z.Model = .{},
     name: []const u8 = "",
     email: ?[]const u8 = null,
     age: i32 = 0,
     active: bool = true,
     balance: f64 = 0,
-    created_at: ?z.Time = null,
-    updated_at: ?z.Time = null,
+    posts: []Post = &.{}, // 自动识别为 has_many
 
-    posts: []Post = &.{}, // has_many (filled by preload)
-
-    pub const zorm = .{
-        .unique = .{"email"},
-        .indexes = .{"age"},
-        .has_many = .{ .posts = .{ .model = Post, .foreign_key = "author_id" } },
+    pub const zorm = z.ModelConfig{
+        .unique = &.{"email"},
+        .indexes = &.{"age"},
     };
 };
 
 pub const Post = struct {
-    id: ?i64 = null,
-    author_id: ?i64 = null,
+    base: z.Model = .{},
+    user_id: ?i64 = null,
     title: []const u8 = "",
-    tags: []const []const u8 = &.{}, // text[]
-    scores: []const i64 = &.{}, // bigint[]
-    meta: ?z.Json = null, // jsonb
-    attachment: ?z.Bytes = null, // bytea
-    author: ?User = null, // belongs_to (filled by preload)
-
-    pub const zorm = .{
-        .belongs_to = .{ .author = .{ .model = User, .foreign_key = "author_id" } },
-    };
+    tags: []const []const u8 = &.{},
+    scores: []const i64 = &.{},
+    meta: ?z.Json = null,
+    attachment: ?z.Bytes = null,
+    author: ?User = null, // 自动识别为 belongs_to
 };
 
 const EmbeddedUser = struct {
@@ -85,9 +77,9 @@ pub fn main(init: std.process.Init) !void {
 
     var u = User{ .name = "Alice", .email = "alice@example.com", .age = 30, .balance = 12.5 };
     try db.insert(&u);
-    std.debug.print("inserted id={?d}\n", .{u.id});
+    std.debug.print("inserted id={?d}\n", .{u.base.id});
 
-    const found = (try db.find(User, u.id.?)).?;
+    const found = (try db.find(User, u.base.id.?)).?;
     std.debug.print("found: {s} {s} age={d} active={} balance={d}\n", .{
         found.name, found.email.?, found.age, found.active, found.balance,
     });
@@ -133,7 +125,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "C3", .age = 43 },
     };
     try db.insertBatch(&batch);
-    std.debug.print("batch ids: {d} {d} {d}\n", .{ batch[0].id.?, batch[1].id.?, batch[2].id.? });
+    std.debug.print("batch ids: {?d} {?d} {?d}\n", .{ batch[0].base.id, batch[1].base.id, batch[2].base.id });
 
     const updated = try db.updateWhere(User, .{ .active = false }, "age > $1", .{40});
     std.debug.print("updateWhere affected={d}\n", .{updated});
@@ -148,7 +140,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var rich = Post{
-        .author_id = u.id,
+        .user_id = u.base.id,
         .title = "rich post",
         .tags = &.{ "zig", "orm" },
         .scores = &.{ 5, 4, 5 },

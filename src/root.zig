@@ -61,6 +61,7 @@ pub const SlowQueryLog = observability.SlowQueryLog;
 pub const ErrorClass = observability.ErrorClass;
 pub const LogLevel = logger.LogLevel;
 pub const Time = time.Time;
+pub const ModelConfig = schema.ModelConfig;
 pub const Model = value.Model;
 
 pub const Error = pq.Error;

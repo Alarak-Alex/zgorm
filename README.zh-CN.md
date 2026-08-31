@@ -81,13 +81,10 @@ pub const User = struct {
 
     pub const Status = enum { draft, review, published };
 
-    pub const zorm = .{           // 可选的模型级配置
+    pub const zorm = z.ModelConfig{
         .table = "users",         // 默认取类型名 snake_case
-        .unique = .{"email"},     // 唯一索引（autoMigrate 使用）
-        .indexes = .{"age"},      // 普通索引
-        // .primary_key = "email",
-        // .columns = .{ .isActive = "active" },  // 字段名 -> 列名覆盖
-        // .ignore = .{.transient},               // 忽略字段
+        .unique = &.{"email"},    // 唯一索引（autoMigrate 使用）
+        .indexes = &.{"age"},     // 普通索引
     };
 };
 ```
@@ -185,28 +182,23 @@ const authors = try z.query(Author, db).preload("posts.comments").all(gpa);
 
 ```zig
 pub const Author = struct {
-    id: ?i64 = null,
+    base: z.Model = .{},
     name: []const u8 = "",
-    posts: []Post = &.{},                       // has_many 字段
-    pub const zorm = .{
-        .has_many = .{ .posts = .{ .model = Post, .foreign_key = "author_id" } },
-    };
+    posts: []Post = &.{},                    // 自动识别为 has_many
 };
 
 pub const Post = struct {
-    id: ?i64 = null,
-    author_id: ?i64 = null,                     // belongs_to 外键
+    base: z.Model = .{},
+    author_id: ?i64 = null,
     title: []const u8 = "",
-    author: ?Author = null,                     // belongs_to 字段
-    tags: []const []const u8 = &.{},            // text[]
-    meta: ?z.Json = null,                       // jsonb
-    pub const zorm = .{
-        .belongs_to = .{ .author = .{ .model = Author, .foreign_key = "author_id" } },
-    };
+    author: ?Author = null,                  // 自动识别为 belongs_to
 };
 
-const authors = try z.query(Author, db).preload("posts").all(gpa);   // 批量装配，无 N+1
-const posts   = try z.query(Post, db).preload("author").all(gpa);
+// 默认推导：
+// Author.posts -> Post.author_id
+// Post.author  -> Post.author_id
+const authors = try z.query(Author, db).preload("posts").all(gpa);
+const posts = try z.query(Post, db).preload("author").all(gpa);
 ```
 
 ### 模型 hook

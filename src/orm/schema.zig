@@ -30,6 +30,14 @@ const time_mod = @import("time.zig");
 
 pub const Time = time_mod.Time;
 
+/// Typed model options for editor completion.
+/// Association options remain model-specific anonymous structs.
+pub const ModelConfig = struct {
+    table: []const u8 = "",
+    unique: []const []const u8 = &.{},
+    indexes: []const []const u8 = &.{},
+};
+
 pub const FieldKind = enum {
     integer,
     unsigned,
@@ -38,19 +46,45 @@ pub const FieldKind = enum {
     text,
     time,
     enum_,
-    /// 1-D PostgreSQL arrays, decoded from the array-literal text format.
     int_array,
     uint_array,
     float_array,
     bool_array,
     text_array,
-    /// `zorm.Json` wrapper <-> `jsonb` column.
     jsonb,
-    /// `zorm.Bytes` wrapper <-> `bytea` column.
     bytes,
-    /// User-defined scalar with zormEncode/zormDecode and zormDdl.
     custom,
 };
+
+const InferredAssoc = struct {
+    model: type,
+    kind: Assoc.Kind,
+};
+
+fn inferredAssoc(comptime T: type) ?InferredAssoc {
+    return switch (@typeInfo(T)) {
+        .optional => |o| switch (@typeInfo(o.child)) {
+            .@"struct" => if (@hasDecl(o.child, "__zorm_time") or
+                @hasDecl(o.child, "__zorm_json") or @hasDecl(o.child, "__zorm_bytes"))
+                null
+            else
+                .{ .model = o.child, .kind = .belongs_to },
+            else => null,
+        },
+        .pointer => |p| if (p.size == .slice and @typeInfo(p.child) == .@"struct")
+            .{ .model = p.child, .kind = .has_many }
+        else
+            null,
+        else => null,
+    };
+}
+
+fn modelForeignKey(comptime owner: type, comptime related: type, comptime kind: Assoc.Kind) []const u8 {
+    const model = if (kind == .belongs_to) related else owner;
+    const model_name = @typeName(model);
+    const dot = std.mem.lastIndexOfScalar(u8, model_name, '.') orelse 0;
+    return naming.toSnakeCase(model_name[dot + 1 ..]) ++ "_id";
+}
 
 pub const Column = struct {
     name: []const u8, // SQL column identifier
@@ -285,7 +319,7 @@ pub fn tableOf(comptime T: type) Table {
     const has_opts = @hasDecl(T, "zorm");
     const opts = if (has_opts) T.zorm else .{};
 
-    const table_name: []const u8 = if (@hasField(@TypeOf(opts), "table"))
+    const table_name: []const u8 = if (@hasField(@TypeOf(opts), "table") and opts.table.len > 0)
         opts.table
     else blk: {
         const tn: []const u8 = @typeName(T);
@@ -423,6 +457,18 @@ pub fn tableOf(comptime T: type) Table {
                 }
             }
         }
+        if (!is_assoc) if (inferredAssoc(FT_raw)) |inferred| {
+            const foreign_key = modelForeignKey(T, inferred.model, inferred.kind);
+            assocs = assocs ++ &[_]Assoc{.{
+                .field_name = fname,
+                .model = inferred.model,
+                .foreign_key = foreign_key,
+                .foreign_keys = &.{foreign_key},
+                .primary_keys = &.{"id"},
+                .kind = inferred.kind,
+            }};
+            is_assoc = true;
+        };
         if (is_assoc) continue;
 
         // Skip fields listed in `.ignore`.
@@ -518,6 +564,37 @@ const Custom = struct {
         .indexes = .{"lastSeen"},
     };
 };
+
+const TypedOptions = struct {
+    id: ?i64 = null,
+    email: []const u8 = "",
+    pub const zorm = ModelConfig{
+        .table = "typed_options",
+        .unique = &.{"email"},
+    };
+};
+
+const InferredChild = struct {
+    id: ?i64 = null,
+    person_id: ?i64 = null,
+};
+
+const InferredParent = struct {
+    id: ?i64 = null,
+    children: []InferredChild = &.{},
+};
+
+test "typed options and convention associations" {
+    const configured = comptime tableOf(TypedOptions);
+    try testing.expectEqualStrings("typed_options", configured.name);
+    try testing.expectEqualStrings("email", configured.unique[0]);
+
+    const inferred = comptime tableOf(InferredParent);
+    try testing.expectEqual(@as(usize, 1), inferred.assocs.len);
+    try testing.expectEqual(Assoc.Kind.has_many, inferred.assocs[0].kind);
+    try testing.expectEqual(InferredChild, inferred.assocs[0].model);
+    try testing.expectEqualStrings("inferred_parent_id", inferred.assocs[0].foreign_key);
+}
 
 test "table reflection with conventions" {
     const t = comptime tableOf(Simple);

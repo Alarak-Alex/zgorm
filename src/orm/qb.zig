@@ -932,12 +932,14 @@ fn loadSingleAssoc(
     const child_table = comptime schema.tableOf(Child);
     const parent_key = if (comptime assoc.kind == .belongs_to) assoc.foreign_key else assoc.primary_key;
     const child_key = if (comptime assoc.kind == .belongs_to) assoc.primary_key else assoc.foreign_key;
-    const ParentKey = FieldOfT(M, parent_key);
+    const parent_col = comptime ColumnOfT(M, parent_key);
+    const child_col = comptime ColumnOfT(Child, child_key);
+    const ParentKey = value.columnFieldType(M, parent_col);
 
     var keys: std.ArrayList(ParentKey) = .empty;
     defer keys.deinit(gpa);
     for (rows) |*parent| {
-        const key = @field(parent, parent_key);
+        const key = value.getColumn(parent, parent_col);
         if (keyPresent(ParentKey, key)) keys.append(gpa, key) catch return error.OutOfMemory;
     }
     if (keys.items.len == 0) {
@@ -980,10 +982,10 @@ fn loadSingleAssoc(
                 owners[child_index] = std.math.maxInt(usize);
                 for (rows, 0..) |*parent, parent_index| {
                     if (keyEqual(
-                        @TypeOf(@field(child, child_key)),
-                        @field(child, child_key),
+                        value.columnFieldType(Child, child_col),
+                        value.getColumn(child, child_col),
                         ParentKey,
-                        @field(parent, parent_key),
+                        value.getColumn(parent, parent_col),
                     )) {
                         owners[child_index] = parent_index;
                         counts[parent_index] += 1;
@@ -1009,10 +1011,10 @@ fn loadSingleAssoc(
                 @field(parent, assoc.field_name) = null;
                 for (children.items) |*child| {
                     if (keyEqual(
-                        @TypeOf(@field(child, child_key)),
-                        @field(child, child_key),
+                        value.columnFieldType(Child, child_col),
+                        value.getColumn(child, child_col),
                         ParentKey,
-                        @field(parent, parent_key),
+                        value.getColumn(parent, parent_col),
                     )) {
                         @field(parent, assoc.field_name) = try value.deepCopy(Child, child.*, gpa);
                         break;
@@ -1391,12 +1393,18 @@ fn asI64(comptime FT: type, v: FT) ?i64 {
     };
 }
 
-/// Resolves the struct field type `name` on model `M`.
-pub fn FieldOfT(comptime M: type, comptime name: []const u8) type {
-    inline for (@typeInfo(M).@"struct".fields) |f| {
-        if (comptime std.mem.eql(u8, f.name, name)) return f.type;
+/// Resolves a model column by Zig field name or SQL column name.
+pub fn ColumnOfT(comptime M: type, comptime name: []const u8) schema.Column {
+    inline for (schema.tableOf(M).columns) |column| {
+        if (comptime std.mem.eql(u8, column.field_name, name) or
+            std.mem.eql(u8, column.name, name)) return column;
     }
     @compileError("zorm: model " ++ @typeName(M) ++ " has no field " ++ name);
+}
+
+/// Resolves the leaf field type, including embedded model fields.
+pub fn FieldOfT(comptime M: type, comptime name: []const u8) type {
+    return value.columnFieldType(M, ColumnOfT(M, name));
 }
 
 /// A compile-time quoted SQL identifier. Model and column metadata are

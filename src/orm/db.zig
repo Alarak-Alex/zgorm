@@ -52,6 +52,13 @@ fn retryDelay(d: *Db, options: RetryOptions, failure_index: u8) void {
     const delay_ms = floor + random % (cap - floor + 1);
     d.io.sleep(.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
 }
+fn associationColumn(comptime M: type, comptime name: []const u8) schema.Column {
+    inline for (schema.tableOf(M).columns) |column| {
+        if (comptime std.mem.eql(u8, column.field_name, name) or
+            std.mem.eql(u8, column.name, name)) return column;
+    }
+    @compileError("zorm: association primary key '" ++ name ++ "' is not a model column");
+}
 
 pub fn Association(comptime M: type, comptime field_name: []const u8) type {
     const assoc = comptime schema.tableOf(M).assoc(field_name) orelse
@@ -69,11 +76,11 @@ pub fn Association(comptime M: type, comptime field_name: []const u8) type {
                     try qb_mod.quoteIdent(arena_state.allocator(), assoc.join_table),
                     try qb_mod.quoteIdent(arena_state.allocator(), assoc.join_foreign_key),
                 }) catch return error.OutOfMemory;
-                var res = try a.sess.exec(sql, .{@field(a.parent, assoc.primary_key)});
+                var res = try a.sess.exec(sql, .{value.getColumn(a.parent, associationColumn(M, assoc.primary_key))});
                 defer res.deinit();
                 return try value.decodeCell(i64, res.rows[0][0], res.columns[0].type_oid, res.columns[0].format, a.sess.gpa);
             }
-            var query = a.sess.query(Child).whereEq(assoc.foreign_key, @field(a.parent, assoc.primary_key));
+            var query = a.sess.query(Child).whereEq(assoc.foreign_key, value.getColumn(a.parent, associationColumn(M, assoc.primary_key)));
             if (assoc.polymorphic_type.len > 0)
                 query = query.whereEq(assoc.polymorphic_type, assoc.polymorphic_value);
             return query.count();
@@ -81,7 +88,7 @@ pub fn Association(comptime M: type, comptime field_name: []const u8) type {
 
         pub fn append(a: *@This(), child: *Child) Error!void {
             if (assoc.kind != .many_to_many) {
-                const parent_key = @field(a.parent, assoc.primary_key);
+                const parent_key = value.getColumn(a.parent, associationColumn(M, assoc.primary_key));
                 switch (@typeInfo(@TypeOf(parent_key))) {
                     .optional => {
                         const key = parent_key orelse return error.TypeMismatch;
