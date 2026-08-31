@@ -31,11 +31,11 @@ const time_mod = @import("time.zig");
 pub const Time = time_mod.Time;
 
 /// Typed model options for editor completion.
-/// Association options remain model-specific anonymous structs.
 pub const ModelConfig = struct {
     table: []const u8 = "",
     unique: []const []const u8 = &.{},
     indexes: []const []const u8 = &.{},
+    associations: []const AssociationConfig = &.{},
 };
 
 pub const FieldKind = enum {
@@ -123,6 +123,23 @@ pub const Assoc = struct {
     polymorphic_value: []const u8 = "",
     cascade_delete: bool = false,
     kind: Kind,
+};
+/// Typed association entry used by `ModelConfig`.
+pub const AssociationConfig = struct {
+    field: []const u8,
+    model: type,
+    kind: Assoc.Kind,
+    foreign_key: []const u8 = "",
+    primary_key: []const u8 = "id",
+    foreign_keys: []const []const u8 = &.{},
+    primary_keys: []const []const u8 = &.{},
+    join_table: []const u8 = "",
+    join_foreign_key: []const u8 = "",
+    join_association_key: []const u8 = "",
+    association_key: []const u8 = "id",
+    polymorphic_type: []const u8 = "",
+    polymorphic_value: []const u8 = "",
+    cascade_delete: bool = false,
 };
 
 pub const Table = struct {
@@ -369,8 +386,35 @@ pub fn tableOf(comptime T: type) Table {
             continue;
         }
 
-        // Association fields are handled by preload, not as columns.
         comptime var is_assoc = false;
+        if (@hasField(@TypeOf(opts), "associations")) {
+            inline for (opts.associations) |cfg| {
+                if (comptime std.mem.eql(u8, cfg.field, fname)) {
+                    const foreign_key = if (cfg.foreign_key.len > 0) cfg.foreign_key else modelForeignKey(T, cfg.model, cfg.kind);
+                    const foreign_keys = if (cfg.foreign_keys.len > 0) cfg.foreign_keys else &.{foreign_key};
+                    const primary_keys = if (cfg.primary_keys.len > 0) cfg.primary_keys else &.{cfg.primary_key};
+                    assocs = assocs ++ &[_]Assoc{.{
+                        .field_name = fname,
+                        .model = cfg.model,
+                        .foreign_key = foreign_key,
+                        .primary_key = cfg.primary_key,
+                        .foreign_keys = foreign_keys,
+                        .primary_keys = primary_keys,
+                        .join_table = cfg.join_table,
+                        .join_foreign_key = cfg.join_foreign_key,
+                        .join_association_key = cfg.join_association_key,
+                        .association_key = cfg.association_key,
+                        .polymorphic_type = cfg.polymorphic_type,
+                        .polymorphic_value = cfg.polymorphic_value,
+                        .cascade_delete = cfg.cascade_delete,
+                        .kind = cfg.kind,
+                    }};
+                    is_assoc = true;
+                }
+            }
+        }
+
+        // Association fields are handled by preload, not as columns.
         if (@hasField(@TypeOf(opts), "belongs_to")) {
             inline for (@typeInfo(@TypeOf(opts.belongs_to)).@"struct".fields) |af| {
                 if (comptime std.mem.eql(u8, af.name, fname)) {
@@ -582,6 +626,17 @@ const InferredChild = struct {
 const InferredParent = struct {
     id: ?i64 = null,
     children: []InferredChild = &.{},
+
+    pub const zorm = ModelConfig{
+        .associations = &.{
+            .{
+                .field = "children",
+                .model = InferredChild,
+                .kind = .has_many,
+                .foreign_key = "person_id",
+            },
+        },
+    };
 };
 
 test "typed options and convention associations" {
@@ -593,7 +648,7 @@ test "typed options and convention associations" {
     try testing.expectEqual(@as(usize, 1), inferred.assocs.len);
     try testing.expectEqual(Assoc.Kind.has_many, inferred.assocs[0].kind);
     try testing.expectEqual(InferredChild, inferred.assocs[0].model);
-    try testing.expectEqualStrings("inferred_parent_id", inferred.assocs[0].foreign_key);
+    try testing.expectEqualStrings("person_id", inferred.assocs[0].foreign_key);
 }
 
 test "table reflection with conventions" {

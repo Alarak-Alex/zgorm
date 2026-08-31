@@ -201,6 +201,26 @@ const authors = try z.query(Author, db).preload("posts").all(gpa);
 const posts = try z.query(Post, db).preload("author").all(gpa);
 ```
 
+不符合命名约定时，可以使用类型化配置显式声明关联：
+
+```zig
+pub const Author = struct {
+    base: z.Model = .{},
+    posts: []Post = &.{},
+
+    pub const zorm = z.ModelConfig{
+        .associations = &.{
+            .{
+                .field = "posts",
+                .model = Post,
+                .kind = .has_many,
+                .foreign_key = "owner_id",
+            },
+        },
+    };
+};
+```
+
 ### 模型 hook
 
 ```zig
