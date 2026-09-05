@@ -5,10 +5,10 @@
 //! Defaults to the local dev container on 127.0.0.1:5433.
 
 const std = @import("std");
-const z = @import("zorm");
+const zg = @import("zgorm");
 
 pub const User = struct {
-    base: z.Model = .{},
+    base: zg.Model = .{},
     name: []const u8 = "",
     email: ?[]const u8 = null,
     age: i32 = 0,
@@ -16,20 +16,20 @@ pub const User = struct {
     balance: f64 = 0,
     posts: []Post = &.{}, // 自动识别为 has_many
 
-    pub const zorm = z.ModelConfig{
+    pub const zgorm = zg.ModelConfig{
         .unique = &.{"email"},
         .indexes = &.{"age"},
     };
 };
 
 pub const Post = struct {
-    base: z.Model = .{},
+    base: zg.Model = .{},
     user_id: ?i64 = null,
     title: []const u8 = "",
     tags: []const []const u8 = &.{},
     scores: []const i64 = &.{},
-    meta: ?z.Json = null,
-    attachment: ?z.Bytes = null,
+    meta: ?zg.Json = null,
+    attachment: ?zg.Bytes = null,
     author: ?User = null, // 自动识别为 belongs_to
 };
 
@@ -38,22 +38,22 @@ const EmbeddedUser = struct {
     name: []const u8 = "",
     active: bool = true,
 
-    pub const zorm = .{ .table = "embedded_users" };
+    pub const zgorm = .{ .table = "embedded_users" };
 };
 
 fn sqliteDemo(gpa: std.mem.Allocator) !void {
-    const raw = try z.drivers.sqlite.Db.open(gpa, ":memory:");
+    const raw = try zg.drivers.sqlite.Db.open(gpa, ":memory:");
     defer raw.deinit();
-    var db = z.drivers.sqlite.orm(raw);
+    var db = zg.drivers.sqlite.orm(raw);
     try db.autoMigrate(EmbeddedUser);
     var user = EmbeddedUser{ .name = "SQLite" };
     try db.insert(&user);
     const found = (try db.find(EmbeddedUser, user.id.?, gpa)).?;
-    defer z.free(EmbeddedUser, found, gpa);
+    defer zg.free(EmbeddedUser, found, gpa);
     std.debug.print("sqlite typed ORM: id={d} name={s}\n", .{ user.id.?, found.name });
 }
 
-fn insertRetried(user: *User, tx: *z.Tx) z.Error!void {
+fn insertRetried(user: *User, tx: *zg.Tx) zg.Error!void {
     try tx.insert(user);
 }
 
@@ -64,9 +64,9 @@ pub fn main(init: std.process.Init) !void {
 
     const dsn = init.environ_map.get("ZORM_DSN") orelse
         "postgres://zorm:zorm@127.0.0.1:5433/zorm?sslmode=disable";
-    const db = try z.Db.connectDsn(gpa, io, dsn, 8);
+    const db = try zg.Db.connectDsn(gpa, io, dsn, 8);
     defer db.deinit();
-    var plugin_metrics: z.PluginMetrics = .{};
+    var plugin_metrics: zg.PluginMetrics = .{};
     try db.addPlugin(plugin_metrics.plugin());
 
     var dropped = try db.execRaw("DROP TABLE IF EXISTS \"user\" CASCADE");
@@ -83,21 +83,21 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("found: {s} {s} age={d} active={} balance={d}\n", .{
         found.name, found.email.?, found.age, found.active, found.balance,
     });
-    defer z.free(User, found, gpa);
+    defer zg.free(User, found, gpa);
 
     var upd = found;
     upd.age = 31;
     _ = try db.update(&upd);
 
-    const users = try z.query(User, db)
+    const users = try zg.query(User, db)
         .where("age >= $1", .{18})
         .whereEq("active", true)
         .order_by("created_at DESC")
         .all(gpa);
-    defer z.freeSlice(User, users, gpa);
+    defer zg.freeSlice(User, users, gpa);
     std.debug.print("query all: {d} rows, first={s}\n", .{ users.len, users[0].name });
 
-    const n = try z.query(User, db).where("age > $1", .{20}).count();
+    const n = try zg.query(User, db).where("age > $1", .{20}).count();
     std.debug.print("count(age>20)={d}\n", .{n});
 
     // Transaction: insert + rollback.
@@ -107,7 +107,7 @@ pub fn main(init: std.process.Init) !void {
         var ghost = User{ .name = "Ghost", .age = 99 };
         try tx.insert(&ghost);
     }
-    const ghosts = try z.query(User, db).where("name = $1", .{"Ghost"}).count();
+    const ghosts = try zg.query(User, db).where("name = $1", .{"Ghost"}).count();
     std.debug.print("ghosts after rollback={d}\n", .{ghosts});
 
     // Explicit whole-transaction retry; ordinary writes are never replayed.
@@ -133,7 +133,7 @@ pub fn main(init: std.process.Init) !void {
     const deleted = try db.deleteWhere(User, "age >= $1", .{40});
     std.debug.print("deleteWhere affected={d}\n", .{deleted});
 
-    var one = try z.query(User, db).whereEq("name", "Bob").first();
+    var one = try zg.query(User, db).whereEq("name", "Bob").first();
     if (one) |*b| {
         _ = try db.delete(b);
         std.debug.print("deleted Bob\n", .{});
@@ -144,14 +144,14 @@ pub fn main(init: std.process.Init) !void {
         .title = "rich post",
         .tags = &.{ "zig", "orm" },
         .scores = &.{ 5, 4, 5 },
-        .meta = z.Json{ .data = "{\"views\": 42}" },
-        .attachment = z.Bytes{ .data = "bin" },
+        .meta = zg.Json{ .data = "{\"views\": 42}" },
+        .attachment = zg.Bytes{ .data = "bin" },
     };
     try db.insert(&rich);
 
     // Associations + preloading (posts rendered with arrays/jsonb columns).
-    const with_posts = try z.query(User, db).preload("posts").all(gpa);
-    defer z.freeSlice(User, with_posts, gpa);
+    const with_posts = try zg.query(User, db).preload("posts").all(gpa);
+    defer zg.freeSlice(User, with_posts, gpa);
     for (with_posts) |usr| {
         std.debug.print("{s} has {d} post(s)\n", .{ usr.name, usr.posts.len });
         for (usr.posts) |p| {
@@ -159,18 +159,18 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const preloaded = try z.query(Post, db).preload("author").whereEq("title", "rich post").first();
+    const preloaded = try zg.query(Post, db).preload("author").whereEq("title", "rich post").first();
     if (preloaded) |p| {
         std.debug.print("preloaded post author: {s}\n", .{p.author.?.name});
-        z.free(Post, p, gpa);
+        zg.free(Post, p, gpa);
     }
 
-    const total = try z.query(User, db).count();
+    const total = try zg.query(User, db).count();
     std.debug.print("total={d}\n", .{total});
     std.debug.print("observed queries={d} mutations={d}\n", .{
         plugin_metrics.queries.load(.monotonic),
         plugin_metrics.mutations.load(.monotonic),
     });
-    z.free(User, one.?, gpa);
+    zg.free(User, one.?, gpa);
     std.debug.print("smoke OK\n", .{});
 }

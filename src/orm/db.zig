@@ -57,12 +57,12 @@ fn associationColumn(comptime M: type, comptime name: []const u8) schema.Column 
         if (comptime std.mem.eql(u8, column.field_name, name) or
             std.mem.eql(u8, column.name, name)) return column;
     }
-    @compileError("zorm: association primary key '" ++ name ++ "' is not a model column");
+    @compileError("zgorm: association primary key '" ++ name ++ "' is not a model column");
 }
 
 pub fn Association(comptime M: type, comptime field_name: []const u8) type {
     const assoc = comptime schema.tableOf(M).assoc(field_name) orelse
-        @compileError("zorm: unknown association " ++ field_name);
+        @compileError("zgorm: unknown association " ++ field_name);
     const Child = assoc.model;
     return struct {
         sess: Session,
@@ -556,7 +556,7 @@ pub const Session = struct {
     pub fn insert(s: *Session, m: anytype) Error!void {
         const MP = @typeInfo(@TypeOf(m));
         if (MP != .pointer or MP.pointer.size != .one or MP.pointer.is_const)
-            @compileError("zorm: insert expects a mutable pointer to a model, e.g. db.insert(&user)");
+            @compileError("zgorm: insert expects a mutable pointer to a model, e.g. db.insert(&user)");
         const T = MP.pointer.child;
         const table = comptime schema.tableOf(T);
 
@@ -632,14 +632,14 @@ pub const Session = struct {
         comptime R: type,
         comptime fields: []const []const u8,
     ) Error!R {
-        if (fields.len == 0) @compileError("zorm: insertReturning requires at least one field");
+        if (fields.len == 0) @compileError("zgorm: insertReturning requires at least one field");
         const MP = @typeInfo(@TypeOf(m));
         if (MP != .pointer or MP.pointer.size != .one or MP.pointer.is_const)
-            @compileError("zorm: insertReturning expects a mutable model pointer");
+            @compileError("zgorm: insertReturning expects a mutable model pointer");
         const T = MP.pointer.child;
         const table = comptime schema.tableOf(T);
         inline for (fields) |name| {
-            if (comptime !table.hasColumn(name)) @compileError("zorm: unknown RETURNING column " ++ name);
+            if (comptime !table.hasColumn(name)) @compileError("zgorm: unknown RETURNING column " ++ name);
         }
 
         try callHook(T, "beforeSave", m, s);
@@ -716,7 +716,7 @@ pub const Session = struct {
             if (P == .pointer and P.pointer.size == .slice and !P.pointer.is_const) break :blk @TypeOf(models);
             if (P == .pointer and P.pointer.size == .one and @typeInfo(P.pointer.child) == .array and !P.pointer.is_const)
                 break :blk []@typeInfo(P.pointer.child).array.child;
-            @compileError("zorm: insertBatchReturning expects a mutable slice");
+            @compileError("zgorm: insertBatchReturning expects a mutable slice");
         };
         const list: Items = models;
         const out = s.gpa.alloc(R, list.len) catch return error.OutOfMemory;
@@ -747,17 +747,17 @@ pub const Session = struct {
     pub fn upsert(s: *Session, m: anytype, comptime conflict: OnConflict) Error!bool {
         const MP = @typeInfo(@TypeOf(m));
         if (MP != .pointer or MP.pointer.size != .one)
-            @compileError("zorm: upsert expects a pointer to a model");
+            @compileError("zgorm: upsert expects a pointer to a model");
         const T = MP.pointer.child;
         const table = comptime schema.tableOf(T);
         inline for (conflict.columns) |name| {
-            if (comptime !table.hasColumn(name)) @compileError("zorm: unknown conflict column " ++ name);
+            if (comptime !table.hasColumn(name)) @compileError("zgorm: unknown conflict column " ++ name);
         }
         inline for (conflict.update) |name| {
-            if (comptime !table.hasColumn(name)) @compileError("zorm: unknown upsert update column " ++ name);
+            if (comptime !table.hasColumn(name)) @compileError("zgorm: unknown upsert update column " ++ name);
         }
         if (conflict.update.len > 0 and conflict.columns.len == 0 and table.pk_indexes.len == 0)
-            @compileError("zorm: ON CONFLICT DO UPDATE requires conflict columns or a primary key");
+            @compileError("zgorm: ON CONFLICT DO UPDATE requires conflict columns or a primary key");
 
         try callHook(T, "beforeSave", m, s);
         try callHook(T, "beforeCreate", m, s);
@@ -852,7 +852,7 @@ pub const Session = struct {
             if (P == .pointer and P.pointer.size == .slice and !P.pointer.is_const) break :blk @TypeOf(models);
             if (P == .pointer and P.pointer.size == .one and @typeInfo(P.pointer.child) == .array and !P.pointer.is_const)
                 break :blk []@typeInfo(P.pointer.child).array.child;
-            @compileError("zorm: upsertBatch expects a mutable slice");
+            @compileError("zgorm: upsertBatch expects a mutable slice");
         };
         const list: Items = models;
         if (s.pinned != null) {
@@ -875,7 +875,7 @@ pub const Session = struct {
             if (P == .pointer and P.pointer.size == .slice) break :blk @TypeOf(models);
             if (P == .pointer and P.pointer.size == .one and @typeInfo(P.pointer.child) == .array)
                 break :blk []@typeInfo(P.pointer.child).array.child;
-            @compileError("zorm: insertBatch expects a slice, e.g. db.insertBatch(&users)");
+            @compileError("zgorm: insertBatch expects a slice, e.g. db.insertBatch(&users)");
         };
         const list: Items = models;
         const T = @typeInfo(Items).pointer.child;
@@ -1007,7 +1007,7 @@ pub const Session = struct {
             if (P == .pointer and P.pointer.size == .slice and !P.pointer.is_const) break :blk @TypeOf(models);
             if (P == .pointer and P.pointer.size == .one and @typeInfo(P.pointer.child) == .array and !P.pointer.is_const)
                 break :blk []@typeInfo(P.pointer.child).array.child;
-            @compileError("zorm: updateBatch expects a mutable slice, e.g. db.updateBatch(&users)");
+            @compileError("zgorm: updateBatch expects a mutable slice, e.g. db.updateBatch(&users)");
         };
         const list: Items = models;
         if (s.pinned != null) {
@@ -1024,11 +1024,11 @@ pub const Session = struct {
     fn updateImpl(s: *Session, m: anytype, comptime unscoped: bool) Error!i64 {
         const MP = @typeInfo(@TypeOf(m));
         if (MP != .pointer or MP.pointer.size != .one or MP.pointer.is_const)
-            @compileError("zorm: update expects a mutable pointer to a model, e.g. db.update(&user)");
+            @compileError("zgorm: update expects a mutable pointer to a model, e.g. db.update(&user)");
         const T = MP.pointer.child;
         const table = comptime schema.tableOf(T);
         if (table.pk_indexes.len == 0)
-            @compileError("zorm: model has no primary key; declare one via `primary_key` or `primary_keys`");
+            @compileError("zgorm: model has no primary key; declare one via `primary_key` or `primary_keys`");
         inline for (table.pk_indexes) |pk_index| {
             if (isZeroValue(value.getColumn(m, table.columns[pk_index]))) return error.NullValue;
         }
@@ -1116,7 +1116,7 @@ pub const Session = struct {
     pub fn delete(s: *Session, m: anytype) Error!i64 {
         const MP = @typeInfo(@TypeOf(m));
         if (MP != .pointer or MP.pointer.size != .one)
-            @compileError("zorm: delete expects a pointer to a model");
+            @compileError("zgorm: delete expects a pointer to a model");
         const T = MP.pointer.child;
         const table = comptime schema.tableOf(T);
         try validateModelPrimaryKey(T, m, table);
@@ -1172,7 +1172,7 @@ pub const Session = struct {
     pub fn deleteHard(s: *Session, m: anytype) Error!i64 {
         const MP = @typeInfo(@TypeOf(m));
         if (MP != .pointer or MP.pointer.size != .one)
-            @compileError("zorm: deleteHard expects a pointer to a model");
+            @compileError("zgorm: deleteHard expects a pointer to a model");
         const T = MP.pointer.child;
         const table = comptime schema.tableOf(T);
         try validateModelPrimaryKey(T, m, table);
@@ -1203,11 +1203,11 @@ pub const Session = struct {
     pub fn restore(s: *Session, m: anytype) Error!i64 {
         const MP = @typeInfo(@TypeOf(m));
         if (MP != .pointer or MP.pointer.size != .one)
-            @compileError("zorm: restore expects a pointer to a model");
+            @compileError("zgorm: restore expects a pointer to a model");
         const T = MP.pointer.child;
         const table = comptime schema.tableOf(T);
-        if (table.deleted_at_index == null) @compileError("zorm: restore requires a deleted_at column");
-        if (table.pk_index == null) @compileError("zorm: model has no primary key");
+        if (table.deleted_at_index == null) @compileError("zgorm: restore requires a deleted_at column");
+        if (table.pk_index == null) @compileError("zgorm: model has no primary key");
         const pkc = table.columns[table.pk_index.?];
         const del_col = table.columns[table.deleted_at_index.?];
         if (isZeroValue(value.getColumn(m, pkc))) return error.NullValue;
@@ -1297,7 +1297,7 @@ pub const Session = struct {
             inline for (table.columns) |col| {
                 if (comptime std.mem.eql(u8, col.field_name, f.name)) col_name = col.name;
             }
-            if (col_name == null) @compileError("zorm: updateWhere set field '" ++ f.name ++ "' is not a column of " ++ @typeName(T));
+            if (col_name == null) @compileError("zgorm: updateWhere set field '" ++ f.name ++ "' is not a column of " ++ @typeName(T));
             w.print("{s} = ${d}", .{ try qb_mod.quoteIdent(arena, col_name.?), i + 1 }) catch return error.OutOfMemory;
             params.append(arena, try value.toParam(@field(sets, f.name), arena)) catch return error.OutOfMemory;
         }
@@ -1319,7 +1319,7 @@ pub const Session = struct {
 
     /// Fetches one model by primary key, or null.
     /// Returned strings are allocated with the session's gpa; release them
-    /// with `zorm.free(T, value, gpa)` or decode into an arena of your own.
+    /// with `zgorm.free(T, value, gpa)` or decode into an arena of your own.
     /// Fetches one model by primary key, excluding soft-deleted rows
     /// (models with a `deleted_at` column). Use `findUnscoped` to include them.
     pub fn find(s: *Session, comptime T: type, pk: anytype) Error!?T {
@@ -1333,7 +1333,7 @@ pub const Session = struct {
 
     fn findImpl(s: *Session, comptime T: type, pk: anytype, comptime unscoped: bool) Error!?T {
         const table = comptime schema.tableOf(T);
-        if (table.pk_indexes.len == 0) @compileError("zorm: model has no primary key");
+        if (table.pk_indexes.len == 0) @compileError("zgorm: model has no primary key");
 
         var arena_state = std.heap.ArenaAllocator.init(s.gpa);
 
@@ -1362,9 +1362,9 @@ pub const Session = struct {
     /// need no manual cleanup.
     pub fn query(s: *Session, comptime T: type) *Query(T) {
         const gpa = s.gpa;
-        const sess_copy = gpa.create(Session) catch @panic("zorm: out of memory");
+        const sess_copy = gpa.create(Session) catch @panic("zgorm: out of memory");
         sess_copy.* = s.*;
-        const q = gpa.create(Query(T)) catch @panic("zorm: out of memory");
+        const q = gpa.create(Query(T)) catch @panic("zgorm: out of memory");
         q.* = .{
             .sess = sess_copy,
             .owns_session = true,
@@ -1609,7 +1609,7 @@ pub const Session = struct {
     }
 
     fn validateModelPrimaryKey(comptime T: type, m: *T, comptime table: schema.Table) Error!void {
-        if (table.pk_indexes.len == 0) @compileError("zorm: model has no primary key");
+        if (table.pk_indexes.len == 0) @compileError("zgorm: model has no primary key");
         inline for (table.pk_indexes) |pk_index| {
             if (isZeroValue(value.getColumn(m, table.columns[pk_index]))) return error.NullValue;
         }
@@ -1677,7 +1677,7 @@ pub const Tx = struct {
         errdefer t.sess.savepoint_depth -= 1;
 
         var sp = Tx{ .sess = t.sess, .is_savepoint = true };
-        const name = std.fmt.bufPrint(&sp.sp_name_buf, "zorm_sp_{d}", .{t.sess.savepoint_depth}) catch
+        const name = std.fmt.bufPrint(&sp.sp_name_buf, "zgorm_sp_{d}", .{t.sess.savepoint_depth}) catch
             unreachable;
         sp.sp_name_len = name.len;
 
@@ -1825,7 +1825,7 @@ pub const Tx = struct {
     }
     pub fn query(t: *Tx, comptime T: type) *Query(T) {
         const gpa = t.sess.gpa;
-        const q = gpa.create(Query(T)) catch @panic("zorm: out of memory");
+        const q = gpa.create(Query(T)) catch @panic("zgorm: out of memory");
         q.* = .{
             .sess = t.sess,
             .owns_session = false,

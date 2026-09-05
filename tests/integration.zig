@@ -3,7 +3,7 @@
 //! Without ZORM_DSN the tests are skipped.
 
 const std = @import("std");
-const z = @import("zorm");
+const zg = @import("zgorm");
 const test_options = @import("test_options");
 
 const User = struct {
@@ -13,10 +13,10 @@ const User = struct {
     age: i32 = 0,
     active: bool = true,
     balance: f64 = 0,
-    created_at: ?z.Time = null,
-    updated_at: ?z.Time = null,
+    created_at: ?zg.Time = null,
+    updated_at: ?zg.Time = null,
 
-    pub const zorm = .{ .unique = .{"email"}, .indexes = .{"age"} };
+    pub const zgorm = .{ .unique = .{"email"}, .indexes = .{"age"} };
 };
 
 const Post = struct {
@@ -28,31 +28,31 @@ const Post = struct {
     published: bool = false,
     rating: f32 = 0,
     status: Status = .draft,
-    created_at: ?z.Time = null,
+    created_at: ?zg.Time = null,
 
     pub const Status = enum { draft, review, published };
 
-    pub const zorm = .{ .indexes = .{"author_id"} };
+    pub const zgorm = .{ .indexes = .{"author_id"} };
 };
 
 const StreamRow = struct {
     id: ?i64 = null,
     name: []const u8 = "",
-    pub const zorm = .{ .table = "zorm_stream_rows" };
+    pub const zgorm = .{ .table = "zgorm_stream_rows" };
 };
 
 const VersionedRow = struct {
     id: ?i64 = null,
     name: []const u8 = "",
     version: i64 = 0,
-    pub const zorm = .{ .table = "zorm_versioned_rows" };
+    pub const zgorm = .{ .table = "zgorm_versioned_rows" };
 };
 
 const ExplicitVersionRow = struct {
     id: ?i64 = null,
     name: []const u8 = "",
     lock_version: i64 = 0,
-    pub const zorm = .{ .table = "zorm_explicit_version_rows", .version = "lock_version" };
+    pub const zgorm = .{ .table = "zgorm_explicit_version_rows", .version = "lock_version" };
 };
 
 const UpsertRow = struct {
@@ -60,7 +60,7 @@ const UpsertRow = struct {
     email: []const u8 = "",
     name: []const u8 = "",
     note: []const u8 = "",
-    pub const zorm = .{ .table = "zorm_upsert_rows", .unique = &.{"email"} };
+    pub const zgorm = .{ .table = "zgorm_upsert_rows", .unique = &.{"email"} };
 };
 
 const ReturningProjection = struct {
@@ -72,8 +72,8 @@ const CompositeRow = struct {
     tenant_id: i64,
     code: []const u8,
     name: []const u8 = "",
-    pub const zorm = .{
-        .table = "zorm_composite_rows",
+    pub const zgorm = .{
+        .table = "zgorm_composite_rows",
         .primary_keys = &.{ "tenant_id", "code" },
     };
 };
@@ -83,7 +83,7 @@ const CompositeChild = struct {
     tenant_id: i64,
     parent_code: []const u8,
     body: []const u8 = "",
-    pub const zorm = .{ .table = "zorm_composite_children" };
+    pub const zgorm = .{ .table = "zgorm_composite_children" };
 };
 
 const CompositeParent = struct {
@@ -91,8 +91,8 @@ const CompositeParent = struct {
     code: []const u8,
     name: []const u8 = "",
     children: []CompositeChild = &.{},
-    pub const zorm = .{
-        .table = "zorm_composite_parents",
+    pub const zgorm = .{
+        .table = "zgorm_composite_parents",
         .primary_keys = &.{ "tenant_id", "code" },
         .has_many = .{
             .children = .{
@@ -108,7 +108,7 @@ const AssocProfile = struct {
     id: ?i64 = null,
     owner_id: ?i64 = null,
     bio: []const u8 = "",
-    pub const zorm = .{ .table = "zorm_assoc_profiles" };
+    pub const zgorm = .{ .table = "zgorm_assoc_profiles" };
 };
 
 const AssocNote = struct {
@@ -116,13 +116,13 @@ const AssocNote = struct {
     owner_id: ?i64 = null,
     owner_type: []const u8 = "",
     body: []const u8 = "",
-    pub const zorm = .{ .table = "zorm_assoc_notes" };
+    pub const zgorm = .{ .table = "zgorm_assoc_notes" };
 };
 
 const AssocTag = struct {
     id: ?i64 = null,
     name: []const u8 = "",
-    pub const zorm = .{ .table = "zorm_assoc_tags" };
+    pub const zgorm = .{ .table = "zgorm_assoc_tags" };
 };
 
 const AssocOwner = struct {
@@ -131,8 +131,8 @@ const AssocOwner = struct {
     profile: ?AssocProfile = null,
     notes: []AssocNote = &.{},
     tags: []AssocTag = &.{},
-    pub const zorm = .{
-        .table = "zorm_assoc_owners",
+    pub const zgorm = .{
+        .table = "zgorm_assoc_owners",
         .has_one = .{ .profile = .{
             .model = AssocProfile,
             .foreign_key = "owner_id",
@@ -148,7 +148,7 @@ const AssocOwner = struct {
         .many_to_many = .{ .tags = .{
             .model = AssocTag,
             .foreign_key = "owner_id",
-            .join_table = "zorm_owner_tags",
+            .join_table = "zgorm_owner_tags",
             .join_foreign_key = "owner_id",
             .join_association_key = "tag_id",
             .cascade_delete = true,
@@ -159,11 +159,11 @@ const AssocOwner = struct {
 const CustomState = enum {
     ready,
     stopped,
-    pub const zormDdl = "text";
-    pub fn zormEncode(self: @This(), _: std.mem.Allocator) z.pq.Error!z.pq.Param {
+    pub const zgormDdl = "text";
+    pub fn zgormEncode(self: @This(), _: std.mem.Allocator) zg.pq.Error!zg.pq.Param {
         return .{ .oid = 0, .format = 0, .data = if (self == .ready) "R" else "S" };
     }
-    pub fn zormDecode(data: []const u8, _: u32, _: u16, _: std.mem.Allocator) z.value.DecodeError!@This() {
+    pub fn zgormDecode(data: []const u8, _: u32, _: u16, _: std.mem.Allocator) zg.value.DecodeError!@This() {
         if (std.mem.eql(u8, data, "R")) return .ready;
         if (std.mem.eql(u8, data, "S")) return .stopped;
         return error.TypeMismatch;
@@ -172,45 +172,45 @@ const CustomState = enum {
 
 const CustomJson = struct {
     data: []const u8,
-    pub const zormDdl = "jsonb";
-    pub fn zormEncode(self: @This(), _: std.mem.Allocator) z.pq.Error!z.pq.Param {
+    pub const zgormDdl = "jsonb";
+    pub fn zgormEncode(self: @This(), _: std.mem.Allocator) zg.pq.Error!zg.pq.Param {
         return .{ .oid = 0, .format = 0, .data = self.data };
     }
-    pub fn zormDecode(data: []const u8, _: u32, _: u16, gpa: std.mem.Allocator) z.value.DecodeError!@This() {
+    pub fn zgormDecode(data: []const u8, _: u32, _: u16, gpa: std.mem.Allocator) zg.value.DecodeError!@This() {
         return .{ .data = gpa.dupe(u8, data) catch return error.OutOfMemory };
     }
 };
 
 const CodecRow = struct {
     id: ?i64 = null,
-    uuid: z.Uuid,
-    amount: z.Decimal,
-    address: z.Inet,
-    network: z.Cidr,
-    span: z.Range,
+    uuid: zg.Uuid,
+    amount: zg.Decimal,
+    address: zg.Inet,
+    network: zg.Cidr,
+    span: zg.Range,
     state: CustomState,
     payload: CustomJson,
-    pub const zorm = .{ .table = "zorm_codec_rows" };
+    pub const zgorm = .{ .table = "zgorm_codec_rows" };
 };
 
-fn drop(res: z.pq.Result) void {
+fn drop(res: zg.pq.Result) void {
     var r = res;
     r.deinit();
 }
 
-fn backendPid(db: *z.Db) !i64 {
+fn backendPid(db: *zg.Db) !i64 {
     var result = try db.execRaw("SELECT pg_backend_pid()");
     defer result.deinit();
     return try std.fmt.parseInt(i64, result.rows[0][0].?, 10);
 }
 
-fn makeDb(gpa: std.mem.Allocator, io: std.Io) !?*z.Db {
+fn makeDb(gpa: std.mem.Allocator, io: std.Io) !?*zg.Db {
     const dsn = test_options.dsn orelse {
         std.debug.print("no DSN given; skipping integration tests\n", .{});
         std.debug.print("run: zig build test-integration -Ddsn='postgres://user:pass@host:5432/db'\n", .{});
         return null;
     };
-    return try z.Db.connectDsn(gpa, io, dsn, 4);
+    return try zg.Db.connectDsn(gpa, io, dsn, 4);
 }
 
 test "full orm lifecycle" {
@@ -247,7 +247,7 @@ test "full orm lifecycle" {
     try std.testing.expectEqual(@as(i32, 30), found.age);
     try std.testing.expectEqual(@as(f64, 100.5), found.balance);
     try std.testing.expect(found.active);
-    z.free(User, found, gpa);
+    zg.free(User, found, gpa);
 
     // update
     var upd = u;
@@ -258,50 +258,50 @@ test "full orm lifecycle" {
     const after = (try db.find(User, u.id.?)).?;
     try std.testing.expectEqual(@as(i32, 31), after.age);
     try std.testing.expectEqual(@as(f64, 200.25), after.balance);
-    z.free(User, after, gpa);
+    zg.free(User, after, gpa);
 
     // save (update path)
     upd.age = 32;
     try db.save(&upd);
     const after2 = (try db.find(User, u.id.?)).?;
     try std.testing.expectEqual(@as(i32, 32), after2.age);
-    z.free(User, after2, gpa);
+    zg.free(User, after2, gpa);
 
     // query builder
-    const users = try z.query(User, db)
+    const users = try zg.query(User, db)
         .where("age >= $1", .{18})
         .whereEq("active", true)
         .order_by("age DESC")
         .all(gpa);
-    defer z.freeSlice(User, users, gpa);
+    defer zg.freeSlice(User, users, gpa);
     try std.testing.expect(users.len >= 1);
 
-    try std.testing.expectEqual(@as(i64, 1), try z.query(User, db).whereEq("name", "Alice").count());
-    try std.testing.expect(try z.query(User, db).whereEq("name", "Alice").exists());
-    try std.testing.expect(!(try z.query(User, db).whereEq("name", "Nobody").exists()));
+    try std.testing.expectEqual(@as(i64, 1), try zg.query(User, db).whereEq("name", "Alice").count());
+    try std.testing.expect(try zg.query(User, db).whereEq("name", "Alice").exists());
+    try std.testing.expect(!(try zg.query(User, db).whereEq("name", "Nobody").exists()));
 
     // renumbered chained conditions + IN
-    const mixed = try z.query(User, db)
+    const mixed = try zg.query(User, db)
         .where("age > $1", .{0})
         .whereIn("name", &.{ "Alice", "Bob", "Carol" })
         .all(gpa);
-    defer z.freeSlice(User, mixed, gpa);
+    defer zg.freeSlice(User, mixed, gpa);
     try std.testing.expectEqual(@as(usize, 1), mixed.len);
 
     // orWhere
-    const ors = try z.query(User, db)
+    const ors = try zg.query(User, db)
         .whereEq("name", "Alice")
         .orWhere("name = $1", .{"Zed"})
         .all(gpa);
-    defer z.freeSlice(User, ors, gpa);
+    defer zg.freeSlice(User, ors, gpa);
     try std.testing.expectEqual(@as(usize, 1), ors.len);
 
     // select subset: missing columns keep defaults
-    const partial = try z.query(User, db).select(&.{ "id", "name" }).whereEq("id", u.id.?).first();
+    const partial = try zg.query(User, db).select(&.{ "id", "name" }).whereEq("id", u.id.?).first();
     try std.testing.expect(partial != null);
     try std.testing.expectEqualStrings("Alice", partial.?.name);
     try std.testing.expectEqual(@as(i32, 0), partial.?.age);
-    z.free(User, partial.?, gpa);
+    zg.free(User, partial.?, gpa);
 
     // enums + f32 + batches through a transaction
     {
@@ -317,12 +317,12 @@ test "full orm lifecycle" {
         try tx.commit();
     }
 
-    const popular = try z.query(Post, db)
+    const popular = try zg.query(Post, db)
         .where("views >= $1", .{5})
         .whereIn("status", .{ .published, .review })
         .order_by("views DESC")
         .all(gpa);
-    defer z.freeSlice(Post, popular, gpa);
+    defer zg.freeSlice(Post, popular, gpa);
     try std.testing.expectEqual(@as(usize, 2), popular.len);
     try std.testing.expectEqualStrings("One", popular[0].title); // views DESC: 10, 7
     try std.testing.expectEqualStrings("Three", popular[1].title);
@@ -334,9 +334,9 @@ test "full orm lifecycle" {
     try std.testing.expectEqual(@as(i64, 1), removed);
 
     // delete by model
-    var by_id = (try z.query(Post, db).whereEq("title", "One").first()).?;
+    var by_id = (try zg.query(Post, db).whereEq("title", "One").first()).?;
     _ = try db.delete(&by_id);
-    z.free(Post, by_id, gpa);
+    zg.free(Post, by_id, gpa);
 
     // rollback leaves no trace
     {
@@ -345,14 +345,14 @@ test "full orm lifecycle" {
         var ghost = User{ .name = "Ghost" };
         try tx.insert(&ghost);
     }
-    try std.testing.expectEqual(@as(i64, 0), try z.query(User, db).whereEq("name", "Ghost").count());
+    try std.testing.expectEqual(@as(i64, 0), try zg.query(User, db).whereEq("name", "Ghost").count());
 
     // time round trip through timestamptz
-    var timed = Post{ .author_id = u.id.?, .title = "Timed", .created_at = z.Time.fromUnix(1_800_000_000) };
+    var timed = Post{ .author_id = u.id.?, .title = "Timed", .created_at = zg.Time.fromUnix(1_800_000_000) };
     try db.insert(&timed);
-    const timed_back = (try z.query(Post, db).whereEq("title", "Timed").first()).?;
+    const timed_back = (try zg.query(Post, db).whereEq("title", "Timed").first()).?;
     try std.testing.expectEqual(@as(i64, 1_800_000_000_000_000), timed_back.created_at.?.micros);
-    z.free(Post, timed_back, gpa);
+    zg.free(Post, timed_back, gpa);
 
     // cleanup
     _ = try db.deleteWhere(User, "true", .{});
@@ -368,7 +368,7 @@ const BlogAuthor = struct {
     name: []const u8 = "",
     posts: []RichPost = &.{}, // has_many
 
-    pub const zorm = .{
+    pub const zgorm = .{
         .has_many = .{ .posts = .{ .model = RichPost, .foreign_key = "author_id" } },
     };
 };
@@ -380,12 +380,12 @@ const RichPost = struct {
     tags: []const []const u8 = &.{}, // text[]
     scores: []const i64 = &.{}, // bigint[]
     weights: ?[]const ?f64 = null, // double precision[] with NULL elements
-    meta: ?z.Json = null, // jsonb
-    attachment: ?z.Bytes = null, // bytea
+    meta: ?zg.Json = null, // jsonb
+    attachment: ?zg.Bytes = null, // bytea
     author: ?BlogAuthor = null, // preloaded belongs_to
     comments: []Comment = &.{}, // preloaded has_many
 
-    pub const zorm = .{
+    pub const zgorm = .{
         .table = "v2_posts",
         .belongs_to = .{ .author = .{ .model = BlogAuthor, .foreign_key = "author_id" } },
         .has_many = .{ .comments = .{ .model = Comment, .foreign_key = "post_id" } },
@@ -398,7 +398,7 @@ const Matrix = struct {
     cells: []const []const i64 = &.{}, // 2-D bigint[]
     weights: ?[]const ?f64 = null, // double precision[] with NULL elements
 
-    pub const zorm = .{
+    pub const zgorm = .{
         .table = "v2_matrix",
     };
 };
@@ -408,7 +408,7 @@ const Comment = struct {
     post_id: ?i64 = null,
     text: []const u8 = "",
 
-    pub const zorm = .{
+    pub const zgorm = .{
         .table = "v2_comments",
         .belongs_to = .{ .post = .{ .model = RichPost, .foreign_key = "post_id" } },
     };
@@ -427,37 +427,37 @@ const Hooked = struct {
         log_len += tag.len;
     }
 
-    pub fn beforeCreate(self: *Hooked, s: *z.Session) z.Error!void {
+    pub fn beforeCreate(self: *Hooked, s: *zg.Session) zg.Error!void {
         _ = s;
         note("B");
         self.name = "hooked:" ++ "seed";
     }
 
-    pub fn afterCreate(self: *Hooked, s: *z.Session) z.Error!void {
+    pub fn afterCreate(self: *Hooked, s: *zg.Session) zg.Error!void {
         _ = s;
         _ = self;
         note("C");
     }
 
-    pub fn beforeUpdate(self: *Hooked, s: *z.Session) z.Error!void {
+    pub fn beforeUpdate(self: *Hooked, s: *zg.Session) zg.Error!void {
         _ = s;
         _ = self;
         note("U");
     }
 
-    pub fn afterFind(self: *Hooked, s: *z.Session) z.Error!void {
+    pub fn afterFind(self: *Hooked, s: *zg.Session) zg.Error!void {
         _ = s;
         self.calls += 1;
         note("F");
     }
 
-    pub fn beforeDelete(self: *Hooked, s: *z.Session) z.Error!void {
+    pub fn beforeDelete(self: *Hooked, s: *zg.Session) zg.Error!void {
         _ = s;
         _ = self;
         note("D");
     }
 
-    pub const zorm = .{};
+    pub const zgorm = .{};
 };
 
 test "v2: binary params, arrays, jsonb, bytea round trip" {
@@ -477,8 +477,8 @@ test "v2: binary params, arrays, jsonb, bytea round trip" {
         .tags = &.{ "dev", "has,comma", "quo\"te", null_safe_tag },
         .scores = &.{ 1, -2, 3 },
         .weights = &.{ 0.5, 1.5 },
-        .meta = z.Json{ .data = "{\"k\": [1, 2], \"s\": \"v\"}" },
-        .attachment = z.Bytes{ .data = &.{ 0, 0xff, 0x7f } },
+        .meta = zg.Json{ .data = "{\"k\": [1, 2], \"s\": \"v\"}" },
+        .attachment = zg.Bytes{ .data = &.{ 0, 0xff, 0x7f } },
     };
     try db.insert(&p);
     try std.testing.expect(p.id != null);
@@ -493,7 +493,7 @@ test "v2: binary params, arrays, jsonb, bytea round trip" {
     try std.testing.expectEqual(@as(f64, 0.5), back.weights.?[0]);
     try std.testing.expectEqualStrings("{\"k\": [1, 2], \"s\": \"v\"}", back.meta.?.data);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0xff, 0x7f }, back.attachment.?.data);
-    z.free(RichPost, back, gpa);
+    zg.free(RichPost, back, gpa);
 
     // NULL array elements (optional f64 elements)
     var pw = RichPost{ .title = "nulls", .weights = &[_]?f64{ 1.5, null, -2.5 }, .scores = &.{} };
@@ -503,7 +503,7 @@ test "v2: binary params, arrays, jsonb, bytea round trip" {
     try std.testing.expectEqual(@as(?f64, 1.5), pw_back.weights.?[0]);
     try std.testing.expectEqual(@as(?f64, null), pw_back.weights.?[1]);
     try std.testing.expectEqual(@as(?f64, -2.5), pw_back.weights.?[2]);
-    z.free(RichPost, pw_back, gpa);
+    zg.free(RichPost, pw_back, gpa);
 
     // empty array round trip
     var p2 = RichPost{ .title = "empty", .scores = &.{}, .tags = &.{} };
@@ -511,7 +511,7 @@ test "v2: binary params, arrays, jsonb, bytea round trip" {
     const back2 = (try db.find(RichPost, p2.id.?)).?;
     try std.testing.expectEqual(@as(usize, 0), back2.scores.len);
     try std.testing.expectEqual(@as(usize, 0), back2.tags.len);
-    z.free(RichPost, back2, gpa);
+    zg.free(RichPost, back2, gpa);
 
     _ = try db.deleteWhere(RichPost, "true", .{});
 }
@@ -545,8 +545,8 @@ test "v2: associations and preloading" {
     try db.insertBatch(&posts);
 
     // has_many preload
-    const authors = try z.query(BlogAuthor, db).preload("posts").order_by("id").all(gpa);
-    defer z.freeSlice(BlogAuthor, authors, gpa);
+    const authors = try zg.query(BlogAuthor, db).preload("posts").order_by("id").all(gpa);
+    defer zg.freeSlice(BlogAuthor, authors, gpa);
     try std.testing.expectEqual(@as(usize, 2), authors.len);
     try std.testing.expectEqualStrings("Alice", authors[0].name);
     try std.testing.expectEqual(@as(usize, 2), authors[0].posts.len);
@@ -556,8 +556,8 @@ test "v2: associations and preloading" {
     try std.testing.expectEqualStrings("b1", authors[1].posts[0].title);
 
     // belongs_to preload (including NULL fk -> null author)
-    const all_posts = try z.query(RichPost, db).preload("author").order_by("id").all(gpa);
-    defer z.freeSlice(RichPost, all_posts, gpa);
+    const all_posts = try zg.query(RichPost, db).preload("author").order_by("id").all(gpa);
+    defer zg.freeSlice(RichPost, all_posts, gpa);
     try std.testing.expectEqual(@as(usize, 4), all_posts.len);
     try std.testing.expectEqualStrings("Alice", all_posts[0].author.?.name);
     try std.testing.expectEqualStrings("Alice", all_posts[1].author.?.name);
@@ -565,9 +565,9 @@ test "v2: associations and preloading" {
     try std.testing.expect(all_posts[3].author == null);
 
     // first() also preloads
-    const one = (try z.query(RichPost, db).preload("author").whereEq("title", "b1").first()).?;
+    const one = (try zg.query(RichPost, db).preload("author").whereEq("title", "b1").first()).?;
     try std.testing.expectEqualStrings("Bob", one.author.?.name);
-    z.free(RichPost, one, gpa);
+    zg.free(RichPost, one, gpa);
 
     _ = try db.deleteWhere(RichPost, "true", .{});
     _ = try db.deleteWhere(BlogAuthor, "true", .{});
@@ -596,15 +596,15 @@ test "v2: model hooks" {
     _ = try db.update(&h);
 
     var found = (try db.find(Hooked, h.id.?)).?;
-    defer z.free(Hooked, found, gpa);
+    defer zg.free(Hooked, found, gpa);
     try std.testing.expectEqual(@as(i32, 1), found.calls); // afterFind ran
 
-    const queried = (try z.query(Hooked, db).whereEq("id", h.id.?).first()).?;
-    defer z.free(Hooked, queried, gpa);
+    const queried = (try zg.query(Hooked, db).whereEq("id", h.id.?).first()).?;
+    defer zg.free(Hooked, queried, gpa);
     try std.testing.expectEqual(@as(i32, 1), queried.calls);
 
-    const queried_all = try z.query(Hooked, db).all(gpa);
-    defer z.freeSlice(Hooked, queried_all, gpa);
+    const queried_all = try zg.query(Hooked, db).all(gpa);
+    defer zg.freeSlice(Hooked, queried_all, gpa);
     try std.testing.expectEqual(@as(usize, 1), queried_all.len);
     try std.testing.expectEqual(@as(i32, 1), queried_all[0].calls);
 
@@ -624,7 +624,7 @@ const Plain = struct {
     id: ?i64 = null,
     name: []const u8 = "",
 
-    pub const zorm = .{};
+    pub const zgorm = .{};
 };
 
 test "v2: savepoints and nested transactions" {
@@ -673,10 +673,10 @@ test "v2: savepoints and nested transactions" {
         try tx.commit();
     }
 
-    const a_count = try z.query(Plain, db).whereEq("name", "A").count();
-    const b_count = try z.query(Plain, db).whereEq("name", "B").count();
-    const c_count = try z.query(Plain, db).whereEq("name", "C").count();
-    const d_count = try z.query(Plain, db).whereEq("name", "D").count();
+    const a_count = try zg.query(Plain, db).whereEq("name", "A").count();
+    const b_count = try zg.query(Plain, db).whereEq("name", "B").count();
+    const c_count = try zg.query(Plain, db).whereEq("name", "C").count();
+    const d_count = try zg.query(Plain, db).whereEq("name", "D").count();
     try std.testing.expectEqual(@as(i64, 1), a_count);
     try std.testing.expectEqual(@as(i64, 0), b_count);
     try std.testing.expectEqual(@as(i64, 1), c_count);
@@ -716,8 +716,8 @@ test "v2: nested preloading and 2-D arrays" {
     try db.insertBatch(&comments);
 
     // two-level nested preload: author -> posts -> comments
-    const authors = try z.query(BlogAuthor, db).preload("posts.comments").all(gpa);
-    defer z.freeSlice(BlogAuthor, authors, gpa);
+    const authors = try zg.query(BlogAuthor, db).preload("posts.comments").all(gpa);
+    defer zg.freeSlice(BlogAuthor, authors, gpa);
     try std.testing.expectEqual(@as(usize, 1), authors.len);
     try std.testing.expectEqual(@as(usize, 2), authors[0].posts.len);
     try std.testing.expectEqual(@as(usize, 2), authors[0].posts[0].comments.len);
@@ -733,7 +733,7 @@ test "v2: nested preloading and 2-D arrays" {
     try std.testing.expectEqual(@as(usize, 2), m_back.cells.len);
     try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, m_back.cells[0]);
     try std.testing.expectEqualSlices(i64, &.{ 3, 4 }, m_back.cells[1]);
-    z.free(Matrix, m_back, gpa);
+    zg.free(Matrix, m_back, gpa);
 
     _ = try db.deleteWhere(Comment, "true", .{});
     _ = try db.deleteWhere(RichPost, "true", .{});
@@ -753,7 +753,7 @@ test "v2: migration versioning" {
     drop(try db.execRaw("DROP TABLE IF EXISTS m_demo CASCADE"));
     drop(try db.execRaw("DROP TABLE IF EXISTS schema_migrations CASCADE"));
 
-    var m = z.Migrator.init(db);
+    var m = zg.Migrator.init(db);
     defer m.deinit();
     // Registered out of order to prove version ordering.
     m.add(&.{
@@ -793,7 +793,7 @@ const MigrationShape = struct {
     code: []const u8 = "",
     amount: i64 = 0,
 
-    pub const zorm = .{ .table = "v5_migration_shape" };
+    pub const zgorm = .{ .table = "v5_migration_shape" };
 };
 
 test "v5: migration schema operations, diffs, checksums, and dirty state" {
@@ -816,7 +816,7 @@ test "v5: migration schema operations, diffs, checksums, and dirty state" {
     ));
     drop(try db.execRaw("CREATE TABLE v5_migration_shape (code text, amount integer, extra text)"));
 
-    var m = z.Migrator.init(db);
+    var m = zg.Migrator.init(db);
     defer m.deinit();
     try m.renameColumn("v5_migration_child", "old_value", "value");
     try m.alterColumnType("v5_migration_child", "value", "bigint", "value::bigint");
@@ -874,7 +874,7 @@ test "v5: migration schema operations, diffs, checksums, and dirty state" {
     }});
     try std.testing.expectEqual(@as(usize, 1), try m.applyAll());
 
-    var changed = z.Migrator.init(db);
+    var changed = zg.Migrator.init(db);
     defer changed.deinit();
     changed.add(&.{.{ .version = 100, .name = "checksum", .up = "CREATE TABLE v5_migration_checksum (id integer)" }});
     try std.testing.expectError(error.MigrationChecksumMismatch, changed.applyAll());
@@ -894,14 +894,14 @@ test "v5: migration schema operations, diffs, checksums, and dirty state" {
 }
 
 const EmbeddedUser = struct {
-    base: z.Model = .{}, // id, created_at, updated_at, deleted_at
+    base: zg.Model = .{}, // id, created_at, updated_at, deleted_at
     name: []const u8 = "",
     email: ?[]const u8 = null,
 
-    pub const zorm = .{ .table = "v3_embedded_users", .unique = .{"email"} };
+    pub const zgorm = .{ .table = "v3_embedded_users", .unique = .{"email"} };
 };
 
-test "v3: embedded zorm.Model round trip and soft delete" {
+test "v3: embedded zgorm.Model round trip and soft delete" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -921,22 +921,22 @@ test "v3: embedded zorm.Model round trip and soft delete" {
     try std.testing.expect(u.base.deleted_at == null);
 
     const found = (try db.find(EmbeddedUser, u.base.id.?)).?;
-    defer z.free(EmbeddedUser, found, gpa);
+    defer zg.free(EmbeddedUser, found, gpa);
     try std.testing.expectEqualStrings("Alice", found.name);
     try std.testing.expectEqual(u.base.id.?, found.base.id.?);
 
     // Update through a copy so `found` keeps its heap-owned strings
-    // (z.free requires the value's strings to be unmodified).
+    // (zg.free requires the value's strings to be unmodified).
     var upd = found;
     upd.name = "Alice2";
     _ = try db.update(&upd);
     const after = (try db.find(EmbeddedUser, u.base.id.?)).?;
-    defer z.free(EmbeddedUser, after, gpa);
+    defer zg.free(EmbeddedUser, after, gpa);
     try std.testing.expectEqualStrings("Alice2", after.name);
     // updated_at was refreshed by the update
     try std.testing.expect(after.base.updated_at.?.micros >= found.base.updated_at.?.micros);
 
-    const n = try z.query(EmbeddedUser, db).whereEq("name", "Alice2").count();
+    const n = try zg.query(EmbeddedUser, db).whereEq("name", "Alice2").count();
     try std.testing.expectEqual(@as(i64, 1), n);
 
     _ = try db.delete(&u);
@@ -951,12 +951,12 @@ const QueryLogEntry = struct {
 
 const CapturingLogger = struct {
     buf: std.ArrayList(u8) = .empty,
-    level: z.LogLevel = .info,
+    level: zg.LogLevel = .info,
     calls: usize = 0,
-    last_level: z.LogLevel = .silent,
+    last_level: zg.LogLevel = .silent,
     gpa: std.mem.Allocator,
 
-    fn log(ctx: ?*anyopaque, level: z.LogLevel, msg: []const u8) void {
+    fn log(ctx: ?*anyopaque, level: zg.LogLevel, msg: []const u8) void {
         const self: *CapturingLogger = @ptrCast(@alignCast(ctx.?));
         if (@intFromEnum(level) > @intFromEnum(self.level)) return;
         self.calls += 1;
@@ -965,7 +965,7 @@ const CapturingLogger = struct {
         self.buf.appendSlice(self.gpa, "\n") catch {};
     }
 
-    fn logger(self: *CapturingLogger) z.Logger {
+    fn logger(self: *CapturingLogger) zg.Logger {
         return .{
             .context = self,
             .level = self.level,
@@ -980,7 +980,7 @@ const CapturingLogger = struct {
         self.last_level = .silent;
     }
 
-    fn expectOne(self: *const CapturingLogger, level: z.LogLevel) !void {
+    fn expectOne(self: *const CapturingLogger, level: zg.LogLevel) !void {
         try std.testing.expectEqual(@as(usize, 1), self.calls);
         try std.testing.expectEqual(level, self.last_level);
     }
@@ -998,7 +998,7 @@ test "v4: default logger traces queries and can be replaced" {
     // Default logger: warn level, must stay silent for a successful fast query.
     var sink = CapturingLogger{ .gpa = gpa, .level = .info };
     db.setLogger(sink.logger());
-    defer db.setLogger(z.Logger.default);
+    defer db.setLogger(zg.Logger.default);
 
     var r1 = try db.execRaw("SELECT 1");
     r1.deinit();
@@ -1013,7 +1013,7 @@ test "v4: default logger traces queries and can be replaced" {
     try std.testing.expect(std.mem.indexOf(u8, sink.buf.items, "__no_such_table__") != null);
 
     // Silent logger: nothing is emitted.
-    db.setLogger(z.Logger.discard);
+    db.setLogger(zg.Logger.discard);
     sink.buf.clearRetainingCapacity();
     var r3 = try db.execRaw("SELECT 2");
     r3.deinit();
@@ -1038,36 +1038,36 @@ test "query builder logs every terminal operation" {
     var sink = CapturingLogger{ .gpa = gpa };
     defer sink.buf.deinit(gpa);
     db.setLogger(sink.logger());
-    defer db.setLogger(z.Logger.default);
+    defer db.setLogger(zg.Logger.default);
 
-    const rows = try z.query(QueryLogEntry, db).whereEq("name", "logged").all(gpa);
-    defer z.freeSlice(QueryLogEntry, rows, gpa);
+    const rows = try zg.query(QueryLogEntry, db).whereEq("name", "logged").all(gpa);
+    defer zg.freeSlice(QueryLogEntry, rows, gpa);
     try sink.expectOne(.info);
     try std.testing.expect(std.mem.indexOf(u8, sink.buf.items, "ms, rows=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, sink.buf.items, "\"name\" = 'logged'") != null);
     try std.testing.expect(std.mem.indexOf(u8, sink.buf.items, "$1='logged'") != null);
 
     sink.reset();
-    const first = (try z.query(QueryLogEntry, db).whereEq("name", "logged").first()).?;
-    defer z.free(QueryLogEntry, first, gpa);
+    const first = (try zg.query(QueryLogEntry, db).whereEq("name", "logged").first()).?;
+    defer zg.free(QueryLogEntry, first, gpa);
     try sink.expectOne(.info);
 
     sink.reset();
-    try std.testing.expectEqual(@as(i64, 1), try z.query(QueryLogEntry, db).count());
+    try std.testing.expectEqual(@as(i64, 1), try zg.query(QueryLogEntry, db).count());
     try sink.expectOne(.info);
 
     sink.reset();
-    try std.testing.expect(try z.query(QueryLogEntry, db).exists());
+    try std.testing.expect(try zg.query(QueryLogEntry, db).exists());
     try sink.expectOne(.info);
 
     sink.reset();
-    try std.testing.expectEqual(@as(i64, 1), try z.query(QueryLogEntry, db).whereEq("name", "logged").delete());
+    try std.testing.expectEqual(@as(i64, 1), try zg.query(QueryLogEntry, db).whereEq("name", "logged").delete());
     try sink.expectOne(.info);
 
     sink.reset();
     try std.testing.expectError(
         error.UndefinedColumn,
-        z.query(QueryLogEntry, db).where("definitely_missing_column = $1::bigint", .{@as(i64, 1)}).count(),
+        zg.query(QueryLogEntry, db).where("definitely_missing_column = $1::bigint", .{@as(i64, 1)}).count(),
     );
     try sink.expectOne(.err);
     try std.testing.expect(std.mem.indexOf(u8, sink.buf.items, "SQL error") != null);
@@ -1078,7 +1078,7 @@ test "query builder logs every terminal operation" {
     var slow_logger = sink.logger();
     slow_logger.slow_threshold_ms = 1;
     db.setLogger(slow_logger);
-    _ = try z.query(QueryLogEntry, db)
+    _ = try zg.query(QueryLogEntry, db)
         .where("EXISTS (SELECT 1 FROM pg_sleep(0.01))", .{})
         .count();
     try sink.expectOne(.warn);
@@ -1088,7 +1088,7 @@ test "query builder logs every terminal operation" {
     var silent_logger = sink.logger();
     silent_logger.level = .silent;
     db.setLogger(silent_logger);
-    _ = try z.query(QueryLogEntry, db).count();
+    _ = try zg.query(QueryLogEntry, db).count();
     try std.testing.expectEqual(@as(usize, 0), sink.calls);
     try std.testing.expectEqual(@as(usize, 0), sink.buf.items.len);
 }
@@ -1108,13 +1108,13 @@ test "v3: issue fixes regression" {
     {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
-        const cfg = try z.pq.parseDsn(arena_state.allocator(), dsn);
+        const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
         var bad = cfg;
         bad.password = "definitely-not-the-password";
-        try std.testing.expectError(error.AuthenticationFailed, z.Db.connect(gpa, io, bad, 1));
+        try std.testing.expectError(error.AuthenticationFailed, zg.Db.connect(gpa, io, bad, 1));
     }
 
-    const db = try z.Db.connectDsn(gpa, io, dsn, 8);
+    const db = try zg.Db.connectDsn(gpa, io, dsn, 8);
     defer db.deinit();
 
     // Issue #8: adding missing columns to an existing table keeps the same
@@ -1131,7 +1131,7 @@ test "v3: issue fixes regression" {
         title: []const u8 = "",
         note: []const u8 = "",
         flag: bool = false,
-        pub const zorm = .{ .table = "v3_fix" };
+        pub const zgorm = .{ .table = "v3_fix" };
     };
     try db.autoMigrate(Full);
     var row = Full{ .title = "t" };
@@ -1159,7 +1159,7 @@ test "v3: issue fixes regression" {
         var tx = try db.begin();
         var pinned = try db.execRaw("SELECT 1");
         pinned.deinit();
-        var other = try z.Db.connectDsn(gpa, io, dsn, 1); // fresh pool, same path
+        var other = try zg.Db.connectDsn(gpa, io, dsn, 1); // fresh pool, same path
         defer other.deinit();
         var r2 = try other.execRaw("SELECT 2");
         r2.deinit();
@@ -1173,7 +1173,7 @@ test "v3: issue fixes regression" {
     try db.insert(&dup);
     var dup2 = User{ .name = "dup2", .email = "dup@example.com" };
     try std.testing.expectError(error.UniqueViolation, db.insert(&dup2));
-    const snapshot = z.lastErrorCopy(db, arena_state.allocator());
+    const snapshot = zg.lastErrorCopy(db, arena_state.allocator());
     try std.testing.expect(snapshot != null);
     try std.testing.expectEqualStrings("23505", snapshot.?.code);
     try std.testing.expect(std.mem.indexOf(u8, snapshot.?.message, "unique") != null);
@@ -1186,9 +1186,9 @@ test "v3: issue fixes regression" {
 const SoftPost = struct {
     id: ?i64 = null,
     title: []const u8 = "",
-    deleted_at: ?z.Time = null, // enables soft delete
+    deleted_at: ?zg.Time = null, // enables soft delete
 
-    pub const zorm = .{ .table = "v4_soft" };
+    pub const zgorm = .{ .table = "v4_soft" };
 };
 
 test "v4: soft delete semantics" {
@@ -1216,26 +1216,26 @@ test "v4: soft delete semantics" {
 
     // Filtered out of find/count/exists by default.
     try std.testing.expect((try db.find(SoftPost, b.id.?)) == null);
-    try std.testing.expectEqual(@as(i64, 0), try z.query(SoftPost, db).whereEq("title", "doomed").count());
-    try std.testing.expectEqual(@as(i64, 2), try z.query(SoftPost, db).count());
+    try std.testing.expectEqual(@as(i64, 0), try zg.query(SoftPost, db).whereEq("title", "doomed").count());
+    try std.testing.expectEqual(@as(i64, 2), try zg.query(SoftPost, db).count());
 
     // Update does not touch soft-deleted rows.
     _ = try db.updateWhere(SoftPost, .{ .title = "x" }, "title = $1", .{"doomed"});
-    try std.testing.expectEqual(@as(i64, 0), try z.query(SoftPost, db).whereEq("title", "x").count());
+    try std.testing.expectEqual(@as(i64, 0), try zg.query(SoftPost, db).whereEq("title", "x").count());
 
     // unscoped() sees them.
-    try std.testing.expectEqual(@as(i64, 3), try z.query(SoftPost, db).unscoped().count());
+    try std.testing.expectEqual(@as(i64, 3), try zg.query(SoftPost, db).unscoped().count());
 
     // findUnscoped fetches soft-deleted rows by pk; updateUnscoped can modify them.
     const doomed = (try db.findUnscoped(SoftPost, b.id.?)).?;
-    defer z.free(SoftPost, doomed, gpa);
+    defer zg.free(SoftPost, doomed, gpa);
     try std.testing.expectEqualStrings("doomed", doomed.title);
     try std.testing.expect(doomed.deleted_at != null);
     var upd = doomed;
     upd.title = "doomed-v2";
     try std.testing.expectEqual(@as(i64, 1), try db.updateUnscoped(&upd));
     const renamed = (try db.findUnscoped(SoftPost, b.id.?)).?;
-    defer z.free(SoftPost, renamed, gpa);
+    defer zg.free(SoftPost, renamed, gpa);
     try std.testing.expectEqualStrings("doomed-v2", renamed.title);
     // default find still excludes it
     try std.testing.expect((try db.find(SoftPost, b.id.?)) == null);
@@ -1243,31 +1243,31 @@ test "v4: soft delete semantics" {
     // restore brings the row back (title was renamed to "doomed-v2" above).
     var target = SoftPost{ .id = b.id };
     _ = try db.restore(&target);
-    try std.testing.expectEqual(@as(i64, 1), try z.query(SoftPost, db).whereEq("title", "doomed-v2").count());
+    try std.testing.expectEqual(@as(i64, 1), try zg.query(SoftPost, db).whereEq("title", "doomed-v2").count());
 
     // Builder-level delete soft-deletes too.
-    _ = try z.query(SoftPost, db).whereEq("title", "counted").delete();
-    try std.testing.expectEqual(@as(i64, 0), try z.query(SoftPost, db).whereEq("title", "counted").count());
-    try std.testing.expectEqual(@as(i64, 3), try z.query(SoftPost, db).unscoped().count());
+    _ = try zg.query(SoftPost, db).whereEq("title", "counted").delete();
+    try std.testing.expectEqual(@as(i64, 0), try zg.query(SoftPost, db).whereEq("title", "counted").count());
+    try std.testing.expectEqual(@as(i64, 3), try zg.query(SoftPost, db).unscoped().count());
 
     // unscoped delete is a hard delete (removes the restored "doomed-v2";
     // "counted" remains as a soft-deleted row).
-    _ = try z.query(SoftPost, db).unscoped().whereEq("title", "doomed-v2").delete();
-    try std.testing.expectEqual(@as(i64, 2), try z.query(SoftPost, db).unscoped().count());
+    _ = try zg.query(SoftPost, db).unscoped().whereEq("title", "doomed-v2").delete();
+    try std.testing.expectEqual(@as(i64, 2), try zg.query(SoftPost, db).unscoped().count());
 
     // Model-level hard delete.
     var alive = (try db.find(SoftPost, a.id.?)).?;
-    defer z.free(SoftPost, alive, gpa);
+    defer zg.free(SoftPost, alive, gpa);
     _ = try db.deleteHard(&alive);
-    try std.testing.expectEqual(@as(i64, 1), try z.query(SoftPost, db).unscoped().count());
+    try std.testing.expectEqual(@as(i64, 1), try zg.query(SoftPost, db).unscoped().count());
 
     // deleteWhere hard variant removes the new row but the soft-deleted
     // "counted" row remains visible under unscoped.
     var d2 = SoftPost{ .title = "hard" };
     try db.insert(&d2);
     _ = try db.deleteWhereHard(SoftPost, "title = $1", .{"hard"});
-    try std.testing.expectEqual(@as(i64, 1), try z.query(SoftPost, db).unscoped().count());
-    try std.testing.expectEqual(@as(i64, 0), try z.query(SoftPost, db).count());
+    try std.testing.expectEqual(@as(i64, 1), try zg.query(SoftPost, db).unscoped().count());
+    try std.testing.expectEqual(@as(i64, 0), try zg.query(SoftPost, db).count());
 }
 
 test "prepared statement cache keys by SQL and OIDs and evicts LRU" {
@@ -1279,9 +1279,9 @@ test "prepared statement cache keys by SQL and OIDs and evicts LRU" {
     defer threaded.deinit();
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    var cfg = try z.pq.parseDsn(arena_state.allocator(), dsn);
+    var cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
     cfg.prepared_statement_cache_size = 2;
-    const db = try z.Db.connectWithOptions(gpa, threaded.io(), cfg, .{
+    const db = try zg.Db.connectWithOptions(gpa, threaded.io(), cfg, .{
         .max_connections = 1,
         .max_idle_connections = 1,
     });
@@ -1315,23 +1315,23 @@ test "prepared statement cache reparses an invalidated PostgreSQL plan" {
     defer threaded.deinit();
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    var cfg = try z.pq.parseDsn(arena_state.allocator(), dsn);
+    var cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
     cfg.prepared_statement_cache_size = 8;
-    const db = try z.Db.connectWithOptions(gpa, threaded.io(), cfg, .{
+    const db = try zg.Db.connectWithOptions(gpa, threaded.io(), cfg, .{
         .max_connections = 1,
         .max_idle_connections = 1,
     });
     defer db.deinit();
     const before = db.poolStats();
 
-    drop(try db.execRaw("DROP TABLE IF EXISTS zorm_plan_invalidation"));
-    drop(try db.execRaw("CREATE TABLE zorm_plan_invalidation (id bigint PRIMARY KEY, value integer NOT NULL)"));
-    drop(try db.execRaw("INSERT INTO zorm_plan_invalidation VALUES (1, 7)"));
-    drop(try db.exec("SELECT value FROM zorm_plan_invalidation WHERE id = $1", .{@as(i64, 1)}));
-    drop(try db.execRaw("ALTER TABLE zorm_plan_invalidation ALTER COLUMN value TYPE bigint"));
-    // PostgreSQL reports 0A000 for the cached result-type change. zorm closes
+    drop(try db.execRaw("DROP TABLE IF EXISTS zgorm_plan_invalidation"));
+    drop(try db.execRaw("CREATE TABLE zgorm_plan_invalidation (id bigint PRIMARY KEY, value integer NOT NULL)"));
+    drop(try db.execRaw("INSERT INTO zgorm_plan_invalidation VALUES (1, 7)"));
+    drop(try db.exec("SELECT value FROM zgorm_plan_invalidation WHERE id = $1", .{@as(i64, 1)}));
+    drop(try db.execRaw("ALTER TABLE zgorm_plan_invalidation ALTER COLUMN value TYPE bigint"));
+    // PostgreSQL reports 0A000 for the cached result-type change. zgorm closes
     // the stale named statement, reparses it, and retries once.
-    drop(try db.exec("SELECT value FROM zorm_plan_invalidation WHERE id = $1", .{@as(i64, 1)}));
+    drop(try db.exec("SELECT value FROM zgorm_plan_invalidation WHERE id = $1", .{@as(i64, 1)}));
 
     const stats = db.poolStats();
     try std.testing.expectEqual(@as(u64, 1), stats.prepared_hits - before.prepared_hits);
@@ -1341,7 +1341,7 @@ test "prepared statement cache reparses an invalidated PostgreSQL plan" {
 test "query deadline sends CancelRequest and leaves connection reusable" {
     const db = (try makeDb(std.testing.allocator, std.testing.io)) orelse return;
     defer db.deinit();
-    db.setLogger(z.Logger.discard);
+    db.setLogger(zg.Logger.discard);
 
     try std.testing.expectError(error.QueryTimeout, db.execRawTimeout("SELECT pg_sleep(0.2)", 20));
     try db.ping();
@@ -1351,13 +1351,13 @@ test "explicit PostgreSQL CancelRequest reports QueryCanceled" {
     const dsn = test_options.dsn orelse return;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const cfg = try z.pq.parseDsn(arena_state.allocator(), dsn);
-    const conn = try z.pq.Conn.connect(std.testing.allocator, std.testing.io, cfg);
+    const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
+    const conn = try zg.pq.Conn.connect(std.testing.allocator, std.testing.io, cfg);
     defer conn.close();
 
     const Runner = struct {
-        conn: *z.pq.Conn,
-        err: ?z.pq.Error = null,
+        conn: *zg.pq.Conn,
+        err: ?zg.pq.Error = null,
 
         fn run(r: *@This()) void {
             var result = r.conn.execSimple("SELECT pg_sleep(5)") catch |err| {
@@ -1380,14 +1380,14 @@ test "network read timeout retires and rebuilds the connection" {
     const dsn = test_options.dsn orelse return;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    var cfg = try z.pq.parseDsn(arena_state.allocator(), dsn);
+    var cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
     cfg.read_timeout_ms = 20;
-    const db = try z.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
+    const db = try zg.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
         .max_connections = 1,
         .max_idle_connections = 1,
     });
     defer db.deinit();
-    db.setLogger(z.Logger.discard);
+    db.setLogger(zg.Logger.discard);
 
     try std.testing.expectError(error.NetworkReadTimeout, db.execRaw("SELECT pg_sleep(0.2)"));
     try db.ping();
@@ -1397,14 +1397,14 @@ test "pool acquire and transaction deadlines return distinct errors" {
     const dsn = test_options.dsn orelse return;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const cfg = try z.pq.parseDsn(arena_state.allocator(), dsn);
-    const db = try z.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
+    const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
+    const db = try zg.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
         .max_connections = 1,
         .max_idle_connections = 1,
         .acquire_timeout_ms = 20,
     });
     defer db.deinit();
-    db.setLogger(z.Logger.discard);
+    db.setLogger(zg.Logger.discard);
 
     var tx = try db.begin();
     try std.testing.expectError(error.AcquireTimeout, db.execRaw("SELECT 1"));
@@ -1421,8 +1421,8 @@ test "pool hands connections to waiters in FIFO order without barging" {
     const dsn = test_options.dsn orelse return;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const cfg = try z.pq.parseDsn(arena_state.allocator(), dsn);
-    const db = try z.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
+    const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
+    const db = try zg.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
         .max_connections = 1,
         .min_idle_connections = 1,
         .max_idle_connections = 1,
@@ -1480,8 +1480,8 @@ test "pool bounds concurrent connection establishment" {
     const dsn = test_options.dsn orelse return;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const cfg = try z.pq.parseDsn(arena_state.allocator(), dsn);
-    const db = try z.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
+    const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
+    const db = try zg.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
         .max_connections = 32,
         .max_connecting = 2,
         .max_idle_connections = 32,
@@ -1532,9 +1532,9 @@ test "pool prewarms minimum idle and enforces maximum idle" {
     const dsn = test_options.dsn orelse return;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const cfg = try z.pq.parseDsn(arena_state.allocator(), dsn);
+    const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
 
-    const warm = try z.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
+    const warm = try zg.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
         .max_connections = 3,
         .min_idle_connections = 2,
         .max_idle_connections = 2,
@@ -1554,7 +1554,7 @@ test "pool prewarms minimum idle and enforces maximum idle" {
     second.rollback();
     try std.testing.expectEqual(@as(usize, 2), warm.poolStats().idle);
 
-    const capped = try z.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
+    const capped = try zg.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
         .max_connections = 2,
         .max_idle_connections = 1,
         .cleanup_interval_ms = 0,
@@ -1573,9 +1573,9 @@ test "pool background maintenance replaces lifetime and idle expirations" {
     const dsn = test_options.dsn orelse return;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const cfg = try z.pq.parseDsn(arena_state.allocator(), dsn);
+    const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
 
-    const lifetime = try z.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
+    const lifetime = try zg.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
         .max_connections = 1,
         .min_idle_connections = 1,
         .max_idle_connections = 1,
@@ -1588,7 +1588,7 @@ test "pool background maintenance replaces lifetime and idle expirations" {
     const new_lifetime_pid = try backendPid(lifetime);
     try std.testing.expect(old_lifetime_pid != new_lifetime_pid);
 
-    const idle = try z.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
+    const idle = try zg.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
         .max_connections = 1,
         .min_idle_connections = 1,
         .max_idle_connections = 1,
@@ -1606,22 +1606,22 @@ test "pool health check rebuilds a terminated connection" {
     const dsn = test_options.dsn orelse return;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const cfg = try z.pq.parseDsn(arena_state.allocator(), dsn);
-    const target = try z.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
+    const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
+    const target = try zg.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
         .max_connections = 1,
         .max_idle_connections = 1,
         .health_check_interval_ms = 1,
         .cleanup_interval_ms = 0,
     });
     defer target.deinit();
-    target.setLogger(z.Logger.discard);
-    const killer = try z.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
+    target.setLogger(zg.Logger.discard);
+    const killer = try zg.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
         .max_connections = 1,
         .max_idle_connections = 1,
         .cleanup_interval_ms = 0,
     });
     defer killer.deinit();
-    killer.setLogger(z.Logger.discard);
+    killer.setLogger(zg.Logger.discard);
 
     const old_pid = try backendPid(target);
     drop(try killer.exec("SELECT pg_terminate_backend($1::integer)", .{old_pid}));
@@ -1636,8 +1636,8 @@ test "pool health check rebuilds a terminated connection" {
 test "streaming model rows support early close, CSV, and iterator errors" {
     const db = (try makeDb(std.testing.allocator, std.testing.io)) orelse return;
     defer db.deinit();
-    db.setLogger(z.Logger.discard);
-    drop(try db.execRaw("DROP TABLE IF EXISTS zorm_stream_rows"));
+    db.setLogger(zg.Logger.discard);
+    drop(try db.execRaw("DROP TABLE IF EXISTS zgorm_stream_rows"));
     try db.autoMigrate(StreamRow);
 
     var models: [2_000]StreamRow = undefined;
@@ -1649,39 +1649,39 @@ test "streaming model rows support early close, CSV, and iterator errors" {
     const before_find = db.poolStats();
     const found_first = (try db.find(StreamRow, @as(i64, 1))).?;
     try std.testing.expectEqualStrings("row-0", found_first.name);
-    z.free(StreamRow, found_first, std.testing.allocator);
+    zg.free(StreamRow, found_first, std.testing.allocator);
     const found_again = (try db.find(StreamRow, @as(i64, 1))).?;
-    z.free(StreamRow, found_again, std.testing.allocator);
+    zg.free(StreamRow, found_again, std.testing.allocator);
     const after_find = db.poolStats();
     try std.testing.expectEqual(@as(u64, 1), after_find.prepared_misses - before_find.prepared_misses);
     try std.testing.expectEqual(@as(u64, 1), after_find.prepared_hits - before_find.prepared_hits);
 
-    var early = try z.query(StreamRow, db).order_by("id").stream(std.testing.allocator);
+    var early = try zg.query(StreamRow, db).order_by("id").stream(std.testing.allocator);
     const first = (try early.next()).?;
     try std.testing.expectEqualStrings("row-0", first.name);
-    z.free(StreamRow, first, std.testing.allocator);
+    zg.free(StreamRow, first, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), db.poolStats().in_use);
     early.deinit();
     try std.testing.expectEqual(@as(usize, 0), db.poolStats().in_use);
     try db.ping();
 
-    var rows = try z.query(StreamRow, db).order_by("id").stream(std.testing.allocator);
+    var rows = try zg.query(StreamRow, db).order_by("id").stream(std.testing.allocator);
     defer rows.deinit();
     var count: usize = 0;
     while (try rows.next()) |row| {
-        z.free(StreamRow, row, std.testing.allocator);
+        zg.free(StreamRow, row, std.testing.allocator);
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2_000), count);
     try std.testing.expectEqual(@as(usize, 0), db.poolStats().in_use);
 
-    var csv_rows = try z.query(StreamRow, db).order_by("id").limit(2).stream(std.testing.allocator);
+    var csv_rows = try zg.query(StreamRow, db).order_by("id").limit(2).stream(std.testing.allocator);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try csv_rows.exportCsv(&output.writer);
     try std.testing.expectEqualStrings("id,name\r\n1,row-0\r\n2,row-1\r\n", output.writer.buffered());
 
-    var bad = try z.query(StreamRow, db)
+    var bad = try zg.query(StreamRow, db)
         .where("CASE WHEN id = 5 THEN name::integer ELSE 1 END = 1", .{})
         .order_by("id")
         .stream(std.testing.allocator);
@@ -1692,7 +1692,7 @@ test "streaming model rows support early close, CSV, and iterator errors" {
             break;
         };
         if (item) |row| {
-            z.free(StreamRow, row, std.testing.allocator);
+            zg.free(StreamRow, row, std.testing.allocator);
         } else {
             return error.TestExpectedError;
         }
@@ -1704,14 +1704,14 @@ test "structured events, spans, metrics, slow SQL, and Prometheus output" {
     const dsn = test_options.dsn orelse return;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const cfg = try z.pq.parseDsn(arena_state.allocator(), dsn);
-    const db = try z.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
+    const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
+    const db = try zg.Db.connectWithOptions(std.testing.allocator, std.testing.io, cfg, .{
         .max_connections = 1,
         .max_idle_connections = 1,
         .acquire_timeout_ms = 20,
     });
     defer db.deinit();
-    db.setLogger(z.Logger.discard);
+    db.setLogger(zg.Logger.discard);
 
     const Capture = struct {
         events: usize = 0,
@@ -1719,11 +1719,11 @@ test "structured events, spans, metrics, slow SQL, and Prometheus output" {
         returned_rows: usize = 0,
         pool_wait_ns: u128 = 0,
         prepared_hit_rate: f64 = 0,
-        error_class: z.ErrorClass = .none,
+        error_class: zg.ErrorClass = .none,
         sqlstate: [5]u8 = .{0} ** 5,
         sqlstate_len: usize = 0,
 
-        fn query(context: ?*anyopaque, event: z.QueryEvent) void {
+        fn query(context: ?*anyopaque, event: zg.QueryEvent) void {
             const capture: *@This() = @ptrCast(@alignCast(context.?));
             capture.events += 1;
             capture.returned_rows = event.returned_rows;
@@ -1734,14 +1734,14 @@ test "structured events, spans, metrics, slow SQL, and Prometheus output" {
             @memcpy(capture.sqlstate[0..capture.sqlstate_len], event.sqlstate[0..capture.sqlstate_len]);
         }
 
-        fn span(context: ?*anyopaque, _: z.QueryEvent) void {
+        fn span(context: ?*anyopaque, _: zg.QueryEvent) void {
             const capture: *@This() = @ptrCast(@alignCast(context.?));
             capture.spans += 1;
         }
     };
     var capture: Capture = .{};
-    var metrics: z.Metrics = .{};
-    var slow = z.SlowQueryLog.init(0);
+    var metrics: zg.Metrics = .{};
+    var slow = zg.SlowQueryLog.init(0);
     db.setObserver(.{
         .context = &capture,
         .on_query = Capture.query,
@@ -1755,29 +1755,29 @@ test "structured events, spans, metrics, slow SQL, and Prometheus output" {
     try std.testing.expect(capture.prepared_hit_rate > 0);
     try std.testing.expectEqual(@as(usize, 1), capture.returned_rows);
 
-    try std.testing.expectError(error.UndefinedColumn, db.execRaw("SELECT zorm_missing_column"));
-    try std.testing.expectEqual(z.ErrorClass.syntax, capture.error_class);
+    try std.testing.expectError(error.UndefinedColumn, db.execRaw("SELECT zgorm_missing_column"));
+    try std.testing.expectEqual(zg.ErrorClass.syntax, capture.error_class);
     try std.testing.expectEqualStrings("42703", capture.sqlstate[0..capture.sqlstate_len]);
 
     var tx = try db.begin();
     try std.testing.expectError(error.AcquireTimeout, db.execRaw("SELECT 1"));
     tx.rollback();
     try std.testing.expect(capture.pool_wait_ns > 0);
-    try std.testing.expectEqual(z.ErrorClass.timeout, capture.error_class);
+    try std.testing.expectEqual(zg.ErrorClass.timeout, capture.error_class);
 
     try std.testing.expectEqual(capture.events, capture.spans);
     try std.testing.expectEqual(@as(u64, @intCast(capture.events)), metrics.queries.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), metrics.errors.load(.monotonic));
-    var slow_entries: [z.SlowQueryLog.capacity]z.SlowQueryLog.Entry = undefined;
+    var slow_entries: [zg.SlowQueryLog.capacity]zg.SlowQueryLog.Entry = undefined;
     try std.testing.expect(slow.snapshot(&slow_entries).len > 0);
 
     var prometheus: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer prometheus.deinit();
     try db.writePrometheus(&metrics, &prometheus.writer);
     const text = prometheus.writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, text, "zorm_queries_total") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zorm_pool_connections{state=\"idle\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "zorm_prepared_statement_hit_ratio") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgorm_queries_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgorm_pool_connections{state=\"idle\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zgorm_prepared_statement_hit_ratio") != null);
 }
 
 test "optimistic locking detects conflicts and batches roll back atomically" {
@@ -1787,18 +1787,18 @@ test "optimistic locking detects conflicts and batches roll back atomically" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const dsn = test_options.dsn orelse return error.SkipZigTest;
-    const db = try z.Db.connectDsn(gpa, threaded.io(), dsn, 4);
+    const db = try zg.Db.connectDsn(gpa, threaded.io(), dsn, 4);
     defer db.deinit();
 
-    drop(try db.execRaw("DROP TABLE IF EXISTS zorm_versioned_rows, zorm_explicit_version_rows CASCADE"));
+    drop(try db.execRaw("DROP TABLE IF EXISTS zgorm_versioned_rows, zgorm_explicit_version_rows CASCADE"));
     try db.autoMigrateAll(.{ VersionedRow, ExplicitVersionRow });
 
     var row = VersionedRow{ .name = "initial" };
     try db.insert(&row);
     var current = (try db.find(VersionedRow, row.id.?)).?;
-    defer z.free(VersionedRow, current, gpa);
+    defer zg.free(VersionedRow, current, gpa);
     var stale = (try db.find(VersionedRow, row.id.?)).?;
-    defer z.free(VersionedRow, stale, gpa);
+    defer zg.free(VersionedRow, stale, gpa);
 
     gpa.free(current.name);
     current.name = try gpa.dupe(u8, "current");
@@ -1822,10 +1822,10 @@ test "optimistic locking detects conflicts and batches roll back atomically" {
         (try db.find(VersionedRow, first.id.?)).?,
         (try db.find(VersionedRow, second.id.?)).?,
     };
-    defer z.free(VersionedRow, batch[0], gpa);
-    defer z.free(VersionedRow, batch[1], gpa);
+    defer zg.free(VersionedRow, batch[0], gpa);
+    defer zg.free(VersionedRow, batch[1], gpa);
     var competing = (try db.find(VersionedRow, second.id.?)).?;
-    defer z.free(VersionedRow, competing, gpa);
+    defer zg.free(VersionedRow, competing, gpa);
     gpa.free(competing.name);
     competing.name = try gpa.dupe(u8, "winner");
     _ = try db.update(&competing);
@@ -1836,13 +1836,13 @@ test "optimistic locking detects conflicts and batches roll back atomically" {
     batch[1].name = try gpa.dupe(u8, "must-conflict");
     try std.testing.expectError(error.OptimisticLockConflict, db.updateBatch(&batch));
     const first_after = (try db.find(VersionedRow, first.id.?)).?;
-    defer z.free(VersionedRow, first_after, gpa);
+    defer zg.free(VersionedRow, first_after, gpa);
     try std.testing.expectEqualStrings("first", first_after.name);
     try std.testing.expectEqual(@as(i64, 0), first_after.version);
 
     var tx = try db.begin();
     var tx_row = (try tx.find(VersionedRow, row.id.?)).?;
-    defer z.free(VersionedRow, tx_row, gpa);
+    defer zg.free(VersionedRow, tx_row, gpa);
     gpa.free(tx_row.name);
     tx_row.name = try gpa.dupe(u8, "transaction");
     _ = try tx.update(&tx_row);
@@ -1857,12 +1857,12 @@ test "upsert supports conflict policies, excluded updates, batches, and returnin
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const dsn = test_options.dsn orelse return error.SkipZigTest;
-    const db = try z.Db.connectDsn(gpa, threaded.io(), dsn, 4);
+    const db = try zg.Db.connectDsn(gpa, threaded.io(), dsn, 4);
     defer db.deinit();
 
-    drop(try db.execRaw("DROP TABLE IF EXISTS zorm_upsert_rows CASCADE"));
+    drop(try db.execRaw("DROP TABLE IF EXISTS zgorm_upsert_rows CASCADE"));
     try db.autoMigrate(UpsertRow);
-    const replace_name = z.OnConflict{ .columns = &.{"email"}, .update = &.{"name"} };
+    const replace_name = zg.OnConflict{ .columns = &.{"email"}, .update = &.{"name"} };
 
     var original = UpsertRow{ .email = "a@example.com", .name = "one", .note = "keep" };
     try std.testing.expect(try db.upsert(&original, replace_name));
@@ -1872,7 +1872,7 @@ test "upsert supports conflict policies, excluded updates, batches, and returnin
     try std.testing.expect(try db.upsert(&replacement, replace_name));
     try std.testing.expectEqual(original.id, replacement.id);
     const updated = (try db.find(UpsertRow, original.id.?)).?;
-    defer z.free(UpsertRow, updated, gpa);
+    defer zg.free(UpsertRow, updated, gpa);
     try std.testing.expectEqualStrings("two", updated.name);
     try std.testing.expectEqualStrings("keep", updated.note);
 
@@ -1896,15 +1896,15 @@ test "RETURNING supports insert projections, batches, update, and delete" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const dsn = test_options.dsn orelse return error.SkipZigTest;
-    const db = try z.Db.connectDsn(gpa, threaded.io(), dsn, 4);
+    const db = try zg.Db.connectDsn(gpa, threaded.io(), dsn, 4);
     defer db.deinit();
 
-    drop(try db.execRaw("DROP TABLE IF EXISTS zorm_upsert_rows CASCADE"));
+    drop(try db.execRaw("DROP TABLE IF EXISTS zgorm_upsert_rows CASCADE"));
     try db.autoMigrate(UpsertRow);
 
     var one = UpsertRow{ .email = "return@example.com", .name = "return-one", .note = "note" };
     const projection = try db.insertReturning(&one, ReturningProjection, &.{ "id", "name" });
-    defer z.free(ReturningProjection, projection, gpa);
+    defer zg.free(ReturningProjection, projection, gpa);
     try std.testing.expectEqual(one.id, projection.id);
     try std.testing.expectEqualStrings("return-one", projection.name);
 
@@ -1914,30 +1914,30 @@ test "RETURNING supports insert projections, batches, update, and delete" {
     };
     const projected = try db.insertBatchReturning(&batch, ReturningProjection, &.{"name"});
     defer {
-        for (projected) |item| z.free(ReturningProjection, item, gpa);
+        for (projected) |item| zg.free(ReturningProjection, item, gpa);
         gpa.free(projected);
     }
     try std.testing.expectEqual(@as(usize, 2), projected.len);
     try std.testing.expectEqualStrings("batch-b", projected[0].name);
     try std.testing.expect(batch[0].id != null and batch[1].id != null);
 
-    const updated = try z.query(UpsertRow, db)
+    const updated = try zg.query(UpsertRow, db)
         .whereEq("email", "return@example.com")
         .returning(&.{ "id", "email", "name", "note" })
         .updateReturning(.{ .name = "returned-update" }, gpa);
     defer {
-        for (updated) |item| z.free(UpsertRow, item, gpa);
+        for (updated) |item| zg.free(UpsertRow, item, gpa);
         gpa.free(updated);
     }
     try std.testing.expectEqual(@as(usize, 1), updated.len);
     try std.testing.expectEqualStrings("returned-update", updated[0].name);
 
-    const deleted = try z.query(UpsertRow, db)
+    const deleted = try zg.query(UpsertRow, db)
         .whereEq("email", "return@example.com")
         .returning(&.{ "id", "name" })
         .deleteReturning(gpa);
     defer {
-        for (deleted) |item| z.free(UpsertRow, item, gpa);
+        for (deleted) |item| zg.free(UpsertRow, item, gpa);
         gpa.free(deleted);
     }
     try std.testing.expectEqual(@as(usize, 1), deleted.len);
@@ -1951,10 +1951,10 @@ test "query builder supports advanced PostgreSQL composition" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const dsn = test_options.dsn orelse return error.SkipZigTest;
-    const db = try z.Db.connectDsn(gpa, threaded.io(), dsn, 4);
+    const db = try zg.Db.connectDsn(gpa, threaded.io(), dsn, 4);
     defer db.deinit();
 
-    drop(try db.execRaw("DROP TABLE IF EXISTS zorm_upsert_rows CASCADE"));
+    drop(try db.execRaw("DROP TABLE IF EXISTS zgorm_upsert_rows CASCADE"));
     try db.autoMigrate(UpsertRow);
     var rows = [_]UpsertRow{
         .{ .email = "advanced-a@example.com", .name = "alpha", .note = "json-note" },
@@ -1963,16 +1963,16 @@ test "query builder supports advanced PostgreSQL composition" {
     try db.insertBatch(&rows);
 
     const active_scope = struct {
-        fn apply(q: *z.db.Query(UpsertRow)) *z.db.Query(UpsertRow) {
+        fn apply(q: *zg.db.Query(UpsertRow)) *zg.db.Query(UpsertRow) {
             return q.where("name <> $1", .{"never"});
         }
     }.apply;
-    var dry = try z.query(UpsertRow, db)
-        .join("JOIN (SELECT $1::text AS email) j ON j.email = zorm_upsert_rows.email", .{"advanced-a@example.com"})
+    var dry = try zg.query(UpsertRow, db)
+        .join("JOIN (SELECT $1::text AS email) j ON j.email = zgorm_upsert_rows.email", .{"advanced-a@example.com"})
         .whereExists("SELECT 1 WHERE $1::boolean", .{true})
         .whereNamed("name = :name", .{ .name = "alpha" })
         .scope(active_scope)
-        .hint("SeqScan(zorm_upsert_rows)")
+        .hint("SeqScan(zgorm_upsert_rows)")
         .dryRun(gpa);
     defer dry.deinit();
     try std.testing.expectEqual(@as(usize, 4), dry.params.len);
@@ -1981,24 +1981,24 @@ test "query builder supports advanced PostgreSQL composition" {
     try std.testing.expect(std.mem.indexOf(u8, dry.sql, "name = $3") != null);
     try std.testing.expect(std.mem.indexOf(u8, dry.sql, "/*+ SeqScan") != null);
 
-    try std.testing.expectEqual(@as(i64, 2), try z.query(UpsertRow, db)
+    try std.testing.expectEqual(@as(i64, 2), try zg.query(UpsertRow, db)
         .with("chosen", "SELECT $1::text AS email", .{"unused@example.com"})
         .withRecursive("nums", "SELECT 1 AS n UNION ALL SELECT n + 1 FROM nums WHERE n < $1", .{@as(i64, 3)})
         .whereExists("SELECT 1 FROM nums WHERE n = $1", .{@as(i64, 3)})
         .count());
 
-    const unioned = try z.query(UpsertRow, db)
+    const unioned = try zg.query(UpsertRow, db)
         .whereEq("email", "advanced-a@example.com")
-        .unionAll("SELECT * FROM zorm_upsert_rows WHERE email = $1", .{"advanced-b@example.com"})
+        .unionAll("SELECT * FROM zgorm_upsert_rows WHERE email = $1", .{"advanced-b@example.com"})
         .order_by("id")
         .all(gpa);
     defer {
-        for (unioned) |item| z.free(UpsertRow, item, gpa);
+        for (unioned) |item| zg.free(UpsertRow, item, gpa);
         gpa.free(unioned);
     }
     try std.testing.expectEqual(@as(usize, 2), unioned.len);
 
-    const expressions = try z.query(UpsertRow, db)
+    const expressions = try zg.query(UpsertRow, db)
         .distinctOn(&.{"id"})
         .selectRaw(&.{
             "id",
@@ -2010,14 +2010,14 @@ test "query builder supports advanced PostgreSQL composition" {
         .order_by("id")
         .all(gpa);
     defer {
-        for (expressions) |item| z.free(UpsertRow, item, gpa);
+        for (expressions) |item| zg.free(UpsertRow, item, gpa);
         gpa.free(expressions);
     }
     try std.testing.expectEqual(@as(usize, 1), expressions.len);
     try std.testing.expectEqualStrings("case-ok", expressions[0].name);
     try std.testing.expectEqualStrings("1", expressions[0].note);
 
-    var plan = try z.query(UpsertRow, db).whereEq("email", "advanced-a@example.com").explain(false);
+    var plan = try zg.query(UpsertRow, db).whereEq("email", "advanced-a@example.com").explain(false);
     defer plan.deinit();
     try std.testing.expect(plan.rows.len > 0);
 }
@@ -2029,16 +2029,16 @@ test "composite primary keys migrate and drive find update delete and upsert" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const dsn = test_options.dsn orelse return error.SkipZigTest;
-    const db = try z.Db.connectDsn(gpa, threaded.io(), dsn, 4);
+    const db = try zg.Db.connectDsn(gpa, threaded.io(), dsn, 4);
     defer db.deinit();
 
-    drop(try db.execRaw("DROP TABLE IF EXISTS zorm_composite_rows CASCADE"));
+    drop(try db.execRaw("DROP TABLE IF EXISTS zgorm_composite_rows CASCADE"));
     try db.autoMigrate(CompositeRow);
     var row = CompositeRow{ .tenant_id = 7, .code = "alpha", .name = "first" };
     try db.insert(&row);
 
     var found = (try db.find(CompositeRow, .{ @as(i64, 7), "alpha" })).?;
-    defer z.free(CompositeRow, found, gpa);
+    defer zg.free(CompositeRow, found, gpa);
     gpa.free(found.name);
     found.name = try gpa.dupe(u8, "updated");
     try std.testing.expectEqual(@as(i64, 1), try db.update(&found));
@@ -2047,7 +2047,7 @@ test "composite primary keys migrate and drive find update delete and upsert" {
     var replacement = CompositeRow{ .tenant_id = 7, .code = "alpha", .name = "upserted" };
     try std.testing.expect(try db.upsert(&replacement, .{ .update = &.{"name"} }));
     const after = (try db.find(CompositeRow, .{ @as(i64, 7), "alpha" })).?;
-    defer z.free(CompositeRow, after, gpa);
+    defer zg.free(CompositeRow, after, gpa);
     try std.testing.expectEqualStrings("upserted", after.name);
 
     var pk_info = try db.exec(
@@ -2057,11 +2057,11 @@ test "composite primary keys migrate and drive find update delete and upsert" {
         \\  AND constraint_name = (SELECT constraint_name FROM information_schema.table_constraints
         \\                         WHERE table_schema = current_schema() AND table_name = $1
         \\                           AND constraint_type = 'PRIMARY KEY')
-    , .{"zorm_composite_rows"});
+    , .{"zgorm_composite_rows"});
     defer pk_info.deinit();
     try std.testing.expectEqualStrings("2", pk_info.rows[0][0].?);
 
-    drop(try db.execRaw("DROP TABLE IF EXISTS zorm_composite_children, zorm_composite_parents CASCADE"));
+    drop(try db.execRaw("DROP TABLE IF EXISTS zgorm_composite_children, zgorm_composite_parents CASCADE"));
     try db.autoMigrateAll(.{ CompositeParent, CompositeChild });
     var parent = CompositeParent{ .tenant_id = 7, .code = "parent", .name = "p" };
     try db.insert(&parent);
@@ -2070,11 +2070,11 @@ test "composite primary keys migrate and drive find update delete and upsert" {
         .{ .tenant_id = 8, .parent_code = "parent", .body = "other tenant" },
     };
     try db.insertBatch(&children);
-    const loaded = (try z.query(CompositeParent, db)
+    const loaded = (try zg.query(CompositeParent, db)
         .where("tenant_id = $1 AND code = $2", .{ @as(i64, 7), "parent" })
         .preload("children")
         .first()).?;
-    defer z.free(CompositeParent, loaded, gpa);
+    defer zg.free(CompositeParent, loaded, gpa);
     try std.testing.expectEqual(@as(usize, 1), loaded.children.len);
     try std.testing.expectEqualStrings("match", loaded.children[0].body);
 
@@ -2089,13 +2089,13 @@ test "association mode covers singular many-to-many polymorphic and cascades" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const dsn = test_options.dsn orelse return error.SkipZigTest;
-    const db = try z.Db.connectDsn(gpa, threaded.io(), dsn, 4);
+    const db = try zg.Db.connectDsn(gpa, threaded.io(), dsn, 4);
     defer db.deinit();
 
-    drop(try db.execRaw("DROP TABLE IF EXISTS zorm_owner_tags, zorm_assoc_notes, zorm_assoc_profiles, zorm_assoc_tags, zorm_assoc_owners CASCADE"));
+    drop(try db.execRaw("DROP TABLE IF EXISTS zgorm_owner_tags, zgorm_assoc_notes, zgorm_assoc_profiles, zgorm_assoc_tags, zgorm_assoc_owners CASCADE"));
     try db.autoMigrateAll(.{ AssocOwner, AssocProfile, AssocNote, AssocTag });
     drop(try db.execRaw(
-        "CREATE TABLE zorm_owner_tags (owner_id bigint NOT NULL, tag_id bigint NOT NULL, PRIMARY KEY (owner_id, tag_id))",
+        "CREATE TABLE zgorm_owner_tags (owner_id bigint NOT NULL, tag_id bigint NOT NULL, PRIMARY KEY (owner_id, tag_id))",
     ));
 
     var profile = AssocProfile{ .bio = "auto profile" };
@@ -2114,13 +2114,13 @@ test "association mode covers singular many-to-many polymorphic and cascades" {
     try std.testing.expectEqualStrings("owner", notes[0].owner_type);
     try std.testing.expect(tags[0].id != null);
 
-    const loaded = (try z.query(AssocOwner, db)
+    const loaded = (try zg.query(AssocOwner, db)
         .whereEq("id", owner.id)
         .joinPreload("profile")
         .preload("notes")
         .preload("tags")
         .first()).?;
-    defer z.free(AssocOwner, loaded, gpa);
+    defer zg.free(AssocOwner, loaded, gpa);
     try std.testing.expect(loaded.profile != null);
     try std.testing.expectEqual(@as(usize, 1), loaded.notes.len);
     try std.testing.expectEqual(@as(usize, 1), loaded.tags.len);
@@ -2139,8 +2139,8 @@ test "association mode covers singular many-to-many polymorphic and cascades" {
     try std.testing.expectEqual(@as(i64, 0), try tag_assoc.count());
 
     try std.testing.expectEqual(@as(i64, 1), try db.delete(&owner));
-    try std.testing.expectEqual(@as(i64, 0), try z.query(AssocProfile, db).count());
-    try std.testing.expectEqual(@as(i64, 0), try z.query(AssocNote, db).count());
+    try std.testing.expectEqual(@as(i64, 0), try zg.query(AssocProfile, db).count());
+    try std.testing.expectEqual(@as(i64, 0), try zg.query(AssocNote, db).count());
 }
 
 test "custom codecs cover PostgreSQL scalar and user-defined formats" {
@@ -2152,12 +2152,12 @@ test "custom codecs cover PostgreSQL scalar and user-defined formats" {
     const dsn = test_options.dsn orelse return error.SkipZigTest;
     var cfg_arena = std.heap.ArenaAllocator.init(gpa);
     defer cfg_arena.deinit();
-    var cfg = try z.pq.parseDsn(cfg_arena.allocator(), dsn);
+    var cfg = try zg.pq.parseDsn(cfg_arena.allocator(), dsn);
     cfg.binary_results = false;
-    const db = try z.Db.connect(gpa, threaded.io(), cfg, 4);
+    const db = try zg.Db.connect(gpa, threaded.io(), cfg, 4);
     defer db.deinit();
 
-    drop(try db.execRaw("DROP TABLE IF EXISTS zorm_codec_rows CASCADE"));
+    drop(try db.execRaw("DROP TABLE IF EXISTS zgorm_codec_rows CASCADE"));
     try db.autoMigrate(CodecRow);
     var row = CodecRow{
         .uuid = .{ .data = "550e8400-e29b-41d4-a716-446655440000" },
@@ -2170,7 +2170,7 @@ test "custom codecs cover PostgreSQL scalar and user-defined formats" {
     };
     try db.insert(&row);
     const found = (try db.find(CodecRow, row.id.?)).?;
-    defer z.free(CodecRow, found, gpa);
+    defer zg.free(CodecRow, found, gpa);
     try std.testing.expectEqualStrings(row.uuid.data, found.uuid.data);
     try std.testing.expectEqualStrings(row.amount.data, found.amount.data);
     try std.testing.expectEqualStrings("192.0.2.1", found.address.data);
@@ -2181,12 +2181,12 @@ test "custom codecs cover PostgreSQL scalar and user-defined formats" {
         std.mem.indexOf(u8, found.payload.data, "\"ok\":true") != null);
 
     const GeoRow = struct {
-        shape: z.Geometry,
+        shape: zg.Geometry,
     };
-    try std.testing.expectEqualStrings("geometry", comptime z.schema.tableOf(GeoRow).columns[0].ddl_type);
+    try std.testing.expectEqualStrings("geometry", comptime zg.schema.tableOf(GeoRow).columns[0].ddl_type);
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const encoded = try z.value.toParam(z.Geometry{ .data = "POINT(1 2)" }, arena_state.allocator());
+    const encoded = try zg.value.toParam(zg.Geometry{ .data = "POINT(1 2)" }, arena_state.allocator());
     try std.testing.expectEqualStrings("POINT(1 2)", encoded.data);
 }
 
@@ -2204,7 +2204,7 @@ test "v5: primary replica tenant and shard routing" {
     const replica_b = (try makeDb(gpa, threaded.io())) orelse return;
     defer replica_b.deinit();
 
-    var router = z.Router.init(gpa, primary, &.{ replica_a, replica_b });
+    var router = zg.Router.init(gpa, primary, &.{ replica_a, replica_b });
     defer router.deinit();
     try std.testing.expect((try router.writer()) == primary);
     try std.testing.expect((try router.reader()) == replica_a);
@@ -2227,10 +2227,10 @@ test "v5: primary replica tenant and shard routing" {
 
     var cfg_arena = std.heap.ArenaAllocator.init(gpa);
     defer cfg_arena.deinit();
-    const failed_primary = try z.Db.connect(gpa, threaded.io(), try z.pq.parseDsn(cfg_arena.allocator(), dsn), 1);
+    const failed_primary = try zg.Db.connect(gpa, threaded.io(), try zg.pq.parseDsn(cfg_arena.allocator(), dsn), 1);
     failed_primary.pool.deinit();
     defer gpa.destroy(failed_primary);
-    var failover = z.Router.init(gpa, failed_primary, &.{replica_a});
+    var failover = zg.Router.init(gpa, failed_primary, &.{replica_a});
     defer failover.deinit();
     try std.testing.expect((try failover.writer()) == replica_a);
 }
@@ -2244,33 +2244,33 @@ const PluginProbe = struct {
     audits: usize = 0,
     invalidations: usize = 0,
 
-    fn beforeQuery(raw: ?*anyopaque, _: z.plugins.QueryContext) bool {
+    fn beforeQuery(raw: ?*anyopaque, _: zg.plugins.QueryContext) bool {
         const probe: *PluginProbe = @ptrCast(@alignCast(raw.?));
         probe.before_queries += 1;
         return true;
     }
-    fn afterQuery(raw: ?*anyopaque, _: z.plugins.QueryContext) void {
+    fn afterQuery(raw: ?*anyopaque, _: zg.plugins.QueryContext) void {
         const probe: *PluginProbe = @ptrCast(@alignCast(raw.?));
         probe.after_queries += 1;
     }
-    fn beforeCrud(raw: ?*anyopaque, _: z.plugins.CrudContext) bool {
+    fn beforeCrud(raw: ?*anyopaque, _: zg.plugins.CrudContext) bool {
         const probe: *PluginProbe = @ptrCast(@alignCast(raw.?));
         probe.before_crud += 1;
         return true;
     }
-    fn afterCrud(raw: ?*anyopaque, _: z.plugins.CrudContext) void {
+    fn afterCrud(raw: ?*anyopaque, _: zg.plugins.CrudContext) void {
         const probe: *PluginProbe = @ptrCast(@alignCast(raw.?));
         probe.after_crud += 1;
     }
-    fn trace(raw: ?*anyopaque, _: z.QueryEvent) void {
+    fn trace(raw: ?*anyopaque, _: zg.QueryEvent) void {
         const probe: *PluginProbe = @ptrCast(@alignCast(raw.?));
         probe.traces += 1;
     }
-    fn audit(raw: ?*anyopaque, _: z.plugins.CrudContext) void {
+    fn audit(raw: ?*anyopaque, _: zg.plugins.CrudContext) void {
         const probe: *PluginProbe = @ptrCast(@alignCast(raw.?));
         probe.audits += 1;
     }
-    fn invalidate(raw: ?*anyopaque, _: z.plugins.Operation) void {
+    fn invalidate(raw: ?*anyopaque, _: zg.plugins.Operation) void {
         const probe: *PluginProbe = @ptrCast(@alignCast(raw.?));
         probe.invalidations += 1;
     }
@@ -2280,7 +2280,7 @@ const PluginRow = struct {
     id: ?i64 = null,
     tenant_id: i64,
     name: []const u8,
-    pub const zorm = .{ .table = "v5_plugin_rows" };
+    pub const zgorm = .{ .table = "v5_plugin_rows" };
 };
 
 test "v5: global callbacks and production plugins" {
@@ -2295,10 +2295,10 @@ test "v5: global callbacks and production plugins" {
     try db.autoMigrate(PluginRow);
 
     var probe: PluginProbe = .{};
-    var plugin_metrics: z.PluginMetrics = .{};
-    var trace = z.TracePlugin{ .context = &probe, .emit = PluginProbe.trace };
-    var audit = z.AuditPlugin{ .context = &probe, .record = PluginProbe.audit };
-    var cache = z.CacheInvalidationPlugin{ .context = &probe, .invalidate = PluginProbe.invalidate };
+    var plugin_metrics: zg.PluginMetrics = .{};
+    var trace = zg.TracePlugin{ .context = &probe, .emit = PluginProbe.trace };
+    var audit = zg.AuditPlugin{ .context = &probe, .record = PluginProbe.audit };
+    var cache = zg.CacheInvalidationPlugin{ .context = &probe, .invalidate = PluginProbe.invalidate };
     try db.addPlugin(.{
         .context = &probe,
         .before_query = PluginProbe.beforeQuery,
@@ -2318,11 +2318,11 @@ test "v5: global callbacks and production plugins" {
     try db.insert(&b);
     try db.insert(&other);
 
-    var query = z.query(PluginRow, db);
-    query = (z.TenantFilterPlugin{}).apply(query, @as(i64, 1));
-    query = (z.PaginationPlugin{ .page = 0, .per_page = 1 }).apply(query);
+    var query = zg.query(PluginRow, db);
+    query = (zg.TenantFilterPlugin{}).apply(query, @as(i64, 1));
+    query = (zg.PaginationPlugin{ .page = 0, .per_page = 1 }).apply(query);
     const rows = try query.order_by("\"id\" ASC").all(gpa);
-    defer z.freeSlice(PluginRow, rows, gpa);
+    defer zg.freeSlice(PluginRow, rows, gpa);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqual(@as(i64, 1), rows[0].tenant_id);
 
@@ -2342,9 +2342,9 @@ test "v5: global callbacks and production plugins" {
 const RetryProbe = struct {
     attempts: usize = 0,
     fail_until: usize,
-    failure: z.Error,
+    failure: zg.Error,
 
-    fn run(probe: *RetryProbe, tx: *z.Tx) z.Error!void {
+    fn run(probe: *RetryProbe, tx: *zg.Tx) zg.Error!void {
         probe.attempts += 1;
         if (probe.attempts <= probe.fail_until) return probe.failure;
         var result = try tx.exec("INSERT INTO v5_retry_log (attempts) VALUES ($1)", .{@as(i64, @intCast(probe.attempts))});
@@ -2363,7 +2363,7 @@ test "v5: explicit transaction retries are bounded and selective" {
     drop(try db.execRaw("DROP TABLE IF EXISTS v5_retry_log"));
     drop(try db.execRaw("CREATE TABLE v5_retry_log (attempts bigint)"));
 
-    const options = z.RetryOptions{ .max_attempts = 4, .base_delay_ms = 1, .max_delay_ms = 2 };
+    const options = zg.RetryOptions{ .max_attempts = 4, .base_delay_ms = 1, .max_delay_ms = 2 };
     var serialization = RetryProbe{ .fail_until = 2, .failure = error.SerializationFailure };
     try db.transactionRetry(options, &serialization, RetryProbe.run);
     try std.testing.expectEqual(@as(usize, 3), serialization.attempts);

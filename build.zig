@@ -6,13 +6,13 @@ pub fn build(b: *std.Build) void {
     const dsn_opt = b.option([]const u8, "dsn", "PostgreSQL DSN (example + integration tests)");
     const mysql_port = b.option(u16, "mysql-port", "MySQL/MariaDB port for driver tests");
     const mysql_host = b.option([]const u8, "mysql-host", "MySQL/MariaDB host") orelse "127.0.0.1";
-    const mysql_user = b.option([]const u8, "mysql-user", "MySQL/MariaDB user") orelse "zorm";
-    const mysql_password = b.option([]const u8, "mysql-password", "MySQL/MariaDB password") orelse "zorm";
-    const mysql_database = b.option([]const u8, "mysql-database", "MySQL/MariaDB database") orelse "zorm";
+    const mysql_user = b.option([]const u8, "mysql-user", "MySQL/MariaDB user") orelse "zgorm";
+    const mysql_password = b.option([]const u8, "mysql-password", "MySQL/MariaDB password") orelse "zgorm";
+    const mysql_database = b.option([]const u8, "mysql-database", "MySQL/MariaDB database") orelse "zgorm";
     const mysql_ssl = b.option(bool, "mysql-ssl", "Require TLS for MySQL/MariaDB driver tests") orelse false;
 
-    // Library module "zorm".
-    const mod = b.addModule("zorm", .{
+    // Library module "zgorm".
+    const mod = b.addModule("zgorm", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -21,13 +21,13 @@ pub fn build(b: *std.Build) void {
 
     // Example executable.
     const example = b.addExecutable(.{
-        .name = "zorm-example",
+        .name = "zgorm-example",
         .root_module = b.createModule(.{
             .root_source_file = b.path("example/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zorm", .module = mod },
+                .{ .name = "zgorm", .module = mod },
             },
         }),
     });
@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zorm", .module = mod },
+                .{ .name = "zgorm", .module = mod },
                 .{ .name = "test_options", .module = test_options.createModule() },
             },
         }),
@@ -78,7 +78,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zorm", .module = mod },
+                .{ .name = "zgorm", .module = mod },
                 .{ .name = "driver_options", .module = driver_options.createModule() },
             },
         }),
@@ -89,21 +89,21 @@ pub fn build(b: *std.Build) void {
     driver_step.dependOn(&run_driver_tests.step);
 
     const benchmark = b.addExecutable(.{
-        .name = "zorm-benchmark",
+        .name = "zgorm-benchmark",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("benchmark/zorm.zig"),
+            .root_source_file = b.path("benchmark/zgorm.zig"),
             .target = target,
             .optimize = .ReleaseFast,
             .imports = &.{
-                .{ .name = "zorm", .module = mod },
+                .{ .name = "zgorm", .module = mod },
             },
         }),
     });
     const run_benchmark = b.addRunArtifact(benchmark);
     if (dsn_opt) |dsn| run_benchmark.setEnvironmentVariable("ZORM_DSN", dsn);
-    const benchmark_step = b.step("benchmark", "Run the zorm PostgreSQL benchmark suite");
+    const benchmark_step = b.step("benchmark", "Run the zgorm PostgreSQL benchmark suite");
     benchmark_step.dependOn(&run_benchmark.step);
     const install_benchmark = b.addInstallArtifact(benchmark, .{});
-    const benchmark_build_step = b.step("benchmark-build", "Build the zorm benchmark executable");
+    const benchmark_build_step = b.step("benchmark-build", "Build the zgorm benchmark executable");
     benchmark_build_step.dependOn(&install_benchmark.step);
 }

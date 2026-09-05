@@ -48,7 +48,7 @@ pub const AuthType = enum(i32) {
 
 pub const sasl_mechanism_scram_sha256 = "SCRAM-SHA-256";
 
-/// Well known OIDs. Only the subset zorm needs for decoding decisions.
+/// Well known OIDs. Only the subset zgorm needs for decoding decisions.
 pub const Oid = struct {
     pub const bool_ = 16;
     pub const bytea = 17;

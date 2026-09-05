@@ -10,7 +10,7 @@ pub fn Association(
     comptime field_name: []const u8,
 ) type {
     const assoc = comptime schema.tableOf(M).assoc(field_name) orelse
-        @compileError("zorm: unknown association " ++ field_name);
+        @compileError("zgorm: unknown association " ++ field_name);
     const Child = assoc.model;
     return struct {
         const Self = @This();

@@ -1,4 +1,4 @@
-//! zorm — a GORM-inspired ORM for Zig, PostgreSQL first.
+//! zgorm — a GORM-inspired ORM for Zig.
 //!
 //! Library root module. See README.md for a quick tour.
 

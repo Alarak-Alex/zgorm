@@ -504,7 +504,7 @@ pub const Conn = struct {
         set_sql.writer.writeAll("SET ") catch return error.OutOfMemory;
         for (params, 0..) |param, index| {
             if (index != 0) set_sql.writer.writeAll(", ") catch return error.OutOfMemory;
-            set_sql.writer.print("@zorm_p{d} = ", .{index}) catch return error.OutOfMemory;
+            set_sql.writer.print("@zgorm_p{d} = ", .{index}) catch return error.OutOfMemory;
             try writeParam(&set_sql.writer, param);
         }
         try conn.execControl(set_sql.writer.buffered());
@@ -512,7 +512,7 @@ pub const Conn = struct {
         execute_sql.writer.print("EXECUTE {s} USING ", .{name}) catch return error.OutOfMemory;
         for (params, 0..) |_, index| {
             if (index != 0) execute_sql.writer.writeAll(", ") catch return error.OutOfMemory;
-            execute_sql.writer.print("@zorm_p{d}", .{index}) catch return error.OutOfMemory;
+            execute_sql.writer.print("@zgorm_p{d}", .{index}) catch return error.OutOfMemory;
         }
         return conn.execOnce(execute_sql.writer.buffered());
     }
@@ -534,7 +534,7 @@ pub const Conn = struct {
             .name_len = 0,
         };
         errdefer conn.gpa.free(entry.sql);
-        const name = std.fmt.bufPrint(&entry.name, "zorm_{x}", .{conn.prepared_next_id}) catch
+        const name = std.fmt.bufPrint(&entry.name, "zgorm_{x}", .{conn.prepared_next_id}) catch
             return error.OutOfMemory;
         entry.name_len = @intCast(name.len);
         conn.prepared_next_id +%= 1;
@@ -542,12 +542,12 @@ pub const Conn = struct {
         var arena_state = std.heap.ArenaAllocator.init(conn.gpa);
         defer arena_state.deinit();
         var set_source: std.Io.Writer.Allocating = .init(arena_state.allocator());
-        set_source.writer.writeAll("SET @zorm_sql = CONVERT(X'") catch return error.OutOfMemory;
+        set_source.writer.writeAll("SET @zgorm_sql = CONVERT(X'") catch return error.OutOfMemory;
         for (sql) |byte| set_source.writer.print("{x:0>2}", .{byte}) catch return error.OutOfMemory;
         set_source.writer.writeAll("' USING utf8mb4)") catch return error.OutOfMemory;
         try conn.execControl(set_source.writer.buffered());
         var prepare_buf: [96]u8 = undefined;
-        const prepare_sql = std.fmt.bufPrint(&prepare_buf, "PREPARE {s} FROM @zorm_sql", .{entry.statementName()}) catch
+        const prepare_sql = std.fmt.bufPrint(&prepare_buf, "PREPARE {s} FROM @zgorm_sql", .{entry.statementName()}) catch
             return error.OutOfMemory;
         try conn.execControl(prepare_sql);
         conn.prepared.append(conn.gpa, entry) catch {

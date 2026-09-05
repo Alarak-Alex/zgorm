@@ -13,7 +13,7 @@ pub const DecodeError = error{ NullValue, TypeMismatch, OutOfMemory };
 
 fn hasCodec(comptime T: type) bool {
     return switch (@typeInfo(T)) {
-        .@"struct", .@"enum", .@"union" => @hasDecl(T, "zormEncode") and @hasDecl(T, "zormDecode"),
+        .@"struct", .@"enum", .@"union" => @hasDecl(T, "zgormEncode") and @hasDecl(T, "zgormDecode"),
         else => false,
     };
 }
@@ -21,13 +21,13 @@ fn hasCodec(comptime T: type) bool {
 pub fn TextScalar(comptime ddl: []const u8) type {
     return struct {
         data: []const u8,
-        pub const zormDdl = ddl;
+        pub const zgormDdl = ddl;
 
-        pub fn zormEncode(self: @This(), _: std.mem.Allocator) Error!Param {
+        pub fn zgormEncode(self: @This(), _: std.mem.Allocator) Error!Param {
             return .{ .oid = 0, .format = 0, .data = self.data };
         }
 
-        pub fn zormDecode(
+        pub fn zgormDecode(
             data: []const u8,
             _: u32,
             _: u16,
@@ -51,7 +51,7 @@ pub const Geometry = TextScalar("geometry");
 /// format. All scratch memory comes from `arena`.
 pub fn toParam(value: anytype, arena: std.mem.Allocator) Error!Param {
     const T = @TypeOf(value);
-    if (comptime hasCodec(T)) return value.zormEncode(arena);
+    if (comptime hasCodec(T)) return value.zgormEncode(arena);
     var num_buf: [64]u8 = undefined;
     return switch (@typeInfo(T)) {
         .null => Param.nullParam(proto.Oid.text),
@@ -100,10 +100,10 @@ pub fn toParam(value: anytype, arena: std.mem.Allocator) Error!Param {
                     },
                     .@"struct" => |si| {
                         if (!si.is_tuple) {
-                            if (@hasDecl(C, "__zorm_json")) {
+                            if (@hasDecl(C, "__zgorm_json")) {
                                 break :blk mkText(.{ .oid = proto.Oid.jsonb, .data = value.data });
                             }
-                            if (@hasDecl(C, "__zorm_bytes")) {
+                            if (@hasDecl(C, "__zgorm_bytes")) {
                                 break :blk mkBinary(.{ .oid = proto.Oid.bytea, .data = value.data });
                             }
                         }
@@ -130,7 +130,7 @@ pub fn toParam(value: anytype, arena: std.mem.Allocator) Error!Param {
             break :blk Param.nullParam(nullOidOf(@TypeOf(value)));
         },
         .@"struct" => blk: {
-            if (@hasDecl(T, "__zorm_time")) {
+            if (@hasDecl(T, "__zgorm_time")) {
                 // PostgreSQL receives its native binary instant; other
                 // drivers use the canonical timestamp text.
                 var buf: [8]u8 = undefined;
@@ -143,15 +143,15 @@ pub fn toParam(value: anytype, arena: std.mem.Allocator) Error!Param {
                     .data = arena.dupe(u8, &buf) catch return error.OutOfMemory,
                 });
             }
-            if (@hasDecl(T, "__zorm_json")) {
+            if (@hasDecl(T, "__zgorm_json")) {
                 break :blk mkText(.{ .oid = proto.Oid.jsonb, .kind = .json, .data = value.data });
             }
-            if (@hasDecl(T, "__zorm_bytes")) {
+            if (@hasDecl(T, "__zgorm_bytes")) {
                 break :blk mkBinary(.{ .oid = proto.Oid.bytea, .kind = .bytes, .data = value.data });
             }
-            @compileError("zorm: unsupported parameter type " ++ @typeName(T));
+            @compileError("zgorm: unsupported parameter type " ++ @typeName(T));
         },
-        else => @compileError("zorm: unsupported parameter type " ++ @typeName(T)),
+        else => @compileError("zgorm: unsupported parameter type " ++ @typeName(T)),
     };
 }
 
@@ -175,7 +175,7 @@ pub const Model = struct {
     updated_at: ?Time = null,
     deleted_at: ?Time = null,
 
-    pub const __zorm_embedded = true;
+    pub const __zgorm_embedded = true;
 };
 
 /// The leaf value type a column maps to (resolves through embedded models).
@@ -190,7 +190,7 @@ fn fieldOf(comptime T: type, comptime name: []const u8) type {
     inline for (@typeInfo(T).@"struct".fields) |f| {
         if (comptime std.mem.eql(u8, f.name, name)) return f.type;
     }
-    @compileError("zorm: model " ++ @typeName(T) ++ " has no field " ++ name);
+    @compileError("zgorm: model " ++ @typeName(T) ++ " has no field " ++ name);
 }
 
 /// Reads a column's leaf value (supports embedded models).
@@ -214,14 +214,14 @@ pub fn setColumn(m: anytype, comptime col: schema.Column, v: columnFieldType(@Ty
 pub const Json = struct {
     data: []const u8,
 
-    pub const __zorm_json = true;
+    pub const __zgorm_json = true;
 };
 
 /// Wrapper mapping a raw-binary field to a `bytea` column.
 pub const Bytes = struct {
     data: []const u8,
 
-    pub const __zorm_bytes = true;
+    pub const __zgorm_bytes = true;
 };
 
 fn mkBinary(p: Param) Param {
@@ -291,8 +291,8 @@ pub fn oidOf(comptime T: type) u32 {
                     .array => |ai| if (ai.child == u8) break :blk proto.Oid.text,
                     .@"struct" => |si| {
                         if (!si.is_tuple) {
-                            if (@hasDecl(C, "__zorm_json")) break :blk proto.Oid.jsonb;
-                            if (@hasDecl(C, "__zorm_bytes")) break :blk proto.Oid.bytea;
+                            if (@hasDecl(C, "__zgorm_json")) break :blk proto.Oid.jsonb;
+                            if (@hasDecl(C, "__zgorm_bytes")) break :blk proto.Oid.bytea;
                         }
                     },
                     else => {},
@@ -305,9 +305,9 @@ pub fn oidOf(comptime T: type) u32 {
         .@"enum", .enum_literal => proto.Oid.text,
         .optional => |oi| oidOf(oi.child),
         .@"struct" => blk: {
-            if (@hasDecl(T, "__zorm_time")) break :blk proto.Oid.timestamptz;
-            if (@hasDecl(T, "__zorm_json")) break :blk proto.Oid.jsonb;
-            if (@hasDecl(T, "__zorm_bytes")) break :blk proto.Oid.bytea;
+            if (@hasDecl(T, "__zgorm_time")) break :blk proto.Oid.timestamptz;
+            if (@hasDecl(T, "__zgorm_json")) break :blk proto.Oid.jsonb;
+            if (@hasDecl(T, "__zgorm_bytes")) break :blk proto.Oid.bytea;
             break :blk proto.Oid.text;
         },
         else => proto.Oid.text,
@@ -440,14 +440,14 @@ fn writeArrayElement(comptime E: type, elem: E, w: *std.Io.Writer) !void {
                 try w.writeByte('}');
                 return;
             }
-            @compileError("zorm: unsupported array element type " ++ @typeName(E));
+            @compileError("zgorm: unsupported array element type " ++ @typeName(E));
         },
         .array => |ai| {
             if (ai.child == u8) {
                 try writeQuotedArrayText(w, std.mem.sliceTo(&elem, 0));
-            } else @compileError("zorm: unsupported array element type " ++ @typeName(E));
+            } else @compileError("zgorm: unsupported array element type " ++ @typeName(E));
         },
-        else => @compileError("zorm: unsupported array element type " ++ @typeName(E)),
+        else => @compileError("zgorm: unsupported array element type " ++ @typeName(E)),
     }
 }
 
@@ -588,7 +588,7 @@ fn decodeArrayElement(comptime E: type, raw: []const u8, quoted: bool, present: 
                 // Non-string scalar elements must appear as sub-arrays.
                 return error.TypeMismatch;
             }
-            @compileError("zorm: unsupported array element type " ++ @typeName(E));
+            @compileError("zgorm: unsupported array element type " ++ @typeName(E));
         },
         .int => {
             const trimmed = if (quoted) raw else std.mem.trim(u8, raw, " \t");
@@ -609,9 +609,9 @@ fn decodeArrayElement(comptime E: type, raw: []const u8, quoted: bool, present: 
                 if (!present) return nullElement(E) catch unreachable;
                 return gpa.dupe(u8, raw) catch return error.OutOfMemory;
             }
-            @compileError("zorm: unsupported array element type " ++ @typeName(E));
+            @compileError("zgorm: unsupported array element type " ++ @typeName(E));
         },
-        else => @compileError("zorm: unsupported array element type " ++ @typeName(E)),
+        else => @compileError("zgorm: unsupported array element type " ++ @typeName(E)),
     }
 }
 
@@ -625,7 +625,7 @@ pub fn decodeCell(comptime T: type, cell: ?[]const u8, type_oid: u32, format: u1
     }
     const data = cell orelse return error.NullValue;
     if (comptime hasCodec(T)) {
-        return T.zormDecode(data, type_oid, format, gpa) catch |err| switch (err) {
+        return T.zgormDecode(data, type_oid, format, gpa) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.TypeMismatch,
         };
@@ -705,19 +705,19 @@ pub fn decodeBinary(comptime T: type, data: []const u8, type_oid: u32, gpa: std.
                 }
                 break :blk try decodeBinaryArray(T, data, type_oid, gpa);
             }
-            @compileError("zorm: unsupported binary result type " ++ @typeName(T));
+            @compileError("zgorm: unsupported binary result type " ++ @typeName(T));
         },
         .@"enum" => blk: {
             const tag = std.meta.stringToEnum(T, data) orelse return error.TypeMismatch;
             break :blk tag;
         },
         .@"struct" => blk: {
-            if (@hasDecl(T, "__zorm_time")) {
+            if (@hasDecl(T, "__zgorm_time")) {
                 if (data.len != 8) return error.TypeMismatch;
                 const micros = std.mem.readInt(i64, data[0..8], .big);
                 break :blk T{ .micros = micros + pg_epoch_us };
             }
-            if (@hasDecl(T, "__zorm_json")) {
+            if (@hasDecl(T, "__zgorm_json")) {
                 // jsonb binary = 1-byte version (1) + json text; json = text.
                 if (type_oid == pq.proto.Oid.jsonb) {
                     if (data.len == 0 or data[0] != 1) return error.TypeMismatch;
@@ -725,12 +725,12 @@ pub fn decodeBinary(comptime T: type, data: []const u8, type_oid: u32, gpa: std.
                 }
                 break :blk T{ .data = gpa.dupe(u8, data) catch return error.OutOfMemory };
             }
-            if (@hasDecl(T, "__zorm_bytes")) {
+            if (@hasDecl(T, "__zgorm_bytes")) {
                 break :blk T{ .data = gpa.dupe(u8, data) catch return error.OutOfMemory };
             }
-            @compileError("zorm: unsupported binary result type " ++ @typeName(T));
+            @compileError("zgorm: unsupported binary result type " ++ @typeName(T));
         },
-        else => @compileError("zorm: unsupported binary result type " ++ @typeName(T)),
+        else => @compileError("zgorm: unsupported binary result type " ++ @typeName(T)),
     };
 }
 
@@ -874,28 +874,28 @@ fn decodeText(comptime T: type, text: []const u8, type_oid: u32, gpa: std.mem.Al
                 // array literal.
                 break :blk parseArrayText(ptr.child, text, gpa) catch return error.TypeMismatch;
             }
-            @compileError("zorm: unsupported result type " ++ @typeName(T));
+            @compileError("zgorm: unsupported result type " ++ @typeName(T));
         },
         .@"enum" => blk: {
             const tag = std.meta.stringToEnum(T, text) orelse return error.TypeMismatch;
             break :blk tag;
         },
         .@"struct" => blk: {
-            if (@hasDecl(T, "__zorm_time")) {
+            if (@hasDecl(T, "__zgorm_time")) {
                 break :blk Time.parsePg(text) catch return error.TypeMismatch;
             }
-            if (@hasDecl(T, "__zorm_json")) {
+            if (@hasDecl(T, "__zgorm_json")) {
                 break :blk T{ .data = gpa.dupe(u8, text) catch return error.OutOfMemory };
             }
-            if (@hasDecl(T, "__zorm_bytes")) {
+            if (@hasDecl(T, "__zgorm_bytes")) {
                 if (type_oid == pq.proto.Oid.bytea) {
                     break :blk T{ .data = decodeBytea(text, gpa) catch return error.TypeMismatch };
                 }
                 break :blk T{ .data = gpa.dupe(u8, text) catch return error.OutOfMemory };
             }
-            @compileError("zorm: unsupported result type " ++ @typeName(T));
+            @compileError("zgorm: unsupported result type " ++ @typeName(T));
         },
-        else => @compileError("zorm: unsupported result type " ++ @typeName(T)),
+        else => @compileError("zgorm: unsupported result type " ++ @typeName(T)),
     };
 }
 
@@ -932,7 +932,7 @@ pub fn freeValue(comptime T: type, value: T, gpa: std.mem.Allocator) void {
             }
         } else {},
         .@"struct" => |info| {
-            if (@hasDecl(T, "__zorm_time")) return;
+            if (@hasDecl(T, "__zgorm_time")) return;
             inline for (info.fields) |f| {
                 freeValue(f.type, @field(value, f.name), gpa);
             }
@@ -959,7 +959,7 @@ pub fn deepCopy(comptime T: type, value: T, gpa: std.mem.Allocator) DecodeError!
             break :blk value;
         },
         .@"struct" => |info| blk: {
-            if (@hasDecl(T, "__zorm_time")) break :blk value;
+            if (@hasDecl(T, "__zgorm_time")) break :blk value;
             var out: T = value;
             inline for (info.fields) |f| {
                 @field(out, f.name) = try deepCopy(f.type, @field(value, f.name), gpa);

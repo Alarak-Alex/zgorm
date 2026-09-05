@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-zorm 是面向 Zig 0.16 的 GORM-inspired ORM。提供纯 Zig PostgreSQL/MySQL 协议驱动、SQLite 驱动，以及类型化 CRUD、查询构建、事务、迁移、关联、连接池和可观测性能力。
+zgorm 是面向 Zig 0.16 的 GORM-inspired ORM。提供纯 Zig PostgreSQL/MySQL 协议驱动、SQLite 驱动，以及类型化 CRUD、查询构建、事务、迁移、关联、连接池和可观测性能力。
 
 ## Architecture & Data Flow
 
@@ -22,7 +22,7 @@ zorm 是面向 Zig 0.16 的 GORM-inspired ORM。提供纯 Zig PostgreSQL/MySQL �
 - `src/drivers/shared/`: 三个驱动共享的 backend、dialect、ORM、结果和错误类型。
 - `tests/`: 驱动测试和需要真实 PostgreSQL 的集成测试。
 - `example/`: 可运行的 PostgreSQL/SQLite smoke example。
-- `benchmark/`: zorm 性能程序和 GORM 对照程序。
+- `benchmark/`: zgorm 性能程序和 GORM 对照程序。
 
 ## Development Commands
 
@@ -37,7 +37,7 @@ zig build benchmark
 zig build benchmark-build
 ```
 
-- `zig build` 默认构建并安装 `zorm-example`。
+- `zig build` 默认构建并安装 `zgorm-example`。
 - `test-integration` 需要可写、专用 PostgreSQL 数据库；测试会 `DROP TABLE ... CASCADE`。
 - `test-drivers` 默认覆盖 SQLite；传 `-Dmysql-port=3307` 才运行 live MySQL 测试。
 - 发布前运行：`zig fmt --check build.zig.zon`、`zig build test`、`zig build -Doptimize=ReleaseSafe`。

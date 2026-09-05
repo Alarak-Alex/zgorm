@@ -200,7 +200,7 @@ pub fn Query(comptime T: type) type {
         pub fn whereNamed(q: *Self, frag: []const u8, named: anytype) *Self {
             const info = @typeInfo(@TypeOf(named));
             if (info != .@"struct" or info.@"struct".is_tuple)
-                @compileError("zorm: whereNamed expects a named struct");
+                @compileError("zgorm: whereNamed expects a named struct");
             const start = q.args.items.len;
             inline for (info.@"struct".fields) |field| {
                 const param = value.toParam(@field(named, field.name), q.a()) catch return q.errOut();
@@ -760,7 +760,7 @@ pub fn Query(comptime T: type) type {
             const query_gpa = q.sess.gpa;
             const info = @typeInfo(@TypeOf(sets));
             if (info != .@"struct" or info.@"struct".fields.len == 0)
-                @compileError("zorm: updateReturning expects a non-empty struct");
+                @compileError("zgorm: updateReturning expects a non-empty struct");
             var params: std.ArrayList(pq.Param) = .empty;
             defer params.deinit(query_gpa);
             var aw: std.Io.Writer.Allocating = .init(q.a());
@@ -772,7 +772,7 @@ pub fn Query(comptime T: type) type {
                 inline for (table.columns) |col| {
                     if (comptime std.mem.eql(u8, col.field_name, field.name)) column_name = col.name;
                 }
-                if (column_name == null) @compileError("zorm: update field is not a model column: " ++ field.name);
+                if (column_name == null) @compileError("zgorm: update field is not a model column: " ++ field.name);
                 w.print("{s} = ${d}", .{ try quoteIdent(q.a(), column_name.?), i + 1 }) catch return error.OutOfMemory;
                 params.append(q.sess.gpa, try value.toParam(@field(sets, field.name), q.a())) catch return error.OutOfMemory;
             }
@@ -808,7 +808,7 @@ pub fn ModelRows(comptime T: type) type {
         }
 
         /// Decodes and returns one model. The caller owns it and releases it
-        /// with `zorm.free(T, value, allocator)`.
+        /// with `zgorm.free(T, value, allocator)`.
         pub fn next(r: *Self) Error!?T {
             if (r.closed) return null;
             const raw = r.rows.next() catch |err| {
@@ -850,7 +850,7 @@ pub fn softDeleteStampSql(comptime FType: type) []const u8 {
     return switch (E) {
         time_mod.Time => "now()",
         i64 => "(extract(epoch from now()) * 1000000)::bigint",
-        else => @compileError("zorm: deleted_at must be zorm.Time or i64"),
+        else => @compileError("zgorm: deleted_at must be zgorm.Time or i64"),
     };
 }
 
@@ -871,9 +871,9 @@ pub fn validatePreloadPath(comptime M: type, comptime path: []const u8) void {
                 if (std.mem.eql(u8, a.field_name, seg)) found = a;
             }
             if (found == null) {
-                @compileError("zorm: preload('" ++ path ++ "'): '" ++ seg ++
+                @compileError("zgorm: preload('" ++ path ++ "'): '" ++ seg ++
                     "' is not a declared association of " ++ @typeName(model) ++
-                    " (declare it via `pub const zorm = .{ .has_many = ... }` or `.belongs_to = ...`)");
+                    " (declare it via `pub const zgorm = .{ .has_many = ... }` or `.belongs_to = ...`)");
             }
             model = found.?.model;
             rest = if (dot) |d| rest[d + 1 ..] else "";
@@ -910,7 +910,7 @@ fn loadAssoc(
     gpa: std.mem.Allocator,
 ) Error!void {
     if (assoc.primary_keys.len != assoc.foreign_keys.len)
-        @compileError("zorm: association primary_keys and foreign_keys must have equal length");
+        @compileError("zgorm: association primary_keys and foreign_keys must have equal length");
     if (assoc.primary_keys.len > 1)
         return loadCompositeAssoc(M, rows, assoc, nested, s, gpa);
 
@@ -1113,7 +1113,7 @@ fn loadCompositeAssoc(
 ) Error!void {
     const Child = assoc.model;
     if (assoc.kind == .has_one or assoc.kind == .many_to_many)
-        @compileError("zorm: composite has-one and many-to-many keys are not supported");
+        @compileError("zgorm: composite has-one and many-to-many keys are not supported");
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1303,7 +1303,7 @@ fn queryJoinedChildren(
     w.writeAll(", ") catch return error.OutOfMemory;
     try writeQualifiedIdent(w, assoc.join_table, assoc.join_foreign_key);
     w.writeAll(" AS ") catch return error.OutOfMemory;
-    try writeIdent(w, "__zorm_parent_key");
+    try writeIdent(w, "__zgorm_parent_key");
     w.writeAll(" FROM ") catch return error.OutOfMemory;
     try writeIdent(w, child_table.name);
     w.writeAll(" JOIN ") catch return error.OutOfMemory;
@@ -1328,7 +1328,7 @@ fn queryJoinedChildren(
 
     var key_index: ?usize = null;
     for (res.columns, 0..) |column, i| {
-        if (std.mem.eql(u8, column.name, "__zorm_parent_key")) {
+        if (std.mem.eql(u8, column.name, "__zgorm_parent_key")) {
             key_index = i;
             break;
         }
@@ -1399,7 +1399,7 @@ pub fn ColumnOfT(comptime M: type, comptime name: []const u8) schema.Column {
         if (comptime std.mem.eql(u8, column.field_name, name) or
             std.mem.eql(u8, column.name, name)) return column;
     }
-    @compileError("zorm: model " ++ @typeName(M) ++ " has no field " ++ name);
+    @compileError("zgorm: model " ++ @typeName(M) ++ " has no field " ++ name);
 }
 
 /// Resolves the leaf field type, including embedded model fields.
@@ -1530,7 +1530,7 @@ const SoftDeleteTestModel = struct {
     id: ?i64 = null,
     deleted_at: ?time_mod.Time = null,
 
-    pub const zorm = .{ .table = "records" };
+    pub const zgorm = .{ .table = "records" };
 };
 
 test "for update and soft delete SQL" {

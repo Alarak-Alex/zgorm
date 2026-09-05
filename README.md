@@ -1,4 +1,4 @@
-# zorm
+# zgorm
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -8,7 +8,7 @@ A GORM-inspired ORM for Zig 0.16 with first-class PostgreSQL, MySQL/MariaDB, and
 
 - **Pure-Zig PostgreSQL driver**: protocol 3.0, `SCRAM-SHA-256` / `MD5` / cleartext auth; simple query and extended query protocols (Parse/Bind/Describe/Execute, parameterized against SQL injection)
 - **Binary-format parameters**: scalars (ints/floats/bools/timestamps) are sent in binary format with explicit type OIDs; `bytea` travels raw — better performance and precision
-- **Array & JSON columns**: 1-D and multi-dimensional numeric/boolean arrays (`[]const i64`, `[][]const i64`, ...), text arrays (`[]const []const u8` = text[]), NULL elements via optional element types (`[]const ?f64`), plus `z.Json` (jsonb) and `z.Bytes` (bytea)
+- **Array & JSON columns**: 1-D and multi-dimensional numeric/boolean arrays (`[]const i64`, `[][]const i64`, ...), text arrays (`[]const []const u8` = text[]), NULL elements via optional element types (`[]const ?f64`), plus `zg.Json` (jsonb) and `zg.Bytes` (bytea)
 - **Binary-format results**: result sets are decoded from PostgreSQL's binary format (arrays, timestamps, jsonb, numeric scalars...) — opt out via `Config.binary_results = false`
 - **Comptime model reflection**: plain Zig structs are models — no macros, no codegen, zero runtime registration
 - **Convention over configuration**: camelCase → snake_case, `id` as the default primary key, auto-filled `created_at`/`updated_at`
@@ -18,7 +18,7 @@ A GORM-inspired ORM for Zig 0.16 with first-class PostgreSQL, MySQL/MariaDB, and
 - **Streaming rows**: model decoding and CSV export begin at the first row, keep large-result memory bounded, propagate iterator errors, and release connections after early termination
 - **Schema management**: additive `autoMigrate`, versioned migrations with advisory locking/checksums/dirty-state validation, schema diffs, type/rename/drop operations, constraints, and composite/partial/expression indexes
 - **Associations**: `belongs_to`, `has_one`, `has_many`, many-to-many and polymorphic declarations; nested and join preloading; association append/replace/delete/clear/count; cascade and auto-save support
-- **Custom codecs**: `zormEncode`/`zormDecode` plus UUID, decimal, IP/CIDR, range, geometry, enum, and JSON helpers
+- **Custom codecs**: `zgormEncode`/`zgormDecode` plus UUID, decimal, IP/CIDR, range, geometry, enum, and JSON helpers
 - **Observability**: structured query events, fingerprints, SQLSTATE/error classes, OpenTelemetry-compatible span hooks, Prometheus metrics, slow-query aggregation, prepared-cache rates, and pool metrics
 - **Routing**: primary/replica read-write routing, round-robin replicas, tenant and shard maps, health-based failover
 - **Plugins**: global query/CRUD callbacks plus tracing, metrics, AES-256-GCM encryption, tenant filtering, audit, pagination, and cache-invalidation helpers
@@ -29,11 +29,11 @@ A GORM-inspired ORM for Zig 0.16 with first-class PostgreSQL, MySQL/MariaDB, and
 
 - Zig **0.16.0**
 - PostgreSQL 10+ (14+ recommended; `trust` / `scram-sha-256` / `md5` password auth supported)
-- SQLite development headers/library when using `z.drivers.sqlite` (`libsqlite3`)
+- SQLite development headers/library when using `zg.drivers.sqlite` (`libsqlite3`)
 
 ## Quick start
 
-Add zorm as a dependency (build.zig.zon):
+Add zgorm as a dependency (build.zig.zon):
 
 ```sh
 zig fetch --save <git-url-or-tarball>
@@ -41,26 +41,26 @@ zig fetch --save <git-url-or-tarball>
 
 ```zig
 // build.zig
-const mod = b.addModule("zorm", .{
+const mod = b.addModule("zgorm", .{
     .root_source_file = b.path("src/root.zig"), // omit when consumed as a path dependency
 });
-mod.linkSystemLibrary("sqlite3", .{}); // required only when using z.drivers.sqlite
-// add .{ .name = "zorm", .module = mod } to your module's .imports
+mod.linkSystemLibrary("sqlite3", .{}); // required only when using zg.drivers.sqlite
+// add .{ .name = "zgorm", .module = mod } to your module's .imports
 ```
 
 ### Defining a model
 
-Models can embed `z.Model` (GORM `gorm.Model` equivalent) to get `id`,
+Models can embed `zg.Model` (GORM `gorm.Model` equivalent) to get `id`,
 `created_at`, `updated_at`, and `deleted_at` columns automatically. All three
 timestamp columns use PostgreSQL `timestamptz`; embedded fields are flattened
 into the table at comptime:
 
 ```zig
 pub const Post = struct {
-    base: z.Model = .{},     // id, created_at, updated_at, deleted_at
+    base: zg.Model = .{},     // id, created_at, updated_at, deleted_at
     title: []const u8 = "",
 
-    pub const zorm = .{ .table = "posts" };
+    pub const zgorm = .{ .table = "posts" };
 };
 // post.base.id is filled back on insert; timestamps are auto-stamped
 ```
@@ -69,7 +69,7 @@ Plain models without embedding work exactly the same way:
 
 ```zig
 const std = @import("std");
-const z = @import("zorm");
+const zg = @import("zgorm");
 
 pub const User = struct {
     id: ?i64 = null,              // optional integer PK => bigserial, filled back on insert
@@ -79,12 +79,12 @@ pub const User = struct {
     active: bool = true,
     balance: f64 = 0,
     status: Status = .draft,      // enums are stored as their name (text)
-    created_at: ?z.Time = null,   // name match => auto timestamp
-    updated_at: ?z.Time = null,
+    created_at: ?zg.Time = null,   // name match => auto timestamp
+    updated_at: ?zg.Time = null,
 
     pub const Status = enum { draft, review, published };
 
-    pub const zorm = .{           // optional per-model config
+    pub const zgorm = .{           // optional per-model config
         .table = "users",         // defaults to the type name in snake_case
         .unique = .{"email"},     // unique index (used by autoMigrate)
         .indexes = .{"age"},      // plain index
@@ -95,7 +95,7 @@ pub const User = struct {
 };
 ```
 
-> Note: once a model declares `pub const zorm`, reference library types inside that struct through an import alias (e.g. `const z = @import("zorm")` and then `?z.Time`), otherwise you get an ambiguous-reference compile error.
+> Note: once a model declares `pub const zgorm`, reference library types inside that struct through an import alias (e.g. `const zg = @import("zgorm")` and then `?zg.Time`), otherwise you get an ambiguous-reference compile error.
 
 ### Connecting and using
 
@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     // DSN: URL or key=value form
-    const db = try z.Db.connectDsn(gpa, io,
+    const db = try zg.Db.connectDsn(gpa, io,
         "postgres://user:pass@127.0.0.1:5432/app?sslmode=disable", 8);
     defer db.deinit();
 
@@ -116,26 +116,26 @@ pub fn main(init: std.process.Init) !void {
     try db.insert(&u);
 
     // Find by primary key (returns ?User; strings are allocated with gpa,
-    // release them with z.free)
+    // release them with zg.free)
     var found = (try db.find(User, u.id.?)).?;
-    defer z.free(User, found, gpa);
+    defer zg.free(User, found, gpa);
 
     // Update / save (inserts when the primary key is empty)
     found.age += 1;
     _ = try db.update(&found);
 
     // Query builder: placeholders are renumbered automatically
-    const adults = try z.query(User, db)
+    const adults = try zg.query(User, db)
         .where("age >= $1", .{18})
         .whereEq("active", true)
         .whereIn("status", .{ .published, .review })
         .order_by("created_at DESC")
         .limit(10)
         .all(gpa);
-    defer z.freeSlice(User, adults, gpa);
+    defer zg.freeSlice(User, adults, gpa);
 
-    const n = try z.query(User, db).where("age > $1", .{20}).count();
-    const exists = try z.query(User, db).whereEq("name", "Alice").exists();
+    const n = try zg.query(User, db).where("age > $1", .{20}).count();
+    const exists = try zg.query(User, db).whereEq("name", "Alice").exists();
 
     // Batch insert (auto-chunked)
     var posts = [_]Post{ .{ .title = "a" }, .{ .title = "b" } };
@@ -161,9 +161,9 @@ pub fn main(init: std.process.Init) !void {
 
 ## Memory ownership
 
-- **Strings** decoded by `db.find` / `Query.all` / `Query.first` are allocated with the allocator you pass in; release them with `z.free(T, value, gpa)` / `z.freeSlice(T, slice, gpa)`.
-- `z.free` must only be called on values whose string/slice fields were **not reassigned** after decoding (assigning a literal replaces the heap pointer with a static one). When in doubt, pass an arena.
-- To free a whole batch at once, pass an `ArenaAllocator` allocator (`z.free*` are harmless on arenas).
+- **Strings** decoded by `db.find` / `Query.all` / `Query.first` are allocated with the allocator you pass in; release them with `zg.free(T, value, gpa)` / `zg.freeSlice(T, slice, gpa)`.
+- `zg.free` must only be called on values whose string/slice fields were **not reassigned** after decoding (assigning a literal replaces the heap pointer with a static one). When in doubt, pass an arena.
+- To free a whole batch at once, pass an `ArenaAllocator` allocator (`zg.free*` are harmless on arenas).
 - `db.exec` / `execRaw` return a `pq.Result` that owns its memory: call `res.deinit()`.
 - Query builders are one-shot: terminal operations (`all`/`first`/`count`/`exists`/`delete`) release everything automatically.
 
@@ -183,19 +183,19 @@ Parameters: `host`, `port`, `user`, `password`, `dbname`/`database`, `sslmode`, 
 Preload paths nest with dots and are validated at compile time:
 
 ```zig
-const authors = try z.query(Author, db).preload("posts.comments").all(gpa);
+const authors = try zg.query(Author, db).preload("posts.comments").all(gpa);
 // authors[0].posts[i].comments[j] are filled
 ```
 
 ```zig
 pub const Author = struct {
-    base: z.Model = .{},
+    base: zg.Model = .{},
     name: []const u8 = "",
     posts: []Post = &.{},                       // inferred has_many
 };
 
 pub const Post = struct {
-    base: z.Model = .{},
+    base: zg.Model = .{},
     author_id: ?i64 = null,
     title: []const u8 = "",
     author: ?Author = null,                     // inferred belongs_to
@@ -204,17 +204,17 @@ pub const Post = struct {
 // Default inference:
 // Author.posts -> Post.author_id
 // Post.author  -> Post.author_id
-const authors = try z.query(Author, db).preload("posts").all(gpa);
-const posts   = try z.query(Post, db).preload("author").all(gpa);
+const authors = try zg.query(Author, db).preload("posts").all(gpa);
+const posts   = try zg.query(Post, db).preload("author").all(gpa);
 
 // Explicit configuration when naming does not follow convention:
 pub const ExplicitAuthor = struct {
-    base: z.Model = .{},
+    base: zg.Model = .{},
     posts: []Post = &.{},
 
-    pub const posts_relation = z.hasManyWith(
+    pub const posts_relation = zg.hasManyWith(
         Post,
-        z.AssociationOptions{
+        zg.AssociationOptions{
             .foreign_key = "owner_id",
         },
     );
@@ -227,17 +227,17 @@ pub const ExplicitAuthor = struct {
 ```zig
 pub const User = struct {
     // ...
-    pub fn beforeCreate(self: *User, s: *z.Session) z.Error!void {
+    pub fn beforeCreate(self: *User, s: *zg.Session) zg.Error!void {
         self.name = std.fmt.allocPrint(...); // mutate fields
     }
-    pub fn afterFind(self: *User, s: *z.Session) z.Error!void { ... }
+    pub fn afterFind(self: *User, s: *zg.Session) zg.Error!void { ... }
 };
 ```
-Available hooks: `beforeSave`, `beforeCreate`, `afterCreate`, `beforeUpdate`, `afterUpdate`, `beforeDelete`, `afterDelete`, `afterFind` (declare them on the model, all optional; return `z.Error!void`, use `error.HookAborted` to abort the operation).
+Available hooks: `beforeSave`, `beforeCreate`, `afterCreate`, `beforeUpdate`, `afterUpdate`, `beforeDelete`, `afterDelete`, `afterFind` (declare them on the model, all optional; return `zg.Error!void`, use `error.HookAborted` to abort the operation).
 
 ### Logging
 
-zorm ships with a default stderr logger (GORM-style): failed queries log at
+zgorm ships with a default stderr logger (GORM-style): failed queries log at
 error level, queries slower than the threshold at warn, and everything traces
 at info. Default level is `warn` with a 200ms slow-query threshold, so normal
 usage stays quiet. Its level tags use ANSI colors; custom sinks receive plain messages.
@@ -247,11 +247,11 @@ usage stays quiet. Its level tags use ANSI colors; custom sinks receive plain me
 db.setLogger(.{ .level = .info });
 
 // Silence:
-db.setLogger(z.Logger.discard);
+db.setLogger(zg.Logger.discard);
 
 // Custom sink (e.g. your log framework):
 const MyLogger = struct {
-    fn log(ctx: ?*anyopaque, level: z.LogLevel, msg: []const u8) void {
+    fn log(ctx: ?*anyopaque, level: zg.LogLevel, msg: []const u8) void {
         // `msg` contains elapsed time, row count, inlined SQL and params
         my_log_framework.write(level, msg);
     }
@@ -267,14 +267,14 @@ quoting handled), so they can be copied straight into `psql`.
 
 ### Soft delete
 
-Models with a `deleted_at` column (`?z.Time` or `?i64`, also included in `z.Model`) get GORM-style soft deletes:
+Models with a `deleted_at` column (`?zg.Time` or `?i64`, also included in `zg.Model`) get GORM-style soft deletes:
 
 ```zig
 _ = try db.delete(&user);            // UPDATE ... SET deleted_at = now()
 _ = try db.find(User, id);           // excludes soft-deleted rows
-_ = try z.query(User, db).count();   // filtered too; update/deleteWhere as well
+_ = try zg.query(User, db).count();   // filtered too; update/deleteWhere as well
 
-_ = try z.query(User, db).unscoped().count();  // include soft-deleted rows
+_ = try zg.query(User, db).unscoped().count();  // include soft-deleted rows
 _ = try db.findUnscoped(User, id);   // fetch a soft-deleted row by pk
 _ = try db.updateUnscoped(&user);    // update it too
 _ = try db.restore(&user);           // clear deleted_at by primary key
@@ -288,7 +288,7 @@ _ = try db.deleteWhereHard(User, "age < $1", .{5});
 var tx = try db.begin();
 defer tx.rollback();
 
-var sp = try tx.begin();     // SAVEPOINT zorm_sp_1
+var sp = try tx.begin();     // SAVEPOINT zgorm_sp_1
 var u2 = User{ .name = "maybe" };
 try sp.insert(&u2);
 try sp.rollback();           // undoes only this savepoint; use commit() to RELEASE
@@ -298,7 +298,7 @@ try tx.commit();
 ### Migration version management
 
 ```zig
-var m = z.Migrator.init(db);
+var m = zg.Migrator.init(db);
 defer m.deinit();
 m.add(&.{
     .{ .version = 1, .name = "create_users", .up = "CREATE TABLE users (...)", .down = "DROP TABLE users" },
@@ -312,11 +312,11 @@ The tracking table stores `version`, `name`, `checksum`, `dirty`, and `applied_a
 ### Plugins and explicit transaction retries
 
 ```zig
-var metrics: z.PluginMetrics = .{};
+var metrics: zg.PluginMetrics = .{};
 try db.addPlugin(metrics.plugin());
 
 const Retry = struct {
-    fn run(user: *User, tx: *z.Tx) z.Error!void {
+    fn run(user: *User, tx: *zg.Tx) zg.Error!void {
         try tx.insert(user);
     }
 };
@@ -335,30 +335,30 @@ deadlock, and optionally temporary connection failures. Ordinary CRUD and
 Tenant filtering and pagination remain explicit query transformations:
 
 ```zig
-var q = z.query(User, db);
-q = (z.TenantFilterPlugin{}).apply(q, tenant_id);
-q = (z.PaginationPlugin{ .page = 0, .per_page = 50 }).apply(q);
+var q = zg.query(User, db);
+q = (zg.TenantFilterPlugin{}).apply(q, tenant_id);
+q = (zg.PaginationPlugin{ .page = 0, .per_page = 50 }).apply(q);
 const page = try q.all(gpa);
 ```
 
 ### MySQL/MariaDB and SQLite
 
 ```zig
-const sqlite = try z.drivers.sqlite.Db.open(gpa, ":memory:");
+const sqlite = try zg.drivers.sqlite.Db.open(gpa, ":memory:");
 defer sqlite.deinit();
-var sqlite_db = z.drivers.sqlite.orm(sqlite);
+var sqlite_db = zg.drivers.sqlite.orm(sqlite);
 try sqlite_db.autoMigrate(User);
 var local_user = User{ .name = "Ada" };
 try sqlite_db.insert(&local_user);
 const local_rows = try sqlite_db.whereEq(User, "name", "Ada", gpa);
-defer z.freeSlice(User, local_rows, gpa);
+defer zg.freeSlice(User, local_rows, gpa);
 
-const mysql = try z.drivers.mysql.Conn.connect(gpa, io, .{
+const mysql = try zg.drivers.mysql.Conn.connect(gpa, io, .{
     .host = "127.0.0.1", .port = 3306,
     .user = "app", .password = "secret", .database = "app",
 });
 defer mysql.deinit();
-var mysql_db = z.drivers.mysql.orm(mysql);
+var mysql_db = zg.drivers.mysql.orm(mysql);
 try mysql_db.autoMigrate(User);
 var remote_user = User{ .name = "Grace" };
 try mysql_db.insert(&remote_user);
@@ -380,7 +380,7 @@ db.insert(&user) catch |err| {
         error.UniqueViolation => { /* lastError(db).code == "23505" */ },
         error.SerializationFailure => retry(),
         else => {
-            const e = z.lastError(db); // severity/code/message/detail/constraint...
+            const e = zg.lastError(db); // severity/code/message/detail/constraint...
         },
     }
 };
@@ -424,7 +424,7 @@ Integration coverage includes CRUD and batches, transactions/savepoints/retries,
 
 ## Acknowledgements
 
-zorm is inspired by [GORM](https://github.com/go-gorm/gorm), especially its approachable model conventions, chainable query API, hooks, associations, preloading, soft deletes, and migration ergonomics. Thanks to the GORM maintainers and contributors for building and evolving an excellent ORM for the Go ecosystem.
+zgorm is inspired by [GORM](https://github.com/go-gorm/gorm), especially its approachable model conventions, chainable query API, hooks, associations, preloading, soft deletes, and migration ergonomics. Thanks to the GORM maintainers and contributors for building and evolving an excellent ORM for the Go ecosystem.
 
 ## License
 

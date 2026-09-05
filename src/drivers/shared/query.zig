@@ -60,7 +60,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
         build_error: ?Error = null,
 
         pub fn init(db: *Db) *Self {
-            const query = db.backend.gpa.create(Self) catch @panic("zorm: out of memory");
+            const query = db.backend.gpa.create(Self) catch @panic("zgorm: out of memory");
             query.* = .{
                 .db = db,
                 .arena = std.heap.ArenaAllocator.init(db.backend.gpa),
@@ -118,7 +118,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
                     return q;
                 }
             }
-            @compileError("zorm: unknown association " ++ field_name);
+            @compileError("zgorm: unknown association " ++ field_name);
         }
 
         pub fn distinct(q: *Self) *Self {
@@ -147,7 +147,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
         }
 
         pub fn whereEq(q: *Self, comptime column: []const u8, needle: anytype) *Self {
-            if (comptime !table.hasColumn(column)) @compileError("zorm: unknown column " ++ column);
+            if (comptime !table.hasColumn(column)) @compileError("zgorm: unknown column " ++ column);
             var aw: std.Io.Writer.Allocating = .init(q.allocator());
             writeIdent(&aw.writer, column) catch return q.fail(error.OutOfMemory);
             aw.writer.writeAll(" = ?") catch return q.fail(error.OutOfMemory);
@@ -160,7 +160,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
         }
 
         pub fn whereIn(q: *Self, comptime column: []const u8, values: anytype) *Self {
-            if (comptime !table.hasColumn(column)) @compileError("zorm: unknown column " ++ column);
+            if (comptime !table.hasColumn(column)) @compileError("zgorm: unknown column " ++ column);
             const params = value.argsToParams(values, q.allocator()) catch |err| return q.fail(err);
             if (params.len == 0) return q.where("1 = 0", .{});
             var aw: std.Io.Writer.Allocating = .init(q.allocator());
@@ -413,7 +413,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
             const Sets = @TypeOf(sets);
             const info = @typeInfo(Sets);
             if (info != .@"struct" or info.@"struct".is_tuple)
-                @compileError("zorm: query update expects a named struct");
+                @compileError("zgorm: query update expects a named struct");
             if (info.@"struct".fields.len == 0) return error.InvalidQuery;
             var aw: std.Io.Writer.Allocating = .init(q.allocator());
             const w = &aw.writer;
@@ -422,7 +422,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
             try writeIdent(w, table.name);
             try w.writeAll(" SET ");
             inline for (info.@"struct".fields, 0..) |field, i| {
-                if (comptime !table.hasColumn(field.name)) @compileError("zorm: unknown column " ++ field.name);
+                if (comptime !table.hasColumn(field.name)) @compileError("zgorm: unknown column " ++ field.name);
                 if (i != 0) try w.writeAll(", ");
                 try writeIdent(w, field.name);
                 try w.writeAll(" = ?");
@@ -615,7 +615,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
             w.writeAll(", ") catch return error.OutOfMemory;
             try writeQualifiedIdent(w, assoc.join_table, assoc.join_foreign_key);
             w.writeAll(" AS ") catch return error.OutOfMemory;
-            try writeIdent(w, "__zorm_parent_key");
+            try writeIdent(w, "__zgorm_parent_key");
             w.writeAll(" FROM ") catch return error.OutOfMemory;
             try writeIdent(w, child_table.name);
             w.writeAll(" JOIN ") catch return error.OutOfMemory;
@@ -636,7 +636,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
             for (keys.items, 0..) |key, i| params[i] = try value.toParam(key, arena);
             var result = try q.db.runParams(w.buffered(), params, q.timeout_ms);
             defer result.deinit();
-            const key_index = result.colIndex("__zorm_parent_key") orelse return error.ProtocolViolation;
+            const key_index = result.colIndex("__zgorm_parent_key") orelse return error.ProtocolViolation;
             var column_map: [child_table.columns.len]?usize = undefined;
             value.buildColumnMap(child_table, result.columns, &column_map);
 

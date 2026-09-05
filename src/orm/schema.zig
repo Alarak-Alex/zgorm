@@ -1,10 +1,10 @@
 //! Comptime model reflection: turns a plain Zig struct into table metadata.
 //!
 //! A model is any struct whose fields use the supported column types:
-//!   integers, floats, bool, `[]const u8` / `[]u8` (text), `zorm.Time`,
+//!   integers, floats, bool, `[]const u8` / `[]u8` (text), `zgorm.Time`,
 //!   enums (stored as their tag name), and optionals of any of those.
 //!
-//! Optional conventions (all overridable via a `pub const zorm` declaration):
+//! Optional conventions (all overridable via a `pub const zgorm` declaration):
 //!   - table name: snake_case of the struct name
 //!   - primary key: the field named `id`
 //!   - column name: snake_case of the field name
@@ -16,7 +16,7 @@
 //!     email: []const u8 = "",
 //!     isActive: bool = true,
 //!
-//!     pub const zorm = .{
+//!     pub const zgorm = .{
 //!         .table = "users",
 //!         .unique = .{"email"},
 //!         // .primary_key = "email", .ignore = .{.cache}, .columns = .{.isActive = "active"},
@@ -64,8 +64,8 @@ const InferredAssoc = struct {
 fn inferredAssoc(comptime T: type) ?InferredAssoc {
     return switch (@typeInfo(T)) {
         .optional => |o| switch (@typeInfo(o.child)) {
-            .@"struct" => if (@hasDecl(o.child, "__zorm_time") or
-                @hasDecl(o.child, "__zorm_json") or @hasDecl(o.child, "__zorm_bytes"))
+            .@"struct" => if (@hasDecl(o.child, "__zgorm_time") or
+                @hasDecl(o.child, "__zgorm_json") or @hasDecl(o.child, "__zgorm_bytes"))
                 null
             else
                 .{ .model = o.child, .kind = .belongs_to },
@@ -91,7 +91,7 @@ pub const Column = struct {
     field_name: []const u8, // Zig struct field name (leaf; within `embed` when set)
     kind: FieldKind,
     /// Non-null when the column comes from an embedded model field
-    /// (e.g. `base: zorm.Model`); holds the embedding field's name.
+    /// (e.g. `base: zgorm.Model`); holds the embedding field's name.
     embed: ?[]const u8 = null,
     /// DDL type, e.g. "bigint", "text".
     ddl_type: []const u8,
@@ -296,7 +296,7 @@ fn ddlType(comptime kind: FieldKind, comptime T: type) []const u8 {
         .text_array => "text[]",
         .jsonb => "jsonb",
         .bytes => "bytea",
-        .custom => T.zormDdl,
+        .custom => T.zgormDdl,
     };
 }
 
@@ -322,24 +322,24 @@ fn kindOf(comptime T: type) FieldKind {
                     .float, .float_array => FieldKind.float_array,
                     .boolean, .bool_array => FieldKind.bool_array,
                     .text, .text_array => FieldKind.text_array,
-                    else => @compileError("zorm: unsupported array element type " ++ @typeName(ptr.child)),
+                    else => @compileError("zgorm: unsupported array element type " ++ @typeName(ptr.child)),
                 };
             }
-            @compileError("zorm: unsupported field type " ++ @typeName(T) ++
+            @compileError("zgorm: unsupported field type " ++ @typeName(T) ++
                 " (only []const u8 / []u8 slices are supported for strings)");
         },
-        .@"enum" => if (@hasDecl(T, "zormEncode") and @hasDecl(T, "zormDecode") and @hasDecl(T, "zormDdl")) FieldKind.custom else FieldKind.enum_,
+        .@"enum" => if (@hasDecl(T, "zgormEncode") and @hasDecl(T, "zgormDecode") and @hasDecl(T, "zgormDdl")) FieldKind.custom else FieldKind.enum_,
         .@"struct" => blk: {
-            if (@hasDecl(T, "__zorm_time")) break :blk FieldKind.time;
-            if (@hasDecl(T, "__zorm_json")) break :blk FieldKind.jsonb;
-            if (@hasDecl(T, "__zorm_bytes")) break :blk FieldKind.bytes;
-            if (@hasDecl(T, "zormEncode") and @hasDecl(T, "zormDecode") and @hasDecl(T, "zormDdl"))
+            if (@hasDecl(T, "__zgorm_time")) break :blk FieldKind.time;
+            if (@hasDecl(T, "__zgorm_json")) break :blk FieldKind.jsonb;
+            if (@hasDecl(T, "__zgorm_bytes")) break :blk FieldKind.bytes;
+            if (@hasDecl(T, "zgormEncode") and @hasDecl(T, "zgormDecode") and @hasDecl(T, "zgormDdl"))
                 break :blk FieldKind.custom;
-            @compileError("zorm: unsupported struct field type " ++ @typeName(T) ++
-                " (zorm.Time / zorm.Json / zorm.Bytes are the supported struct column types)");
+            @compileError("zgorm: unsupported struct field type " ++ @typeName(T) ++
+                " (zgorm.Time / zgorm.Json / zgorm.Bytes are the supported struct column types)");
         },
-        else => @compileError("zorm: unsupported field type " ++ @typeName(T) ++
-            " (supported: integers, floats, bool, []const u8, arrays, zorm.Time/Json/Bytes, enums, and optionals of those)"),
+        else => @compileError("zgorm: unsupported field type " ++ @typeName(T) ++
+            " (supported: integers, floats, bool, []const u8, arrays, zgorm.Time/Json/Bytes, enums, and optionals of those)"),
     };
 }
 
@@ -349,7 +349,7 @@ fn hasIdLeaf(comptime T: type) bool {
     inline for (@typeInfo(T).@"struct".fields) |f| {
         if (comptime std.mem.eql(u8, f.name, "id")) return true;
         const FT = f.type;
-        if (comptime (@typeInfo(FT) == .@"struct" and @hasDecl(FT, "__zorm_embedded"))) {
+        if (comptime (@typeInfo(FT) == .@"struct" and @hasDecl(FT, "__zgorm_embedded"))) {
             if (comptime @hasField(FT, "id")) return true;
         }
     }
@@ -409,9 +409,9 @@ pub fn tableOf(comptime T: type) Table {
     @setEvalBranchQuota(20000);
     const info = @typeInfo(T).@"struct";
 
-    // Model-level options from `pub const zorm`, if present.
-    const has_opts = @hasDecl(T, "zorm");
-    const opts = if (has_opts) T.zorm else .{};
+    // Model-level options from `pub const zgorm`, if present.
+    const has_opts = @hasDecl(T, "zgorm");
+    const opts = if (has_opts) T.zgorm else .{};
 
     const table_name: []const u8 = if (@hasField(@TypeOf(opts), "table") and opts.table.len > 0)
         opts.table
@@ -445,9 +445,9 @@ pub fn tableOf(comptime T: type) Table {
     inline for (info.fields) |field| {
         const fname = field.name;
 
-        // Embedded models (e.g. `base: zorm.Model`) flatten into columns.
+        // Embedded models (e.g. `base: zgorm.Model`) flatten into columns.
         const FT_raw = field.type;
-        if (@typeInfo(FT_raw) == .@"struct" and @hasDecl(FT_raw, "__zorm_embedded")) {
+        if (@typeInfo(FT_raw) == .@"struct" and @hasDecl(FT_raw, "__zgorm_embedded")) {
             inline for (@typeInfo(FT_raw).@"struct".fields) |sub| {
                 const col = comptime makeColumn(fname, sub, sub.name, opts, pk_field);
                 columns = columns ++ &[_]Column{col};
@@ -642,23 +642,23 @@ pub fn tableOf(comptime T: type) Table {
     inline for (columns, 0..) |a, i| {
         inline for (columns, 0..) |b, j| {
             if (j > i and comptime std.mem.eql(u8, a.name, b.name)) {
-                @compileError("zorm: model " ++ @typeName(T) ++ " has duplicate column name '" ++ a.name ++ "'");
+                @compileError("zgorm: model " ++ @typeName(T) ++ " has duplicate column name '" ++ a.name ++ "'");
             }
         }
     }
 
     if (@hasField(@TypeOf(opts), "primary_keys") and pk_indexes.len != opts.primary_keys.len)
-        @compileError("zorm: one or more configured primary-key fields do not exist on " ++ @typeName(T));
+        @compileError("zgorm: one or more configured primary-key fields do not exist on " ++ @typeName(T));
     const pk_index: ?usize = if (pk_indexes.len == 1) pk_indexes[0] else null;
 
     if (version_field != null and version_index == null)
-        @compileError("zorm: configured version field does not exist on " ++ @typeName(T));
+        @compileError("zgorm: configured version field does not exist on " ++ @typeName(T));
     if (version_index) |index| {
         const version_col = columns[index];
         if (version_col.kind != .integer and version_col.kind != .unsigned)
-            @compileError("zorm: version field must be an integer on " ++ @typeName(T));
+            @compileError("zgorm: version field must be an integer on " ++ @typeName(T));
         if (version_col.is_optional)
-            @compileError("zorm: version field must be non-optional on " ++ @typeName(T));
+            @compileError("zgorm: version field must be non-optional on " ++ @typeName(T));
     }
 
     comptime var unique: []const []const u8 = &.{};
@@ -702,7 +702,7 @@ const Custom = struct {
     metadata: ?[]const u8 = null,
     lastSeen: ?Time = null,
 
-    pub const zorm = .{
+    pub const zgorm = .{
         .table = "custom_users",
         .primary_key = "uid",
         .unique = .{"email"},
@@ -713,7 +713,7 @@ const Custom = struct {
 const TypedOptions = struct {
     id: ?i64 = null,
     email: []const u8 = "",
-    pub const zorm = ModelConfig{
+    pub const zgorm = ModelConfig{
         .table = "typed_options",
         .unique = &.{"email"},
     };
@@ -770,7 +770,7 @@ const Author = struct {
     name: []const u8 = "",
     posts: []PostModel = &.{},
 
-    pub const zorm = .{
+    pub const zgorm = .{
         .has_many = .{ .posts = .{ .model = PostModel, .foreign_key = "author_id" } },
     };
 };
@@ -785,10 +785,10 @@ const Post2 = struct {
 
     pub const Json = struct {
         data: []const u8,
-        pub const __zorm_json = true;
+        pub const __zgorm_json = true;
     };
 
-    pub const zorm = .{
+    pub const zgorm = .{
         .table = "posts",
         .belongs_to = .{ .author = .{ .model = Author, .foreign_key = "author_id" } },
     };
@@ -849,14 +849,14 @@ const EmbModel = struct {
     updated_at: ?time_mod.Time = null,
     deleted_at: ?time_mod.Time = null,
 
-    pub const __zorm_embedded = true;
+    pub const __zgorm_embedded = true;
 };
 
 const EmbPost = struct {
     base: EmbModel,
     title: []const u8 = "",
 
-    pub const zorm = .{ .table = "embedded_posts" };
+    pub const zgorm = .{ .table = "embedded_posts" };
 };
 
 test "embedded model fields flatten into columns" {

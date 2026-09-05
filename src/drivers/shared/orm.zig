@@ -350,7 +350,7 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
                         w.writeAll(" = ") catch return error.OutOfMemory;
                         writeIdent(w, pk.name) catch return error.OutOfMemory;
                     } else inline for (conflict.update, 0..) |name, i| {
-                        if (comptime !table.hasColumn(name)) @compileError("zorm: unknown upsert column " ++ name);
+                        if (comptime !table.hasColumn(name)) @compileError("zgorm: unknown upsert column " ++ name);
                         if (i != 0) w.writeAll(", ") catch return error.OutOfMemory;
                         writeIdent(w, name) catch return error.OutOfMemory;
                         w.writeAll(" = VALUES(") catch return error.OutOfMemory;
@@ -363,7 +363,7 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
                     if (conflict.columns.len > 0) {
                         w.writeAll(" (") catch return error.OutOfMemory;
                         inline for (conflict.columns, 0..) |name, i| {
-                            if (comptime !table.hasColumn(name)) @compileError("zorm: unknown conflict column " ++ name);
+                            if (comptime !table.hasColumn(name)) @compileError("zgorm: unknown conflict column " ++ name);
                             if (i != 0) w.writeAll(", ") catch return error.OutOfMemory;
                             writeIdent(w, name) catch return error.OutOfMemory;
                         }
@@ -374,7 +374,7 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
                     } else {
                         w.writeAll(" DO UPDATE SET ") catch return error.OutOfMemory;
                         inline for (conflict.update, 0..) |name, i| {
-                            if (comptime !table.hasColumn(name)) @compileError("zorm: unknown upsert column " ++ name);
+                            if (comptime !table.hasColumn(name)) @compileError("zgorm: unknown upsert column " ++ name);
                             if (i != 0) w.writeAll(", ") catch return error.OutOfMemory;
                             writeIdent(w, name) catch return error.OutOfMemory;
                             w.writeAll(" = excluded.") catch return error.OutOfMemory;
@@ -447,7 +447,7 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
             gpa: std.mem.Allocator,
         ) Error![]T {
             const table = comptime schema.tableOf(T);
-            if (comptime !table.hasColumn(column)) @compileError("zorm: unknown column " ++ column);
+            if (comptime !table.hasColumn(column)) @compileError("zgorm: unknown column " ++ column);
             var arena_state = std.heap.ArenaAllocator.init(db.backend.gpa);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
@@ -868,14 +868,14 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
                     return error.UnsupportedType;
                 },
                 .@"struct" => {
-                    if (@hasDecl(T, "__zorm_time")) {
+                    if (@hasDecl(T, "__zgorm_time")) {
                         var buf: [value.Time.pg_text_len]u8 = undefined;
                         return writeText(w, v.toPgText(&buf));
                     }
-                    if (@hasDecl(T, "__zorm_json")) return writeText(w, v.data);
-                    if (@hasDecl(T, "__zorm_bytes")) return writeBlob(w, v.data);
-                    if (@hasDecl(T, "zormEncode")) {
-                        const param = v.zormEncode(arena) catch return error.TypeMismatch;
+                    if (@hasDecl(T, "__zgorm_json")) return writeText(w, v.data);
+                    if (@hasDecl(T, "__zgorm_bytes")) return writeBlob(w, v.data);
+                    if (@hasDecl(T, "zgormEncode")) {
+                        const param = v.zgormEncode(arena) catch return error.TypeMismatch;
                         if (param.is_null) return w.writeAll("NULL") catch return error.OutOfMemory;
                         if (param.format != 0) return error.UnsupportedType;
                         return writeText(w, param.data);
@@ -910,7 +910,7 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
             switch (@typeInfo(@TypeOf(result))) {
                 .void => {},
                 .error_union => try result,
-                else => @compileError("zorm: hook " ++ name ++ " must return void or an error union"),
+                else => @compileError("zgorm: hook " ++ name ++ " must return void or an error union"),
             }
         }
 
@@ -1000,7 +1000,7 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
                     @as(@TypeOf(v), std.math.add(optional.child, inner, 1) catch return error.NumericValueOutOfRange)
                 else
                     @as(@TypeOf(v), 1),
-                else => @compileError("zorm: version column must be an integer"),
+                else => @compileError("zgorm: version column must be an integer"),
             };
         }
 

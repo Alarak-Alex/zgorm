@@ -23,7 +23,7 @@ pub const Config = struct {
     password: []const u8 = "",
     database: []const u8 = "",
     ssl_mode: SslMode = .disable,
-    application_name: []const u8 = "zorm",
+    application_name: []const u8 = "zgorm",
     /// Request results in binary format and decode them (default). Set to
     /// false for exotic column types that lack binary output functions.
     binary_results: bool = true,
@@ -784,7 +784,7 @@ pub const Conn = struct {
                     .name_len = 0,
                     .last_used = c.prepared_clock,
                 };
-                const name = std.fmt.bufPrint(&pending.?.name, "zorm_{x}", .{c.prepared_next_id}) catch
+                const name = std.fmt.bufPrint(&pending.?.name, "zgorm_{x}", .{c.prepared_next_id}) catch
                     return error.OutOfMemory;
                 pending.?.name_len = @intCast(name.len);
                 statement_name = pending.?.statementName();

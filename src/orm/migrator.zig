@@ -64,7 +64,7 @@ pub const Migrator = struct {
     /// Registers migrations. Versions are applied in ascending order,
     /// regardless of registration order.
     pub fn add(m: *Migrator, migs: []const Migration) void {
-        m.migrations.appendSlice(m.db.gpa, migs) catch @panic("zorm: out of memory");
+        m.migrations.appendSlice(m.db.gpa, migs) catch @panic("zgorm: out of memory");
     }
 
     /// Creates the `schema_migrations` table if it does not exist.

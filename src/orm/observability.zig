@@ -68,19 +68,19 @@ pub const Metrics = struct {
     /// statement gauges from the supplied snapshot.
     pub fn writePrometheus(m: *const Metrics, writer: *std.Io.Writer, pool: pool_mod.PoolStats) !void {
         try writer.print(
-            "# TYPE zorm_queries_total counter\nzorm_queries_total {d}\n" ++
-                "# TYPE zorm_query_errors_total counter\nzorm_query_errors_total {d}\n" ++
-                "# TYPE zorm_affected_rows_total counter\nzorm_affected_rows_total {d}\n" ++
-                "# TYPE zorm_returned_rows_total counter\nzorm_returned_rows_total {d}\n" ++
-                "# TYPE zorm_query_duration_seconds_total counter\nzorm_query_duration_seconds_total {d:.9}\n" ++
-                "# TYPE zorm_pool_wait_seconds_total counter\nzorm_pool_wait_seconds_total {d:.9}\n" ++
-                "# TYPE zorm_pool_connections gauge\nzorm_pool_connections{{state=\"open\"}} {d}\n" ++
-                "zorm_pool_connections{{state=\"in_use\"}} {d}\n" ++
-                "zorm_pool_connections{{state=\"idle\"}} {d}\n" ++
-                "# TYPE zorm_pool_wait_total counter\nzorm_pool_wait_total {d}\n" ++
-                "# TYPE zorm_prepared_statement_hits_total counter\nzorm_prepared_statement_hits_total {d}\n" ++
-                "# TYPE zorm_prepared_statement_misses_total counter\nzorm_prepared_statement_misses_total {d}\n" ++
-                "# TYPE zorm_prepared_statement_hit_ratio gauge\nzorm_prepared_statement_hit_ratio {d:.9}\n",
+            "# TYPE zgorm_queries_total counter\nzgorm_queries_total {d}\n" ++
+                "# TYPE zgorm_query_errors_total counter\nzgorm_query_errors_total {d}\n" ++
+                "# TYPE zgorm_affected_rows_total counter\nzgorm_affected_rows_total {d}\n" ++
+                "# TYPE zgorm_returned_rows_total counter\nzgorm_returned_rows_total {d}\n" ++
+                "# TYPE zgorm_query_duration_seconds_total counter\nzgorm_query_duration_seconds_total {d:.9}\n" ++
+                "# TYPE zgorm_pool_wait_seconds_total counter\nzgorm_pool_wait_seconds_total {d:.9}\n" ++
+                "# TYPE zgorm_pool_connections gauge\nzgorm_pool_connections{{state=\"open\"}} {d}\n" ++
+                "zgorm_pool_connections{{state=\"in_use\"}} {d}\n" ++
+                "zgorm_pool_connections{{state=\"idle\"}} {d}\n" ++
+                "# TYPE zgorm_pool_wait_total counter\nzgorm_pool_wait_total {d}\n" ++
+                "# TYPE zgorm_prepared_statement_hits_total counter\nzgorm_prepared_statement_hits_total {d}\n" ++
+                "# TYPE zgorm_prepared_statement_misses_total counter\nzgorm_prepared_statement_misses_total {d}\n" ++
+                "# TYPE zgorm_prepared_statement_hit_ratio gauge\nzgorm_prepared_statement_hit_ratio {d:.9}\n",
             .{
                 m.queries.load(.monotonic),
                 m.errors.load(.monotonic),

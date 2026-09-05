@@ -1,4 +1,4 @@
-//! `zorm.Time` — a timestamp value type mapped to PostgreSQL `timestamptz`.
+//! `zgorm.Time` — a timestamp value type mapped to PostgreSQL `timestamptz`.
 //!
 //! Internally stores microseconds since the Unix epoch (UTC). Parses and
 //! formats the ISO text representation PostgreSQL uses on the wire
@@ -12,7 +12,7 @@ pub const Time = struct {
     /// Microseconds since 1970-01-01T00:00:00Z.
     micros: i64,
 
-    pub const __zorm_time = true; // comptime marker for the schema/codec layer
+    pub const __zgorm_time = true; // comptime marker for the schema/codec layer
 
     pub fn now(io: std.Io) Time {
         return .{ .micros = std.Io.Timestamp.now(io, .real).toMicroseconds() };
