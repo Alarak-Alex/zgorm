@@ -29,7 +29,7 @@ pub const DryRun = struct {
     }
 };
 
-fn writeNamed(w: *std.Io.Writer, frag: []const u8, comptime fields: anytype, start: usize) !void {
+fn writeNamed(w: *std.Io.Writer, frag: []const u8, comptime field_names: []const [:0]const u8, start: usize) !void {
     var i: usize = 0;
     while (i < frag.len) {
         if (frag[i] != ':' or (i + 1 < frag.len and frag[i + 1] == ':')) {
@@ -42,8 +42,8 @@ fn writeNamed(w: *std.Io.Writer, frag: []const u8, comptime fields: anytype, sta
         if (end == i + 1) return error.InvalidQuery;
         const name = frag[i + 1 .. end];
         var found = false;
-        inline for (fields, 0..) |field, field_index| {
-            if (std.mem.eql(u8, name, field.name)) {
+        inline for (field_names, 0..) |field_name, field_index| {
+            if (std.mem.eql(u8, name, field_name)) {
                 try w.print("${d}", .{start + field_index + 1});
                 found = true;
             }
@@ -202,12 +202,12 @@ pub fn Query(comptime T: type) type {
             if (info != .@"struct" or info.@"struct".is_tuple)
                 @compileError("zgorm: whereNamed expects a named struct");
             const start = q.args.items.len;
-            inline for (info.@"struct".fields) |field| {
-                const param = value.toParam(@field(named, field.name), q.a()) catch return q.errOut();
+            inline for (info.@"struct".field_names) |field_name| {
+                const param = value.toParam(@field(named, field_name), q.a()) catch return q.errOut();
                 q.args.append(q.sess.gpa, param) catch return q.errOut();
             }
             var aw: std.Io.Writer.Allocating = .init(q.a());
-            writeNamed(&aw.writer, frag, info.@"struct".fields, start) catch {
+            writeNamed(&aw.writer, frag, info.@"struct".field_names, start) catch {
                 q.err = error.InvalidQuery;
                 return q;
             };
@@ -280,12 +280,12 @@ pub fn Query(comptime T: type) type {
         pub fn whereIn(q: *Self, col: []const u8, values: anytype) *Self {
             const Vals = @TypeOf(values);
             const n: usize = switch (@typeInfo(Vals)) {
-                .@"struct" => |si| si.fields.len,
+                .@"struct" => |si| si.field_names.len,
                 .pointer => |pi| switch (pi.size) {
                     .slice => values.len,
                     .one => switch (@typeInfo(pi.child)) {
                         .array => |ai| ai.len,
-                        .@"struct" => |si| if (si.is_tuple) si.fields.len else 1,
+                        .@"struct" => |si| if (si.is_tuple) si.field_names.len else 1,
                         else => 1,
                     },
                     else => 1,
@@ -759,24 +759,24 @@ pub fn Query(comptime T: type) type {
             errdefer q.deinit();
             const query_gpa = q.sess.gpa;
             const info = @typeInfo(@TypeOf(sets));
-            if (info != .@"struct" or info.@"struct".fields.len == 0)
+            if (info != .@"struct" or info.@"struct".field_names.len == 0)
                 @compileError("zgorm: updateReturning expects a non-empty struct");
             var params: std.ArrayList(pq.Param) = .empty;
             defer params.deinit(query_gpa);
             var aw: std.Io.Writer.Allocating = .init(q.a());
             const w = &aw.writer;
             w.print("UPDATE {s} SET ", .{try quoteIdent(q.a(), table.name)}) catch return error.OutOfMemory;
-            inline for (info.@"struct".fields, 0..) |field, i| {
+            inline for (info.@"struct".field_names, 0..) |field_name, i| {
                 if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
                 comptime var column_name: ?[]const u8 = null;
                 inline for (table.columns) |col| {
-                    if (comptime std.mem.eql(u8, col.field_name, field.name)) column_name = col.name;
+                    if (comptime std.mem.eql(u8, col.field_name, field_name)) column_name = col.name;
                 }
-                if (column_name == null) @compileError("zgorm: update field is not a model column: " ++ field.name);
+                if (column_name == null) @compileError("zgorm: update field is not a model column: " ++ field_name);
                 w.print("{s} = ${d}", .{ try quoteIdent(q.a(), column_name.?), i + 1 }) catch return error.OutOfMemory;
-                params.append(q.sess.gpa, try value.toParam(@field(sets, field.name), q.a())) catch return error.OutOfMemory;
+                params.append(q.sess.gpa, try value.toParam(@field(sets, field_name), q.a())) catch return error.OutOfMemory;
             }
-            q.buildWhereOffset(w, info.@"struct".fields.len) catch return error.OutOfMemory;
+            q.buildWhereOffset(w, info.@"struct".field_names.len) catch return error.OutOfMemory;
             q.writeReturning(w) catch return error.OutOfMemory;
             params.appendSlice(q.sess.gpa, q.args.items) catch return error.OutOfMemory;
             const rows = try q.sess.runModels(T, aw.writer.buffered(), params.items, q.timeout_ms, out_gpa);

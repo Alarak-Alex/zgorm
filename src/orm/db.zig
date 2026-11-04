@@ -555,7 +555,7 @@ pub const Session = struct {
     /// `created_at` / `updated_at` columns are auto-stamped when empty.
     pub fn insert(s: *Session, m: anytype) Error!void {
         const MP = @typeInfo(@TypeOf(m));
-        if (MP != .pointer or MP.pointer.size != .one or MP.pointer.is_const)
+        if (MP != .pointer or MP.pointer.size != .one or MP.pointer.attrs.@"const")
             @compileError("zgorm: insert expects a mutable pointer to a model, e.g. db.insert(&user)");
         const T = MP.pointer.child;
         const table = comptime schema.tableOf(T);
@@ -634,7 +634,7 @@ pub const Session = struct {
     ) Error!R {
         if (fields.len == 0) @compileError("zgorm: insertReturning requires at least one field");
         const MP = @typeInfo(@TypeOf(m));
-        if (MP != .pointer or MP.pointer.size != .one or MP.pointer.is_const)
+        if (MP != .pointer or MP.pointer.size != .one or MP.pointer.attrs.@"const")
             @compileError("zgorm: insertReturning expects a mutable model pointer");
         const T = MP.pointer.child;
         const table = comptime schema.tableOf(T);
@@ -713,8 +713,8 @@ pub const Session = struct {
     ) Error![]R {
         const P = @typeInfo(@TypeOf(models));
         const Items: type = blk: {
-            if (P == .pointer and P.pointer.size == .slice and !P.pointer.is_const) break :blk @TypeOf(models);
-            if (P == .pointer and P.pointer.size == .one and @typeInfo(P.pointer.child) == .array and !P.pointer.is_const)
+            if (P == .pointer and P.pointer.size == .slice and !P.pointer.attrs.@"const") break :blk @TypeOf(models);
+            if (P == .pointer and P.pointer.size == .one and @typeInfo(P.pointer.child) == .array and !P.pointer.attrs.@"const")
                 break :blk []@typeInfo(P.pointer.child).array.child;
             @compileError("zgorm: insertBatchReturning expects a mutable slice");
         };
@@ -849,8 +849,8 @@ pub const Session = struct {
     pub fn upsertBatch(s: *Session, models: anytype, comptime conflict: OnConflict) Error!usize {
         const P = @typeInfo(@TypeOf(models));
         const Items: type = blk: {
-            if (P == .pointer and P.pointer.size == .slice and !P.pointer.is_const) break :blk @TypeOf(models);
-            if (P == .pointer and P.pointer.size == .one and @typeInfo(P.pointer.child) == .array and !P.pointer.is_const)
+            if (P == .pointer and P.pointer.size == .slice and !P.pointer.attrs.@"const") break :blk @TypeOf(models);
+            if (P == .pointer and P.pointer.size == .one and @typeInfo(P.pointer.child) == .array and !P.pointer.attrs.@"const")
                 break :blk []@typeInfo(P.pointer.child).array.child;
             @compileError("zgorm: upsertBatch expects a mutable slice");
         };
@@ -1004,8 +1004,8 @@ pub const Session = struct {
     pub fn updateBatch(s: *Session, models: anytype) Error!usize {
         const P = @typeInfo(@TypeOf(models));
         const Items: type = blk: {
-            if (P == .pointer and P.pointer.size == .slice and !P.pointer.is_const) break :blk @TypeOf(models);
-            if (P == .pointer and P.pointer.size == .one and @typeInfo(P.pointer.child) == .array and !P.pointer.is_const)
+            if (P == .pointer and P.pointer.size == .slice and !P.pointer.attrs.@"const") break :blk @TypeOf(models);
+            if (P == .pointer and P.pointer.size == .one and @typeInfo(P.pointer.child) == .array and !P.pointer.attrs.@"const")
                 break :blk []@typeInfo(P.pointer.child).array.child;
             @compileError("zgorm: updateBatch expects a mutable slice, e.g. db.updateBatch(&users)");
         };
@@ -1023,7 +1023,7 @@ pub const Session = struct {
 
     fn updateImpl(s: *Session, m: anytype, comptime unscoped: bool) Error!i64 {
         const MP = @typeInfo(@TypeOf(m));
-        if (MP != .pointer or MP.pointer.size != .one or MP.pointer.is_const)
+        if (MP != .pointer or MP.pointer.size != .one or MP.pointer.attrs.@"const")
             @compileError("zgorm: update expects a mutable pointer to a model, e.g. db.update(&user)");
         const T = MP.pointer.child;
         const table = comptime schema.tableOf(T);
@@ -1288,21 +1288,21 @@ pub const Session = struct {
         var params: std.ArrayList(pq.Param) = .empty;
 
         const SetsInfo = @typeInfo(@TypeOf(sets)).@"struct";
-        if (SetsInfo.fields.len == 0) return error.TypeMismatch;
+        if (SetsInfo.field_names.len == 0) return error.TypeMismatch;
 
         w.print("UPDATE {s} SET ", .{try qb_mod.quoteIdent(arena, table.name)}) catch return error.OutOfMemory;
-        inline for (SetsInfo.fields, 0..) |f, i| {
+        inline for (SetsInfo.field_names, 0..) |set_name, i| {
             if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
             comptime var col_name: ?[]const u8 = null;
             inline for (table.columns) |col| {
-                if (comptime std.mem.eql(u8, col.field_name, f.name)) col_name = col.name;
+                if (comptime std.mem.eql(u8, col.field_name, set_name)) col_name = col.name;
             }
-            if (col_name == null) @compileError("zgorm: updateWhere set field '" ++ f.name ++ "' is not a column of " ++ @typeName(T));
+            if (col_name == null) @compileError("zgorm: updateWhere set field '" ++ set_name ++ "' is not a column of " ++ @typeName(T));
             w.print("{s} = ${d}", .{ try qb_mod.quoteIdent(arena, col_name.?), i + 1 }) catch return error.OutOfMemory;
-            params.append(arena, try value.toParam(@field(sets, f.name), arena)) catch return error.OutOfMemory;
+            params.append(arena, try value.toParam(@field(sets, set_name), arena)) catch return error.OutOfMemory;
         }
         w.writeAll(" WHERE (") catch return error.OutOfMemory;
-        qb_mod.writeRenumbered(w, frag, SetsInfo.fields.len) catch return error.OutOfMemory;
+        qb_mod.writeRenumbered(w, frag, SetsInfo.field_names.len) catch return error.OutOfMemory;
         w.writeByte(')') catch return error.OutOfMemory;
         if (comptime table.softDeletable()) {
             const del_col = table.columns[table.deleted_at_index.?];

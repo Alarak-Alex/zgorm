@@ -200,7 +200,7 @@ test "operation classification and encryption" {
     try std.testing.expectEqual(Operation.select, operation("WITH x AS (SELECT 1) SELECT * FROM x"));
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
-    const encryption = Encryption{ .key = [_]u8{7} ** 32 };
+    const encryption = Encryption{ .key = @splat(7) };
     const encrypted = try encryption.encrypt(threaded.io(), std.testing.allocator, "secret", "users.email");
     defer std.testing.allocator.free(encrypted);
     const decrypted = try encryption.decrypt(std.testing.allocator, encrypted, "users.email");

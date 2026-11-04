@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const z = @import("zorm");
+const z = @import("zgorm");
 
 const CountingAllocator = struct {
     backing: std.mem.Allocator,
@@ -48,7 +48,7 @@ const BenchPost = struct {
     id: ?i64 = null,
     user_id: i64 = 0,
     title: []const u8 = "",
-    pub const zorm = .{ .table = "zorm_bench_posts", .indexes = .{"user_id"} };
+    pub const zgorm = .{ .table = "zorm_bench_posts", .indexes = .{"user_id"} };
 };
 
 const BenchUser = struct {
@@ -59,7 +59,7 @@ const BenchUser = struct {
     name: []const u8 = "",
     score: i64 = 0,
     posts: []BenchPost = &.{},
-    pub const zorm = .{
+    pub const zgorm = .{
         .table = "zorm_bench_users",
         .has_many = .{ .posts = .{ .model = BenchPost, .foreign_key = "user_id" } },
     };

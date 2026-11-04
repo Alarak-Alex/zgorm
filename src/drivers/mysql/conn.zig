@@ -844,13 +844,15 @@ fn readLenBytes(data: []const u8, at: *usize) Error![]const u8 {
 
 test "mysql_native_password vector is stable" {
     var out: [20]u8 = undefined;
-    auth.nativePassword("secret", &[_]u8{0} ** 20, &out);
+    const scramble: [20]u8 = @splat(0);
+    auth.nativePassword("secret", &scramble, &out);
     try std.testing.expectEqualSlices(u8, &.{ 0x8e, 0x7e, 0x67, 0x8b, 0x27, 0xf7, 0x07, 0x47, 0xe6, 0x5f, 0xb2, 0xb3, 0x81, 0x21, 0x44, 0x27, 0xb0, 0xfc, 0xed, 0x48 }, &out);
 }
 
 test "caching_sha2_password vector is stable" {
     var out: [32]u8 = undefined;
-    auth.cachingSha2Password("secret", &[_]u8{0} ** 20, &out);
+    const scramble: [20]u8 = @splat(0);
+    auth.cachingSha2Password("secret", &scramble, &out);
     try std.testing.expectEqualSlices(u8, &.{
         0x43, 0xf3, 0x10, 0xe1, 0x0b, 0xb5, 0xdc, 0x03,
         0xa3, 0xd7, 0x0f, 0x91, 0x2b, 0xa6, 0x2b, 0x06,

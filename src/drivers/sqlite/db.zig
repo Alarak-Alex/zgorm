@@ -3,9 +3,7 @@
 const std = @import("std");
 const types = @import("../shared/types.zig");
 const pool_mod = @import("../shared/pool.zig");
-const c = @cImport({
-    @cInclude("sqlite3.h");
-});
+const c = @import("c.zig");
 
 pub const Error = types.Error;
 
@@ -62,7 +60,7 @@ pub const Db = struct {
     }
 
     pub fn openWithOptions(gpa: std.mem.Allocator, filename: []const u8, options: OpenOptions) Error!*Db {
-        const name = gpa.dupeZ(u8, filename) catch return error.OutOfMemory;
+        const name = gpa.dupeSentinel(u8, filename, 0) catch return error.OutOfMemory;
         defer gpa.free(name);
         var handle: ?*c.sqlite3 = null;
         const flags = if (options.read_only)
@@ -105,7 +103,7 @@ pub const Db = struct {
     }
 
     pub fn execParams(db: *Db, sql: []const u8, params: []const Param) Error!Result {
-        const text = db.gpa.dupeZ(u8, sql) catch return error.OutOfMemory;
+        const text = db.gpa.dupeSentinel(u8, sql, 0) catch return error.OutOfMemory;
         defer db.gpa.free(text);
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(db.handle, text.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK)

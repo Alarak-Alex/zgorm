@@ -310,7 +310,7 @@ pub const Conn = struct {
                 proto.Tag.authentication => {
                     if (m.data.len < 4) return error.ProtocolViolation;
                     const code = std.mem.readInt(i32, m.data[0..4], .big);
-                    const auth_type: proto.AuthType = @enumFromInt(code);
+                    const auth_type: proto.AuthType = @fromBackingInt(@intCast(code));
                     switch (auth_type) {
                         .ok => return,
                         .cleartext_password => try c.sendPassword(c.cfg.password),

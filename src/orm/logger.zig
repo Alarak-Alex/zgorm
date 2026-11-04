@@ -49,7 +49,7 @@ pub const Logger = struct {
     pub const default: Logger = .{};
 
     pub fn enabled(l: *const Logger, level: LogLevel) bool {
-        return @intFromEnum(level) <= @intFromEnum(l.level);
+        return @backingInt(level) <= @backingInt(l.level);
     }
 
     pub fn log(l: *const Logger, level: LogLevel, msg: []const u8) void {

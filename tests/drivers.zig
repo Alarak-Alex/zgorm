@@ -231,7 +231,7 @@ test "SQLite plugins transaction retry and routing" {
     selected.deinit();
     try std.testing.expectEqual(@as(u64, 3), metrics.queries.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), metrics.mutations.load(.monotonic));
-    const encryption = zg.drivers.plugins.Encryption{ .key = [_]u8{7} ** 32 };
+    const encryption = zg.drivers.plugins.Encryption{ .key = @splat(7) };
     const encrypted = try encryption.encrypt(threaded.io(), std.testing.allocator, "secret", "users.email");
     defer std.testing.allocator.free(encrypted);
     const decrypted = try encryption.decrypt(std.testing.allocator, encrypted, "users.email");

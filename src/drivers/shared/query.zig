@@ -46,7 +46,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
         groups: std.ArrayList([]const u8) = .empty,
         columns: []const []const u8 = &.{},
         raw_columns: []const []const u8 = &.{},
-        preload_flags: [table.assocs.len]bool = [_]bool{false} ** table.assocs.len,
+        preload_flags: [table.assocs.len]bool = @splat(false),
         is_distinct: bool = false,
         recursive: bool = false,
         unscoped_flag: bool = false,
@@ -414,19 +414,19 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
             const info = @typeInfo(Sets);
             if (info != .@"struct" or info.@"struct".is_tuple)
                 @compileError("zgorm: query update expects a named struct");
-            if (info.@"struct".fields.len == 0) return error.InvalidQuery;
+            if (info.@"struct".field_names.len == 0) return error.InvalidQuery;
             var aw: std.Io.Writer.Allocating = .init(q.allocator());
             const w = &aw.writer;
             var params: std.ArrayList(types.Param) = .empty;
             try w.writeAll("UPDATE ");
             try writeIdent(w, table.name);
             try w.writeAll(" SET ");
-            inline for (info.@"struct".fields, 0..) |field, i| {
-                if (comptime !table.hasColumn(field.name)) @compileError("zgorm: unknown column " ++ field.name);
+            inline for (info.@"struct".field_names, 0..) |field_name, i| {
+                if (comptime !table.hasColumn(field_name)) @compileError("zgorm: unknown column " ++ field_name);
                 if (i != 0) try w.writeAll(", ");
-                try writeIdent(w, field.name);
+                try writeIdent(w, field_name);
                 try w.writeAll(" = ?");
-                try params.append(q.allocator(), try value.toParam(@field(sets, field.name), q.allocator()));
+                try params.append(q.allocator(), try value.toParam(@field(sets, field_name), q.allocator()));
             }
             try q.appendWhere(w, &params, true);
             if (returning_rows) try q.appendReturning(w);

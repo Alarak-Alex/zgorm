@@ -346,9 +346,8 @@ fn kindOf(comptime T: type) FieldKind {
 /// True when the model (or any of its embedded models) has a field named
 /// `id` — the default primary-key convention.
 fn hasIdLeaf(comptime T: type) bool {
-    inline for (@typeInfo(T).@"struct".fields) |f| {
-        if (comptime std.mem.eql(u8, f.name, "id")) return true;
-        const FT = f.type;
+    inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |fname, FT| {
+        if (comptime std.mem.eql(u8, fname, "id")) return true;
         if (comptime (@typeInfo(FT) == .@"struct" and @hasDecl(FT, "__zgorm_embedded"))) {
             if (comptime @hasField(FT, "id")) return true;
         }
@@ -360,12 +359,12 @@ fn hasIdLeaf(comptime T: type) bool {
 /// when `embed` is non-null).
 fn makeColumn(
     comptime embed: ?[]const u8,
-    comptime field: std.builtin.Type.StructField,
+    comptime field_type: type,
     comptime fname: []const u8,
     comptime opts: anytype,
     comptime pk_field: ?[]const u8,
 ) Column {
-    const FT = field.type;
+    const FT = field_type;
     const is_optional = @typeInfo(FT) == .optional;
     const Inner = if (is_optional) @typeInfo(FT).optional.child else FT;
 
@@ -442,14 +441,12 @@ pub fn tableOf(comptime T: type) Table {
     // Column list index (struct fields can be skipped via `.ignore`).
     comptime var col_i: usize = 0;
 
-    inline for (info.fields) |field| {
-        const fname = field.name;
+    inline for (info.field_names, info.field_types) |fname, FT_raw| {
 
         // Embedded models (e.g. `base: zgorm.Model`) flatten into columns.
-        const FT_raw = field.type;
         if (@typeInfo(FT_raw) == .@"struct" and @hasDecl(FT_raw, "__zgorm_embedded")) {
-            inline for (@typeInfo(FT_raw).@"struct".fields) |sub| {
-                const col = comptime makeColumn(fname, sub, sub.name, opts, pk_field);
+            inline for (@typeInfo(FT_raw).@"struct".field_names, @typeInfo(FT_raw).@"struct".field_types) |sub_name, sub_type| {
+                const col = comptime makeColumn(fname, sub_type, sub_name, opts, pk_field);
                 columns = columns ++ &[_]Column{col};
                 if (col.is_pk) pk_indexes = pk_indexes ++ &[_]usize{col_i};
                 if (comptime std.mem.eql(u8, col.name, "created_at")) created_at_index = col_i;
@@ -517,9 +514,9 @@ pub fn tableOf(comptime T: type) Table {
 
         // Association fields are handled by preload, not as columns.
         if (@hasField(@TypeOf(opts), "belongs_to")) {
-            inline for (@typeInfo(@TypeOf(opts.belongs_to)).@"struct".fields) |af| {
-                if (comptime std.mem.eql(u8, af.name, fname)) {
-                    const cfg = @field(opts.belongs_to, af.name);
+            inline for (@typeInfo(@TypeOf(opts.belongs_to)).@"struct".field_names) |af_name| {
+                if (comptime std.mem.eql(u8, af_name, fname)) {
+                    const cfg = @field(opts.belongs_to, af_name);
                     const foreign_key = if (@hasField(@TypeOf(cfg), "foreign_key")) cfg.foreign_key else cfg.foreign_keys[0];
                     const primary_key = if (@hasField(@TypeOf(cfg), "primary_key")) cfg.primary_key else if (@hasField(@TypeOf(cfg), "primary_keys")) cfg.primary_keys[0] else "id";
                     assocs = assocs ++ &[_]Assoc{.{
@@ -536,9 +533,9 @@ pub fn tableOf(comptime T: type) Table {
             }
         }
         if (!is_assoc and @hasField(@TypeOf(opts), "has_one")) {
-            inline for (@typeInfo(@TypeOf(opts.has_one)).@"struct".fields) |af| {
-                if (comptime std.mem.eql(u8, af.name, fname)) {
-                    const cfg = @field(opts.has_one, af.name);
+            inline for (@typeInfo(@TypeOf(opts.has_one)).@"struct".field_names) |af_name| {
+                if (comptime std.mem.eql(u8, af_name, fname)) {
+                    const cfg = @field(opts.has_one, af_name);
                     const primary_key = if (@hasField(@TypeOf(cfg), "primary_key")) cfg.primary_key else "id";
                     assocs = assocs ++ &[_]Assoc{.{
                         .field_name = fname,
@@ -557,9 +554,9 @@ pub fn tableOf(comptime T: type) Table {
             }
         }
         if (!is_assoc and @hasField(@TypeOf(opts), "has_many")) {
-            inline for (@typeInfo(@TypeOf(opts.has_many)).@"struct".fields) |af| {
-                if (comptime std.mem.eql(u8, af.name, fname)) {
-                    const cfg = @field(opts.has_many, af.name);
+            inline for (@typeInfo(@TypeOf(opts.has_many)).@"struct".field_names) |af_name| {
+                if (comptime std.mem.eql(u8, af_name, fname)) {
+                    const cfg = @field(opts.has_many, af_name);
                     const foreign_key = if (@hasField(@TypeOf(cfg), "foreign_key")) cfg.foreign_key else cfg.foreign_keys[0];
                     const primary_key = if (@hasField(@TypeOf(cfg), "primary_key")) cfg.primary_key else if (@hasField(@TypeOf(cfg), "primary_keys")) cfg.primary_keys[0] else "id";
                     assocs = assocs ++ &[_]Assoc{.{
@@ -579,9 +576,9 @@ pub fn tableOf(comptime T: type) Table {
             }
         }
         if (!is_assoc and @hasField(@TypeOf(opts), "many_to_many")) {
-            inline for (@typeInfo(@TypeOf(opts.many_to_many)).@"struct".fields) |af| {
-                if (comptime std.mem.eql(u8, af.name, fname)) {
-                    const cfg = @field(opts.many_to_many, af.name);
+            inline for (@typeInfo(@TypeOf(opts.many_to_many)).@"struct".field_names) |af_name| {
+                if (comptime std.mem.eql(u8, af_name, fname)) {
+                    const cfg = @field(opts.many_to_many, af_name);
                     const primary_key = if (@hasField(@TypeOf(cfg), "primary_key")) cfg.primary_key else "id";
                     const association_key = if (@hasField(@TypeOf(cfg), "association_key")) cfg.association_key else "id";
                     assocs = assocs ++ &[_]Assoc{.{
@@ -625,7 +622,7 @@ pub fn tableOf(comptime T: type) Table {
             if (ignored) continue;
         }
 
-        const col = comptime makeColumn(null, field, fname, opts, pk_field);
+        const col = comptime makeColumn(null, FT_raw, fname, opts, pk_field);
         columns = columns ++ &[_]Column{col};
 
         if (col.is_pk) pk_indexes = pk_indexes ++ &[_]usize{col_i};

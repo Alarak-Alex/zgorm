@@ -187,8 +187,8 @@ pub fn columnFieldType(comptime T: type, comptime col: schema.Column) type {
 }
 
 fn fieldOf(comptime T: type, comptime name: []const u8) type {
-    inline for (@typeInfo(T).@"struct".fields) |f| {
-        if (comptime std.mem.eql(u8, f.name, name)) return f.type;
+    inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |fname, FT| {
+        if (comptime std.mem.eql(u8, fname, name)) return FT;
     }
     @compileError("zgorm: model " ++ @typeName(T) ++ " has no field " ++ name);
 }
@@ -348,9 +348,9 @@ pub fn argsToParams(args: anytype, arena: std.mem.Allocator) Error![]Param {
                 single[0] = try toParam(args, arena);
                 return single;
             }
-            const params = try arena.alloc(Param, info.fields.len);
-            inline for (info.fields, 0..) |f, i| {
-                params[i] = try toParam(@field(args, f.name), arena);
+            const params = try arena.alloc(Param, info.field_names.len);
+            inline for (info.field_names, 0..) |fname, i| {
+                params[i] = try toParam(@field(args, fname), arena);
             }
             return params;
         },
@@ -376,9 +376,9 @@ pub fn argsToParams(args: anytype, arena: std.mem.Allocator) Error![]Param {
                     },
                     .@"struct" => |ci| {
                         if (ci.is_tuple) {
-                            const params = try arena.alloc(Param, ci.fields.len);
-                            inline for (ci.fields, 0..) |f, i| {
-                                params[i] = try toParam(@field(args, f.name), arena);
+                            const params = try arena.alloc(Param, ci.field_names.len);
+                            inline for (ci.field_names, 0..) |fname, i| {
+                                params[i] = try toParam(@field(args, fname), arena);
                             }
                             return params;
                         }
@@ -933,8 +933,8 @@ pub fn freeValue(comptime T: type, value: T, gpa: std.mem.Allocator) void {
         } else {},
         .@"struct" => |info| {
             if (@hasDecl(T, "__zgorm_time")) return;
-            inline for (info.fields) |f| {
-                freeValue(f.type, @field(value, f.name), gpa);
+            inline for (info.field_names, info.field_types) |fname, FT| {
+                freeValue(FT, @field(value, fname), gpa);
             }
         },
         .optional => if (value) |v| freeValue(@TypeOf(v), v, gpa),
@@ -961,8 +961,8 @@ pub fn deepCopy(comptime T: type, value: T, gpa: std.mem.Allocator) DecodeError!
         .@"struct" => |info| blk: {
             if (@hasDecl(T, "__zgorm_time")) break :blk value;
             var out: T = value;
-            inline for (info.fields) |f| {
-                @field(out, f.name) = try deepCopy(f.type, @field(value, f.name), gpa);
+            inline for (info.field_names, info.field_types) |fname, FT| {
+                @field(out, fname) = try deepCopy(FT, @field(value, fname), gpa);
             }
             break :blk out;
         },
@@ -1122,19 +1122,11 @@ pub fn scanCellsMapped(
 
 /// The leaf field's default value for a column, when it has one.
 fn columnDefault(comptime T: type, comptime col: schema.Column) ?columnFieldType(T, col) {
-    if (col.embed) |parent| {
-        const P = fieldOf(T, parent);
-        inline for (@typeInfo(P).@"struct".fields) |f| {
-            if (comptime std.mem.eql(u8, f.name, col.field_name)) {
-                if (f.defaultValue()) |d| return d;
-                return null;
-            }
-        }
-        return null;
-    }
-    inline for (@typeInfo(T).@"struct".fields) |f| {
-        if (comptime std.mem.eql(u8, f.name, col.field_name)) {
-            if (f.defaultValue()) |d| return d;
+    const Owner = if (col.embed) |parent| fieldOf(T, parent) else T;
+    const info = @typeInfo(Owner).@"struct";
+    inline for (info.field_names, info.field_types, info.field_attrs) |fname, FT, attrs| {
+        if (comptime std.mem.eql(u8, fname, col.field_name)) {
+            if (attrs.defaultValue(FT)) |d| return d;
             return null;
         }
     }

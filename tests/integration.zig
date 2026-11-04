@@ -585,7 +585,7 @@ test "v2: model hooks" {
     drop(try db.execRaw("DROP TABLE IF EXISTS v2_hooked CASCADE"));
     try db.autoMigrate(Hooked);
 
-    Hooked.log = [_]u8{0} ** 64;
+    Hooked.log = @splat(0);
     Hooked.log_len = 0;
 
     var h = Hooked{ .name = "orig" };
@@ -958,7 +958,7 @@ const CapturingLogger = struct {
 
     fn log(ctx: ?*anyopaque, level: zg.LogLevel, msg: []const u8) void {
         const self: *CapturingLogger = @ptrCast(@alignCast(ctx.?));
-        if (@intFromEnum(level) > @intFromEnum(self.level)) return;
+        if (@backingInt(level) > @backingInt(self.level)) return;
         self.calls += 1;
         self.last_level = level;
         self.buf.appendSlice(self.gpa, msg) catch {};
@@ -1720,7 +1720,7 @@ test "structured events, spans, metrics, slow SQL, and Prometheus output" {
         pool_wait_ns: u128 = 0,
         prepared_hit_rate: f64 = 0,
         error_class: zg.ErrorClass = .none,
-        sqlstate: [5]u8 = .{0} ** 5,
+        sqlstate: [5]u8 = @splat(0),
         sqlstate_len: usize = 0,
 
         fn query(context: ?*anyopaque, event: zg.QueryEvent) void {
