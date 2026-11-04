@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-一个受 GORM 启发、面向 Zig 0.16 的 ORM，PostgreSQL、MySQL/MariaDB、SQLite 均为一等驱动。PostgreSQL 与 MySQL 使用内置纯 Zig 线协议实现，SQLite 使用 `libsqlite3`。
+一个受 GORM 启发、面向 Zig 0.17 的 ORM，PostgreSQL、MySQL/MariaDB、SQLite 均为一等驱动。PostgreSQL 与 MySQL 使用内置纯 Zig 线协议实现，SQLite 链接 `libsqlite3`。
 
 ## 特性
 
@@ -27,9 +27,9 @@
 
 ## 环境要求
 
-- Zig **0.16.0**
+- Zig **0.17.0**
 - PostgreSQL 10+（推荐 14+；需允许 `trust`/`scram-sha-256`/`md5` 密码认证）
-- 使用 `zg.drivers.sqlite` 时需安装 SQLite 开发头文件与 `libsqlite3`
+- 使用 `zg.drivers.sqlite` 时需安装 `libsqlite3`
 
 ## 快速上手
 

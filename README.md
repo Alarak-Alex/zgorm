@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-A GORM-inspired ORM for Zig 0.16 with first-class PostgreSQL, MySQL/MariaDB, and SQLite drivers. PostgreSQL and MySQL use built-in pure-Zig wire protocol implementations; SQLite uses `libsqlite3`.
+A GORM-inspired ORM for Zig 0.17 with first-class PostgreSQL, MySQL/MariaDB, and SQLite drivers. PostgreSQL and MySQL use built-in pure-Zig wire protocol implementations; SQLite links `libsqlite3`.
 
 ## Features
 
@@ -27,9 +27,9 @@ A GORM-inspired ORM for Zig 0.16 with first-class PostgreSQL, MySQL/MariaDB, and
 
 ## Requirements
 
-- Zig **0.16.0**
+- Zig **0.17.0**
 - PostgreSQL 10+ (14+ recommended; `trust` / `scram-sha-256` / `md5` password auth supported)
-- SQLite development headers/library when using `zg.drivers.sqlite` (`libsqlite3`)
+- `libsqlite3` when using `zg.drivers.sqlite`
 
 ## Quick start
 

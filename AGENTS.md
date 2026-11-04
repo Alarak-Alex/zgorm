@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-zgorm 是面向 Zig 0.16 的 GORM-inspired ORM。提供纯 Zig PostgreSQL/MySQL 协议驱动、SQLite 驱动，以及类型化 CRUD、查询构建、事务、迁移、关联、连接池和可观测性能力。
+zgorm 是面向 Zig 0.17 的 GORM-inspired ORM。提供纯 Zig PostgreSQL/MySQL 协议驱动、SQLite 驱动，以及类型化 CRUD、查询构建、事务、迁移、关联、连接池和可观测性能力。
 
 ## Architecture & Data Flow
 
@@ -45,7 +45,7 @@ zig build benchmark-build
 
 ## Code Conventions & Common Patterns
 
-- 目标 Zig 版本为 `0.16.0`；格式化使用 `zig fmt`，不要手工调整格式。
+- 目标 Zig 版本为 `0.17.0`；格式化使用 `zig fmt`，不要手工调整格式。
 - 命名转换统一使用 `src/orm/naming.zig:toSnakeCase`；SQL 标识符必须通过 driver/dialect 的 quote helper。
 - 所有用户值使用参数绑定；不要把用户输入拼接进 `where/order/group/select` SQL 片段。
 - 公共操作使用 `Error!T` 传播错误；不要用 `unwrap` 式 panic 替代模型、连接、事务或协议错误处理。
@@ -69,8 +69,8 @@ zig build benchmark-build
 
 ## Runtime/Tooling Preferences
 
-- 必须使用 Zig `0.16.0`；构建由 Zig build system 管理，不使用 Makefile、justfile 或额外脚本。
-- PostgreSQL 和 MySQL 不需要客户端库；SQLite 需要系统开发头文件和 `libsqlite3`。
+- 必须使用 Zig `0.17.0`；构建由 Zig build system 管理，不使用 Makefile、justfile 或额外脚本。
+- PostgreSQL 和 MySQL 不需要客户端库；SQLite 只需链接 `libsqlite3`，C ABI 声明在 `src/drivers/sqlite/c.zig`（0.17 已移除 `@cImport`）。
 - DSN 可通过 `-Ddsn=...` 或 `ZORM_DSN` 提供。支持 URL、key=value 和 PostgreSQL Unix socket 形式。
 - benchmark 需要 PostgreSQL；`benchmark/gorm` 另需 Go 工具链和其 `go.mod` 依赖。
 - `.zig-cache/`、`zig-out/`、`.zcode/` 是忽略目录；`.zcode/config.json` 仅是编辑器/MCP 配置，不是构建配置。
