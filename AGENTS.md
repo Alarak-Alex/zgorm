@@ -70,7 +70,7 @@ zig build benchmark-build
 ## Runtime/Tooling Preferences
 
 - 必须使用 Zig `0.17.0`；构建由 Zig build system 管理，不使用 Makefile、justfile 或额外脚本。
-- PostgreSQL 和 MySQL 不需要客户端库；SQLite 只需链接 `libsqlite3`，C ABI 声明在 `src/drivers/sqlite/c.zig`（0.17 已移除 `@cImport`）。
+- PostgreSQL 和 MySQL 不需要客户端库；SQLite 的 C ABI 声明在 `src/drivers/sqlite/c.zig`（0.17 已移除 `@cImport`）。库模块本身不携带链接参数，使用 SQLite 驱动的构建目标需自行 `linkSystemLibrary("sqlite3")`；本仓库的 example、单元测试和驱动测试已各自链接。
 - DSN 可通过 `-Ddsn=...` 或 `ZORM_DSN` 提供。支持 URL、key=value 和 PostgreSQL Unix socket 形式。
 - benchmark 需要 PostgreSQL；`benchmark/gorm` 另需 Go 工具链和其 `go.mod` 依赖。
 - `.zig-cache/`、`zig-out/`、`.zcode/` 是忽略目录；`.zcode/config.json` 仅是编辑器/MCP 配置，不是构建配置。

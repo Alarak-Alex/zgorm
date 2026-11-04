@@ -79,5 +79,6 @@
         "LICENSE",
         "README.md",
         "README.zh-CN.md",
+        "doc",
     },
 }

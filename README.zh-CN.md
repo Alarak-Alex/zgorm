@@ -29,7 +29,7 @@
 
 - Zig **0.17.0**
 - PostgreSQL 10+（推荐 14+；需允许 `trust`/`scram-sha-256`/`md5` 密码认证）
-- 使用 `zg.drivers.sqlite` 时需安装 `libsqlite3`
+- 使用 `zg.drivers.sqlite` 时，需由自己的构建链接 `libsqlite3`
 
 ## 快速上手
 
@@ -41,12 +41,25 @@ zig fetch --save <git-url-or-tarball>
 
 ```zig
 // build.zig
-const mod = b.addModule("zgorm", .{
-    .root_source_file = b.path("src/root.zig"), // 若以路径依赖方式使用可省略
+const zgorm = b.dependency("zgorm", .{
+    .target = target,
+    .optimize = optimize,
+}).module("zgorm");
+
+const exe = b.addExecutable(.{
+    .name = "app",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zgorm", .module = zgorm }},
+    }),
 });
-mod.linkSystemLibrary("sqlite3", .{}); // 仅使用 zg.drivers.sqlite 时需要
-// 在你的模块 .imports 中加入 .{ .name = "zgorm", .module = mod }
+// 仅使用 zg.drivers.sqlite 时需要；模块本身不携带 C 库链接参数。
+exe.root_module.linkSystemLibrary("sqlite3", .{});
 ```
+
+PostgreSQL 与 MySQL 驱动是纯 Zig 实现，只用这两个驱动时交叉编译不需要额外 C 库。
 
 ### 定义模型
 

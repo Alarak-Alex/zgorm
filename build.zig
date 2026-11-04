@@ -11,13 +11,14 @@ pub fn build(b: *std.Build) void {
     const mysql_database = b.option([]const u8, "mysql-database", "MySQL/MariaDB database") orelse "zgorm";
     const mysql_ssl = b.option(bool, "mysql-ssl", "Require TLS for MySQL/MariaDB driver tests") orelse false;
 
-    // Library module "zgorm".
+    // Library module "zgorm". The SQLite driver declares its C ABI but the
+    // module stays free of link flags, so consumers that never use that driver
+    // can cross-compile. Build targets below link sqlite3 where they need it.
     const mod = b.addModule("zgorm", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    mod.linkSystemLibrary("sqlite3", .{});
 
     // Example executable.
     const example = b.addExecutable(.{
@@ -31,6 +32,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    example.root_module.linkSystemLibrary("sqlite3", .{});
     b.installArtifact(example);
 
     const run_step = b.step("run", "Run the example (set ZORM_DSN to override)");
@@ -38,8 +40,15 @@ pub fn build(b: *std.Build) void {
     if (dsn_opt) |dsn| run_cmd.setEnvironmentVariable("ZORM_DSN", dsn);
     run_step.dependOn(&run_cmd.step);
 
-    // Unit tests.
-    const unit_tests = b.addTest(.{ .root_module = mod });
+    // Unit tests. A separate module keeps the sqlite link off the library
+    // module that consumers import.
+    const unit_test_module = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    unit_test_module.linkSystemLibrary("sqlite3", .{});
+    const unit_tests = b.addTest(.{ .root_module = unit_test_module });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);

@@ -29,7 +29,7 @@ A GORM-inspired ORM for Zig 0.17 with first-class PostgreSQL, MySQL/MariaDB, and
 
 - Zig **0.17.0**
 - PostgreSQL 10+ (14+ recommended; `trust` / `scram-sha-256` / `md5` password auth supported)
-- `libsqlite3` when using `zg.drivers.sqlite`
+- `libsqlite3`, linked by your own build, when using `zg.drivers.sqlite`
 
 ## Quick start
 
@@ -41,12 +41,25 @@ zig fetch --save <git-url-or-tarball>
 
 ```zig
 // build.zig
-const mod = b.addModule("zgorm", .{
-    .root_source_file = b.path("src/root.zig"), // omit when consumed as a path dependency
+const zgorm = b.dependency("zgorm", .{
+    .target = target,
+    .optimize = optimize,
+}).module("zgorm");
+
+const exe = b.addExecutable(.{
+    .name = "app",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zgorm", .module = zgorm }},
+    }),
 });
-mod.linkSystemLibrary("sqlite3", .{}); // required only when using zg.drivers.sqlite
-// add .{ .name = "zgorm", .module = mod } to your module's .imports
+// Only when using zg.drivers.sqlite. The module itself links no C library.
+exe.root_module.linkSystemLibrary("sqlite3", .{});
 ```
+
+The PostgreSQL and MySQL drivers are pure Zig, so a build that imports only those cross-compiles with no C library.
 
 ### Defining a model
 
