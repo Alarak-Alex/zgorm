@@ -11,6 +11,7 @@ pub const sqlite3_stmt = opaque {};
 const Destructor = ?*const fn (?*anyopaque) callconv(.c) void;
 
 pub const SQLITE_OK: c_int = 0;
+pub const SQLITE_NOMEM: c_int = 7;
 pub const SQLITE_BUSY: c_int = 5;
 pub const SQLITE_LOCKED: c_int = 6;
 pub const SQLITE_INTERRUPT: c_int = 9;
@@ -63,6 +64,8 @@ pub extern fn sqlite3_prepare_v2(
 ) c_int;
 pub extern fn sqlite3_finalize(stmt: *sqlite3_stmt) c_int;
 pub extern fn sqlite3_step(stmt: *sqlite3_stmt) c_int;
+pub extern fn sqlite3_reset(stmt: *sqlite3_stmt) c_int;
+pub extern fn sqlite3_clear_bindings(stmt: *sqlite3_stmt) c_int;
 
 pub extern fn sqlite3_bind_parameter_count(stmt: *sqlite3_stmt) c_int;
 pub extern fn sqlite3_bind_null(stmt: *sqlite3_stmt, index: c_int) c_int;

@@ -3,6 +3,7 @@
 const std = @import("std");
 const types = @import("../shared/types.zig");
 const pool_mod = @import("../shared/pool.zig");
+const value = @import("../../orm/value.zig");
 const c = @import("c.zig");
 
 pub const Error = types.Error;
@@ -51,9 +52,19 @@ pub const Db = struct {
     gpa: std.mem.Allocator,
     handle: *c.sqlite3,
     last_error: ?types.ServerError = null,
+    err_arena: std.heap.ArenaAllocator,
     io: ?std.Io = null,
     error_code_buf: [16]u8 = undefined,
     deadline: ?std.Io.Timestamp = null,
+    stmt_cache: std.StringHashMapUnmanaged(StmtEntry) = .empty,
+    stmt_clock: u64 = 0,
+    stmt_cache_size: usize = 64,
+
+    const StmtEntry = struct {
+        stmt: *c.sqlite3_stmt,
+        sql: []u8,
+        last_used: u64,
+    };
 
     pub fn open(gpa: std.mem.Allocator, filename: []const u8) Error!*Db {
         return openWithOptions(gpa, filename, .{});
@@ -75,7 +86,7 @@ pub const Db = struct {
             _ = c.sqlite3_close(handle.?);
             return error.OutOfMemory;
         };
-        db.* = .{ .gpa = gpa, .handle = handle.? };
+        db.* = .{ .gpa = gpa, .handle = handle.?, .err_arena = std.heap.ArenaAllocator.init(gpa) };
         errdefer db.deinit();
         _ = c.sqlite3_extended_result_codes(db.handle, 1);
         if (options.busy_timeout_ms > std.math.maxInt(c_int)) return error.InvalidQuery;
@@ -93,6 +104,13 @@ pub const Db = struct {
     }
 
     pub fn deinit(db: *Db) void {
+        var it = db.stmt_cache.valueIterator();
+        while (it.next()) |entry| {
+            _ = c.sqlite3_finalize(entry.stmt);
+            db.gpa.free(entry.sql);
+        }
+        db.stmt_cache.deinit(db.gpa);
+        db.err_arena.deinit();
         _ = c.sqlite3_close(db.handle);
         const gpa = db.gpa;
         gpa.destroy(db);
@@ -103,18 +121,12 @@ pub const Db = struct {
     }
 
     pub fn execParams(db: *Db, sql: []const u8, params: []const Param) Error!Result {
-        const text = db.gpa.dupeSentinel(u8, sql, 0) catch return error.OutOfMemory;
-        defer db.gpa.free(text);
-        var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db.handle, text.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK)
-            return db.databaseError();
-        defer _ = c.sqlite3_finalize(stmt.?);
+        const stmt = try db.acquireStmt(sql);
+        // Reset on every exit so the cached statement is reusable; bindings
+        // and any partial step state are cleared before the next acquire.
+        defer _ = c.sqlite3_reset(stmt);
 
-        if (c.sqlite3_bind_parameter_count(stmt.?) != params.len) return error.InvalidQuery;
-        for (params, 1..) |param, index| {
-            if (bindParam(stmt.?, @intCast(index), param) != c.SQLITE_OK)
-                return db.databaseError();
-        }
+        if (c.sqlite3_bind_parameter_count(stmt) != params.len) return error.InvalidQuery;
 
         const arena_state = db.gpa.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
         arena_state.* = std.heap.ArenaAllocator.init(db.gpa);
@@ -123,27 +135,32 @@ pub const Db = struct {
             db.gpa.destroy(arena_state);
         }
         const arena = arena_state.allocator();
+        for (params, 1..) |param, index| {
+            if (bindParam(stmt, @intCast(index), param, arena) != c.SQLITE_OK)
+                return db.databaseError();
+        }
+
         var columns: std.ArrayList(Result.Column) = .empty;
-        const column_count: usize = @intCast(c.sqlite3_column_count(stmt.?));
+        const column_count: usize = @intCast(c.sqlite3_column_count(stmt));
         for (0..column_count) |i| {
-            const name = std.mem.span(c.sqlite3_column_name(stmt.?, @intCast(i)));
+            const name = std.mem.span(c.sqlite3_column_name(stmt, @intCast(i)));
             columns.append(arena, .{
                 .name = arena.dupe(u8, name) catch return error.OutOfMemory,
             }) catch return error.OutOfMemory;
         }
 
         var rows: std.ArrayList(Result.Row) = .empty;
-        while (true) switch (c.sqlite3_step(stmt.?)) {
+        while (true) switch (c.sqlite3_step(stmt)) {
             c.SQLITE_ROW => {
                 const row = arena.alloc(?[]const u8, column_count) catch return error.OutOfMemory;
                 @memset(row, null);
                 for (row, 0..) |*cell, i| {
-                    if (c.sqlite3_column_type(stmt.?, @intCast(i)) == c.SQLITE_NULL) continue;
-                    const ptr = c.sqlite3_column_blob(stmt.?, @intCast(i)) orelse {
+                    if (c.sqlite3_column_type(stmt, @intCast(i)) == c.SQLITE_NULL) continue;
+                    const ptr = c.sqlite3_column_blob(stmt, @intCast(i)) orelse {
                         cell.* = "";
                         continue;
                     };
-                    const len: usize = @intCast(c.sqlite3_column_bytes(stmt.?, @intCast(i)));
+                    const len: usize = @intCast(c.sqlite3_column_bytes(stmt, @intCast(i)));
                     const bytes: [*]const u8 = @ptrCast(ptr);
                     cell.* = arena.dupe(u8, bytes[0..len]) catch return error.OutOfMemory;
                 }
@@ -161,6 +178,50 @@ pub const Db = struct {
             .affected = if (column_count == 0) c.sqlite3_changes64(db.handle) else @intCast(row_count),
             .last_insert_id = @intCast(c.sqlite3_last_insert_rowid(db.handle)),
         };
+    }
+
+    /// Returns a prepared statement for `sql`, reusing a cached one when
+    /// possible. Cached statements are reset and their bindings cleared.
+    fn acquireStmt(db: *Db, sql: []const u8) Error!*c.sqlite3_stmt {
+        db.stmt_clock +%= 1;
+        if (db.stmt_cache.getPtr(sql)) |entry| {
+            entry.last_used = db.stmt_clock;
+            _ = c.sqlite3_reset(entry.stmt);
+            _ = c.sqlite3_clear_bindings(entry.stmt);
+            return entry.stmt;
+        }
+        if (db.stmt_cache.count() >= db.stmt_cache_size) {
+            var oldest: ?*StmtEntry = null;
+            var it = db.stmt_cache.valueIterator();
+            while (it.next()) |entry| {
+                if (oldest == null or entry.last_used < oldest.?.last_used) oldest = entry;
+            }
+            if (oldest) |victim| {
+                if (db.stmt_cache.fetchRemove(victim.sql)) |kv| {
+                    _ = c.sqlite3_finalize(kv.value.stmt);
+                    db.gpa.free(kv.value.sql);
+                }
+            }
+        }
+        // prepare_v2 with an explicit byte count does not require NUL
+        // termination. prepare_v2 statements auto-recompile on schema change.
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(db.handle, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK)
+            return db.databaseError();
+        const sql_copy = db.gpa.dupe(u8, sql) catch {
+            _ = c.sqlite3_finalize(stmt.?);
+            return error.OutOfMemory;
+        };
+        db.stmt_cache.put(db.gpa, sql_copy, .{
+            .stmt = stmt.?,
+            .sql = sql_copy,
+            .last_used = db.stmt_clock,
+        }) catch {
+            db.gpa.free(sql_copy);
+            _ = c.sqlite3_finalize(stmt.?);
+            return error.OutOfMemory;
+        };
+        return stmt.?;
     }
 
     pub fn execParamsTimeout(db: *Db, sql: []const u8, params: []const Param, timeout_ms: u64) Error!Result {
@@ -193,10 +254,16 @@ pub const Db = struct {
     fn databaseError(db: *Db) Error {
         const code = c.sqlite3_extended_errcode(db.handle);
         const code_text = std.fmt.bufPrint(&db.error_code_buf, "{d}", .{code}) catch "";
+        const message = std.mem.span(c.sqlite3_errmsg(db.handle));
+        // sqlite3_errmsg's buffer is invalidated by the next statement; copy
+        // into connection-owned storage so lastError() stays valid.
+        db.last_error = null;
+        _ = db.err_arena.reset(.retain_capacity);
+        const a = db.err_arena.allocator();
         db.last_error = .{
             .severity = "ERROR",
-            .code = code_text,
-            .message = std.mem.span(c.sqlite3_errmsg(db.handle)),
+            .code = a.dupe(u8, code_text) catch return error.OutOfMemory,
+            .message = a.dupe(u8, message) catch return error.OutOfMemory,
         };
         return switch (code & 0xff) {
             c.SQLITE_INTERRUPT => if (db.deadline != null) error.QueryTimeout else error.QueryCanceled,
@@ -232,7 +299,7 @@ pub const Db = struct {
     }
 };
 
-fn bindParam(stmt: *c.sqlite3_stmt, index: c_int, param: Param) c_int {
+fn bindParam(stmt: *c.sqlite3_stmt, index: c_int, param: Param, arena: std.mem.Allocator) c_int {
     if (param.is_null or param.kind == .null_) return c.sqlite3_bind_null(stmt, index);
     return switch (param.kind) {
         .null_ => unreachable,
@@ -250,7 +317,18 @@ fn bindParam(stmt: *c.sqlite3_stmt, index: c_int, param: Param) c_int {
         else
             c.sqlite3_bind_text(stmt, index, param.data.ptr, @intCast(param.data.len), null),
         .bytes => c.sqlite3_bind_blob(stmt, index, param.data.ptr, @intCast(param.data.len), null),
-        .text, .json, .time => blk: {
+        .time => blk: {
+            // Binary PG instants carry no canonical text; reconstruct it into
+            // the result arena so it stays valid through sqlite3_step.
+            if (param.canonical.len == 0 and param.format == 1 and param.data.len == 8) {
+                var buf: [value.Time.pg_text_len]u8 = undefined;
+                const text = arena.dupe(u8, value.timeParamToText(param, &buf)) catch return c.SQLITE_NOMEM;
+                break :blk c.sqlite3_bind_text(stmt, index, text.ptr, @intCast(text.len), null);
+            }
+            const text = if (param.canonical.len > 0) param.canonical else param.data;
+            break :blk c.sqlite3_bind_text(stmt, index, text.ptr, @intCast(text.len), null);
+        },
+        .text, .json => blk: {
             const text = if (param.canonical.len > 0) param.canonical else param.data;
             break :blk c.sqlite3_bind_text(stmt, index, text.ptr, @intCast(text.len), null);
         },
