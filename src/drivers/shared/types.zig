@@ -99,6 +99,30 @@ pub const Param = struct {
     }
 };
 
+/// Writes lowercase hex encoding of `bytes` using a lookup table and bulk
+/// writes, avoiding per-byte formatting overhead on text/bytes hot paths.
+pub fn writeHex(w: *std.Io.Writer, bytes: []const u8) error{OutOfMemory}!void {
+    const digits = "0123456789abcdef";
+    var buf: [512]u8 = undefined;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const n = @min(bytes.len - i, buf.len / 2);
+        for (bytes[i..][0..n], 0..) |b, j| {
+            buf[j * 2] = digits[b >> 4];
+            buf[j * 2 + 1] = digits[b & 0xF];
+        }
+        w.writeAll(buf[0 .. n * 2]) catch return error.OutOfMemory;
+        i += n;
+    }
+}
+
+test "writeHex matches per-byte formatting" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try writeHex(&aw.writer, "\x00\x0f\xde\xad\xff");
+    try std.testing.expectEqualStrings("000fdeadff", aw.writer.buffered());
+}
+
 pub const Result = struct {
     arena: *std.heap.ArenaAllocator,
     columns: []Column = &.{},

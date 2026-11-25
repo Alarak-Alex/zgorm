@@ -259,6 +259,7 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
             const arena = arena_state.allocator();
             var sql = SqlBuf.init(arena);
             const w = sql.writer();
+            var params: std.ArrayList(types.Param) = .empty;
 
             w.writeAll("INSERT INTO ") catch return error.OutOfMemory;
             writeIdent(w, table.name) catch return error.OutOfMemory;
@@ -280,13 +281,14 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
                 const skip = col.is_auto and isNull(field_value);
                 if (!skip) {
                     if (count != 0) w.writeAll(", ") catch return error.OutOfMemory;
-                    try writeValue(w, field_value, arena);
+                    w.writeByte('?') catch return error.OutOfMemory;
+                    try appendParam(&params, field_value, arena);
                     count += 1;
                 }
             }
             w.writeByte(')') catch return error.OutOfMemory;
 
-            var result = try db.execRaw(sql.slice());
+            var result = try db.runParams(sql.slice(), params.items, 0);
             defer result.deinit();
             if (table.pk_index) |pk_index| {
                 const pk = table.columns[pk_index];
@@ -302,10 +304,123 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
         }
 
         pub fn insertBatch(db: *Self, models: anytype) Error!void {
+            const P = @typeInfo(@TypeOf(models));
+            const Items: type = blk: {
+                if (P == .pointer and P.pointer.size == .slice) break :blk @TypeOf(models);
+                if (P == .pointer and P.pointer.size == .one and @typeInfo(P.pointer.child) == .array)
+                    break :blk []@typeInfo(P.pointer.child).array.child;
+                @compileError("zgorm: insertBatch expects a slice, e.g. db.insertBatch(&users)");
+            };
+            const list: Items = models;
+            if (list.len == 0) return;
+            const T = @typeInfo(Items).pointer.child;
+            const table = comptime schema.tableOf(T);
+            const pkc = comptime table.pk();
+
+            // Multi-row fast path: a single auto-increment pk that every row
+            // leaves null. Mixed/manual keys fall back to per-row inserts.
+            const auto_cols = comptime blk: {
+                var n: usize = 0;
+                for (table.columns) |c| {
+                    if (c.is_auto) n += 1;
+                }
+                break :blk n;
+            };
+            var multi = comptime auto_cols == 1 and pkc != null and pkc.?.is_auto;
+            if (multi) {
+                for (list) |*m| {
+                    if (!isNull(value.getColumn(m, pkc.?))) {
+                        multi = false;
+                        break;
+                    }
+                }
+            }
+            if (!multi) {
+                var tx = try db.begin();
+                errdefer tx.rollback() catch {};
+                for (list) |*model| try tx.insert(model);
+                try tx.commit();
+                return;
+            }
+            if (comptime table.columns.len < 2) return error.InvalidModel;
+
+            for (list) |*m| {
+                try callHook(T, "beforeSave", m, db);
+                try callHook(T, "beforeCreate", m, db);
+                try db.autoStamp(T, m, true);
+            }
             var tx = try db.begin();
             errdefer tx.rollback() catch {};
-            for (models) |*model| try tx.insert(model);
+            const col_count = comptime table.columns.len - 1;
+            const chunk_rows = @max(@as(usize, 1), dialect.maxParameters() / @max(col_count, 1));
+            var i: usize = 0;
+            while (i < list.len) {
+                const end = @min(i + chunk_rows, list.len);
+                const chunk = list[i..end];
+                const last_id = try tx.db.insertChunkMulti(T, chunk);
+                if (last_id != 0) {
+                    // Auto-increment ids are consecutive within one statement:
+                    // MySQL reports the first id, SQLite the last.
+                    const base = switch (dialect) {
+                        .mysql => last_id,
+                        .sqlite => last_id - (chunk.len - 1),
+                        .postgresql => unreachable,
+                    };
+                    const V = value.columnFieldType(T, pkc.?);
+                    const Child = @typeInfo(V).optional.child;
+                    for (chunk, 0..) |*m, r| {
+                        const id = std.math.cast(Child, base + r) orelse return error.TypeMismatch;
+                        value.setColumn(m, pkc.?, @as(V, id));
+                    }
+                }
+                i = end;
+            }
             try tx.commit();
+            for (list) |*m| {
+                try callHook(T, "afterCreate", m, db);
+                try callHook(T, "afterSave", m, db);
+            }
+        }
+
+        fn insertChunkMulti(db: *Self, comptime T: type, rows: []T) Error!u64 {
+            const table = comptime schema.tableOf(T);
+            var arena_state = std.heap.ArenaAllocator.init(db.backend.gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            var sql = SqlBuf.init(arena);
+            const w = sql.writer();
+            const params = arena.alloc(types.Param, rows.len * (table.columns.len - 1)) catch return error.OutOfMemory;
+            w.writeAll("INSERT INTO ") catch return error.OutOfMemory;
+            writeIdent(w, table.name) catch return error.OutOfMemory;
+            w.writeAll(" (") catch return error.OutOfMemory;
+            var first_col = true;
+            inline for (table.columns) |col| {
+                if (!col.is_auto) {
+                    if (!first_col) w.writeAll(", ") catch return error.OutOfMemory;
+                    writeIdent(w, col.name) catch return error.OutOfMemory;
+                    first_col = false;
+                }
+            }
+            w.writeAll(") VALUES ") catch return error.OutOfMemory;
+            var np: usize = 0;
+            for (rows, 0..) |*m, r| {
+                if (r > 0) w.writeAll(", ") catch return error.OutOfMemory;
+                w.writeByte('(') catch return error.OutOfMemory;
+                var first = true;
+                inline for (table.columns) |col| {
+                    if (!col.is_auto) {
+                        if (!first) w.writeAll(", ") catch return error.OutOfMemory;
+                        w.writeByte('?') catch return error.OutOfMemory;
+                        params[np] = try value.toParam(value.getColumn(m, col), arena);
+                        np += 1;
+                        first = false;
+                    }
+                }
+                w.writeByte(')') catch return error.OutOfMemory;
+            }
+            var result = try db.runParams(sql.slice(), params[0..np], 0);
+            defer result.deinit();
+            return result.last_insert_id;
         }
 
         pub fn upsert(db: *Self, model: anytype, comptime conflict: OnConflict) Error!bool {
@@ -316,6 +431,7 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
             const arena = arena_state.allocator();
             var sql = SqlBuf.init(arena);
             const w = sql.writer();
+            var params: std.ArrayList(types.Param) = .empty;
             w.writeAll("INSERT INTO ") catch return error.OutOfMemory;
             writeIdent(w, table.name) catch return error.OutOfMemory;
             w.writeAll(" (") catch return error.OutOfMemory;
@@ -336,7 +452,8 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
                 const skip = column.is_auto and isNull(field_value);
                 if (!skip) {
                     if (count != 0) w.writeAll(", ") catch return error.OutOfMemory;
-                    try writeValue(w, field_value, arena);
+                    w.writeByte('?') catch return error.OutOfMemory;
+                    try appendParam(&params, field_value, arena);
                     count += 1;
                 }
             }
@@ -384,7 +501,7 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
                 },
                 .postgresql => unreachable,
             }
-            var result = try db.execRaw(sql.slice());
+            var result = try db.runParams(sql.slice(), params.items, 0);
             defer result.deinit();
             if (table.pk_index) |pk_index| {
                 const pk = table.columns[pk_index];
@@ -418,15 +535,16 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
             const arena = arena_state.allocator();
             var sql = SqlBuf.init(arena);
             const w = sql.writer();
+            var params: std.ArrayList(types.Param) = .empty;
             try writeSelectPrefix(w, table);
             w.writeAll(" WHERE ") catch return error.OutOfMemory;
             writeIdent(w, pk.name) catch return error.OutOfMemory;
-            w.writeAll(" = ") catch return error.OutOfMemory;
-            try writeValue(w, key, arena);
+            w.writeAll(" = ?") catch return error.OutOfMemory;
+            try appendParam(&params, key, arena);
             try writeScope(w, table);
             w.writeAll(" LIMIT 1") catch return error.OutOfMemory;
 
-            var result = try db.execRaw(sql.slice());
+            var result = try db.runParams(sql.slice(), params.items, 0);
             defer result.deinit();
             if (result.rows.len == 0) return null;
             var out = try decodeRow(T, table, result.rows[0], gpa);
@@ -436,7 +554,7 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
         }
 
         pub fn all(db: *Self, comptime T: type, gpa: std.mem.Allocator) Error![]T {
-            return db.selectWhere(T, null, gpa);
+            return db.selectWhere(T, null, &.{}, gpa);
         }
 
         pub fn whereEq(
@@ -452,16 +570,18 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
             defer arena_state.deinit();
             const arena = arena_state.allocator();
             var predicate = SqlBuf.init(arena);
+            var params: std.ArrayList(types.Param) = .empty;
             writeIdent(predicate.writer(), column) catch return error.OutOfMemory;
-            predicate.writer().writeAll(" = ") catch return error.OutOfMemory;
-            try writeValue(predicate.writer(), needle, arena);
-            return db.selectWhere(T, predicate.slice(), gpa);
+            predicate.writer().writeAll(" = ?") catch return error.OutOfMemory;
+            try appendParam(&params, needle, arena);
+            return db.selectWhere(T, predicate.slice(), params.items, gpa);
         }
 
         fn selectWhere(
             db: *Self,
             comptime T: type,
             predicate: ?[]const u8,
+            params: []const types.Param,
             gpa: std.mem.Allocator,
         ) Error![]T {
             const table = comptime schema.tableOf(T);
@@ -479,7 +599,7 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
                 writeIdent(w, table.columns[index].name) catch return error.OutOfMemory;
                 w.writeAll(" IS NULL") catch return error.OutOfMemory;
             }
-            var result = try db.execRaw(sql.slice());
+            var result = try db.runParams(sql.slice(), params, 0);
             defer result.deinit();
             const out = gpa.alloc(T, result.rows.len) catch return error.OutOfMemory;
             var initialized: usize = 0;
@@ -509,6 +629,7 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
             const arena = arena_state.allocator();
             var sql = SqlBuf.init(arena);
             const w = sql.writer();
+            var params: std.ArrayList(types.Param) = .empty;
             w.writeAll("UPDATE ") catch return error.OutOfMemory;
             writeIdent(w, table.name) catch return error.OutOfMemory;
             w.writeAll(" SET ") catch return error.OutOfMemory;
@@ -522,22 +643,22 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
                     writeIdent(w, col.name) catch return error.OutOfMemory;
                     w.writeAll(" + 1") catch return error.OutOfMemory;
                 } else {
-                    w.writeAll(" = ") catch return error.OutOfMemory;
-                    try writeValue(w, value.getColumn(model, col), arena);
+                    w.writeAll(" = ?") catch return error.OutOfMemory;
+                    try appendParam(&params, value.getColumn(model, col), arena);
                 }
                 count += 1;
             }
             if (count == 0) return error.InvalidModel;
             w.writeAll(" WHERE ") catch return error.OutOfMemory;
-            try writePkPredicate(w, table, model, arena);
+            try writePkPredicate(w, table, model, &params, arena);
             try writeScope(w, table);
             if (table.version_index) |index| {
                 w.writeAll(" AND ") catch return error.OutOfMemory;
                 writeIdent(w, table.columns[index].name) catch return error.OutOfMemory;
-                w.writeAll(" = ") catch return error.OutOfMemory;
-                try writeValue(w, value.getColumn(model, table.columns[index]), arena);
+                w.writeAll(" = ?") catch return error.OutOfMemory;
+                try appendParam(&params, value.getColumn(model, table.columns[index]), arena);
             }
-            var result = try db.execRaw(sql.slice());
+            var result = try db.runParams(sql.slice(), params.items, 0);
             defer result.deinit();
             if (table.version_index) |index| {
                 if (result.affected == 0) return error.OptimisticLockConflict;
@@ -589,6 +710,7 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
             const arena = arena_state.allocator();
             var sql = SqlBuf.init(arena);
             const w = sql.writer();
+            var params: std.ArrayList(types.Param) = .empty;
             if (!hard and table.deleted_at_index != null) {
                 w.writeAll("UPDATE ") catch return error.OutOfMemory;
                 writeIdent(w, table.name) catch return error.OutOfMemory;
@@ -600,9 +722,9 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
                 writeIdent(w, table.name) catch return error.OutOfMemory;
                 w.writeAll(" WHERE ") catch return error.OutOfMemory;
             }
-            try writePkPredicate(w, table, model, arena);
+            try writePkPredicate(w, table, model, &params, arena);
             if (!hard) try writeScope(w, table);
-            var result = try db.execRaw(sql.slice());
+            var result = try db.runParams(sql.slice(), params.items, 0);
             defer result.deinit();
             try callHook(T, "afterDelete", model, db);
             return result.affected;
@@ -616,13 +738,14 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
             defer arena_state.deinit();
             var sql = SqlBuf.init(arena_state.allocator());
             const w = sql.writer();
+            var params: std.ArrayList(types.Param) = .empty;
             w.writeAll("UPDATE ") catch return error.OutOfMemory;
             writeIdent(w, table.name) catch return error.OutOfMemory;
             w.writeAll(" SET ") catch return error.OutOfMemory;
             writeIdent(w, table.columns[index].name) catch return error.OutOfMemory;
             w.writeAll(" = NULL WHERE ") catch return error.OutOfMemory;
-            try writePkPredicate(w, table, model, arena_state.allocator());
-            var result = try db.execRaw(sql.slice());
+            try writePkPredicate(w, table, model, &params, arena_state.allocator());
+            var result = try db.runParams(sql.slice(), params.items, 0);
             defer result.deinit();
             return result.affected;
         }
@@ -835,73 +958,20 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
             }
         }
 
-        fn writePkPredicate(w: *std.Io.Writer, comptime table: schema.Table, model: anytype, arena: std.mem.Allocator) Error!void {
+        fn writePkPredicate(w: *std.Io.Writer, comptime table: schema.Table, model: anytype, params: *std.ArrayList(types.Param), arena: std.mem.Allocator) Error!void {
             inline for (table.pk_indexes, 0..) |index, i| {
                 if (i != 0) w.writeAll(" AND ") catch return error.OutOfMemory;
                 const col = table.columns[index];
                 const field_value = value.getColumn(model, col);
                 if (isNull(field_value)) return error.InvalidModel;
                 writeIdent(w, col.name) catch return error.OutOfMemory;
-                w.writeAll(" = ") catch return error.OutOfMemory;
-                try writeValue(w, field_value, arena);
+                w.writeAll(" = ?") catch return error.OutOfMemory;
+                try appendParam(params, field_value, arena);
             }
         }
 
-        fn writeValue(w: *std.Io.Writer, v: anytype, arena: std.mem.Allocator) Error!void {
-            const T = @TypeOf(v);
-            switch (@typeInfo(T)) {
-                .null => w.writeAll("NULL") catch return error.OutOfMemory,
-                .optional => {
-                    if (v) |inner| return writeValue(w, inner, arena);
-                    w.writeAll("NULL") catch return error.OutOfMemory;
-                },
-                .bool => w.writeByte(if (v) '1' else '0') catch return error.OutOfMemory,
-                .int, .comptime_int => w.print("{d}", .{v}) catch return error.OutOfMemory,
-                .float, .comptime_float => w.print("{d}", .{v}) catch return error.OutOfMemory,
-                .@"enum" => try writeText(w, @tagName(v)),
-                .pointer => |ptr| {
-                    if (ptr.size == .slice and ptr.child == u8) return writeText(w, v);
-                    return error.UnsupportedType;
-                },
-                .array => |array| {
-                    if (array.child == u8) return writeText(w, &v);
-                    return error.UnsupportedType;
-                },
-                .@"struct" => {
-                    if (@hasDecl(T, "__zgorm_time")) {
-                        var buf: [value.Time.pg_text_len]u8 = undefined;
-                        return writeText(w, v.toPgText(&buf));
-                    }
-                    if (@hasDecl(T, "__zgorm_json")) return writeText(w, v.data);
-                    if (@hasDecl(T, "__zgorm_bytes")) return writeBlob(w, v.data);
-                    if (@hasDecl(T, "zgormEncode")) {
-                        const param = v.zgormEncode(arena) catch return error.TypeMismatch;
-                        if (param.is_null) return w.writeAll("NULL") catch return error.OutOfMemory;
-                        if (param.format != 0) return error.UnsupportedType;
-                        return writeText(w, param.data);
-                    }
-                    return error.UnsupportedType;
-                },
-                else => return error.UnsupportedType,
-            }
-        }
-
-        fn writeText(w: *std.Io.Writer, text: []const u8) Error!void {
-            if (dialect == .sqlite) {
-                w.writeAll("CAST(X'") catch return error.OutOfMemory;
-                try writeHex(w, text);
-                w.writeAll("' AS TEXT)") catch return error.OutOfMemory;
-            } else {
-                w.writeAll("CONVERT(X'") catch return error.OutOfMemory;
-                try writeHex(w, text);
-                w.writeAll("' USING utf8mb4)") catch return error.OutOfMemory;
-            }
-        }
-
-        fn writeBlob(w: *std.Io.Writer, bytes: []const u8) Error!void {
-            w.writeAll("X'") catch return error.OutOfMemory;
-            try writeHex(w, bytes);
-            w.writeByte('\'') catch return error.OutOfMemory;
+        fn appendParam(params: *std.ArrayList(types.Param), v: anytype, arena: std.mem.Allocator) Error!void {
+            params.append(arena, try value.toParam(v, arena)) catch return error.OutOfMemory;
         }
 
         fn callHook(comptime T: type, comptime name: []const u8, model: *T, db: *Self) Error!void {
@@ -1002,10 +1072,6 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
                     @as(@TypeOf(v), 1),
                 else => @compileError("zgorm: version column must be an integer"),
             };
-        }
-
-        fn writeHex(w: *std.Io.Writer, bytes: []const u8) Error!void {
-            for (bytes) |byte| w.print("{x:0>2}", .{byte}) catch return error.OutOfMemory;
         }
 
         fn decodeRow(comptime T: type, comptime table: schema.Table, row: []const ?[]const u8, gpa: std.mem.Allocator) Error!T {

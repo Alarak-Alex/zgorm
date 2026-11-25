@@ -270,6 +270,13 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
             var aw: std.Io.Writer.Allocating = .init(q.allocator());
             const w = &aw.writer;
             var params: std.ArrayList(types.Param) = .empty;
+            var param_count: usize = 0;
+            for (q.ctes.items) |f| param_count += f.params.len;
+            for (q.joins.items) |f| param_count += f.params.len;
+            for (q.conditions.items) |f| param_count += f.params.len;
+            for (q.having_fragments.items) |f| param_count += f.params.len;
+            for (q.unions.items) |f| param_count += f.params.len;
+            params.ensureTotalCapacity(q.allocator(), param_count) catch return error.OutOfMemory;
             if (q.ctes.items.len > 0) {
                 try w.writeAll(if (q.recursive) "WITH RECURSIVE " else "WITH ");
                 for (q.ctes.items, 0..) |fragment_value, i| {
@@ -494,7 +501,15 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
                 .optional => if (a) |unwrapped| keyEqual(@TypeOf(unwrapped), unwrapped, B, b) else false,
                 else => switch (@typeInfo(B)) {
                     .optional => if (b) |unwrapped| keyEqual(A, a, @TypeOf(unwrapped), unwrapped) else false,
-                    else => false,
+                    else => blk: {
+                        // Cross-width integer keys compare numerically.
+                        if (@typeInfo(A) == .int and @typeInfo(B) == .int) {
+                            const ia = std.math.cast(i128, a) orelse break :blk false;
+                            const ib = std.math.cast(i128, b) orelse break :blk false;
+                            break :blk ia == ib;
+                        }
+                        break :blk false;
+                    },
                 },
             };
         }
@@ -508,9 +523,26 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
 
             var keys: std.ArrayList(ParentKey) = .empty;
             defer keys.deinit(gpa);
-            for (rows) |*parent| {
-                const key = @field(parent, parent_key);
-                if (keyPresent(ParentKey, key)) keys.append(gpa, key) catch return error.OutOfMemory;
+            keys.ensureTotalCapacity(gpa, rows.len) catch return error.OutOfMemory;
+            if (comptime assoc.kind == .belongs_to and value.keyMapType(ParentKey) != null) {
+                // Deduplicate the IN list when many parents share one child.
+                var seen: value.keyMapType(ParentKey).? = .init(gpa);
+                defer seen.deinit();
+                for (rows) |*parent| {
+                    const key = @field(parent, parent_key);
+                    if (value.normalizedKey(ParentKey, key)) |nk| {
+                        const gop = seen.getOrPut(nk) catch return error.OutOfMemory;
+                        if (!gop.found_existing) {
+                            gop.value_ptr.* = 0;
+                            keys.appendAssumeCapacity(key);
+                        }
+                    }
+                }
+            } else {
+                for (rows) |*parent| {
+                    const key = @field(parent, parent_key);
+                    if (keyPresent(ParentKey, key)) keys.appendAssumeCapacity(key);
+                }
             }
             if (keys.items.len == 0) {
                 if (assoc.kind != .has_many) {
@@ -538,23 +570,46 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
                 @memset(counts, 0);
                 const owners = gpa.alloc(usize, children.len) catch return error.OutOfMemory;
                 defer gpa.free(owners);
-                for (children, 0..) |*child, child_index| {
-                    owners[child_index] = std.math.maxInt(usize);
+                const ChildKey = @TypeOf(@field(@as(Child, undefined), child_key));
+                if (comptime value.keysHashable(ParentKey, ChildKey)) {
+                    var map: value.keyMapType(ParentKey).? = .init(gpa);
+                    defer map.deinit();
                     for (rows, 0..) |*parent, parent_index| {
-                        if (keyEqual(
-                            @TypeOf(@field(child, child_key)),
-                            @field(child, child_key),
-                            ParentKey,
-                            @field(parent, parent_key),
-                        )) {
-                            owners[child_index] = parent_index;
-                            counts[parent_index] += 1;
-                            break;
+                        if (value.normalizedKey(ParentKey, @field(parent, parent_key))) |k| {
+                            const gop = map.getOrPut(k) catch return error.OutOfMemory;
+                            if (!gop.found_existing) gop.value_ptr.* = parent_index;
+                        }
+                    }
+                    for (children, 0..) |*child, child_index| {
+                        owners[child_index] = std.math.maxInt(usize);
+                        if (value.normalizedKey(ChildKey, @field(child, child_key))) |k| {
+                            if (map.get(k)) |parent_index| {
+                                owners[child_index] = parent_index;
+                                counts[parent_index] += 1;
+                            }
+                        }
+                    }
+                } else {
+                    for (children, 0..) |*child, child_index| {
+                        owners[child_index] = std.math.maxInt(usize);
+                        for (rows, 0..) |*parent, parent_index| {
+                            if (keyEqual(
+                                ChildKey,
+                                @field(child, child_key),
+                                ParentKey,
+                                @field(parent, parent_key),
+                            )) {
+                                owners[child_index] = parent_index;
+                                counts[parent_index] += 1;
+                                break;
+                            }
                         }
                     }
                 }
                 for (rows, 0..) |*parent, parent_index| {
                     slices[parent_index] = gpa.alloc(Child, counts[parent_index]) catch return error.OutOfMemory;
+                    // Zero so a mid-fill error path frees only initialized slots.
+                    @memset(std.mem.sliceAsBytes(slices[parent_index]), 0);
                     fill[parent_index] = 0;
                     @field(parent, assoc.field_name) = slices[parent_index];
                 }
@@ -568,17 +623,37 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
                 return;
             }
 
-            for (rows) |*parent| {
-                @field(parent, assoc.field_name) = null;
-                for (children) |*child| {
-                    if (keyEqual(
-                        @TypeOf(@field(child, child_key)),
-                        @field(child, child_key),
-                        ParentKey,
-                        @field(parent, parent_key),
-                    )) {
-                        @field(parent, assoc.field_name) = try value.deepCopy(Child, child.*, gpa);
-                        break;
+            const ChildKey = @TypeOf(@field(@as(Child, undefined), child_key));
+            if (comptime value.keysHashable(ParentKey, ChildKey)) {
+                var map: value.keyMapType(ChildKey).? = .init(gpa);
+                defer map.deinit();
+                for (children, 0..) |*child, child_index| {
+                    if (value.normalizedKey(ChildKey, @field(child, child_key))) |k| {
+                        const gop = map.getOrPut(k) catch return error.OutOfMemory;
+                        if (!gop.found_existing) gop.value_ptr.* = child_index;
+                    }
+                }
+                for (rows) |*parent| {
+                    @field(parent, assoc.field_name) = null;
+                    if (value.normalizedKey(ParentKey, @field(parent, parent_key))) |k| {
+                        if (map.get(k)) |child_index| {
+                            @field(parent, assoc.field_name) = try value.deepCopy(Child, children[child_index], gpa);
+                        }
+                    }
+                }
+            } else {
+                for (rows) |*parent| {
+                    @field(parent, assoc.field_name) = null;
+                    for (children) |*child| {
+                        if (keyEqual(
+                            ChildKey,
+                            @field(child, child_key),
+                            ParentKey,
+                            @field(parent, parent_key),
+                        )) {
+                            @field(parent, assoc.field_name) = try value.deepCopy(Child, child.*, gpa);
+                            break;
+                        }
                     }
                 }
             }
@@ -593,9 +668,10 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
 
             var keys: std.ArrayList(ParentKey) = .empty;
             defer keys.deinit(gpa);
+            keys.ensureTotalCapacity(gpa, rows.len) catch return error.OutOfMemory;
             for (rows) |*parent| {
                 const key = @field(parent, assoc.primary_key);
-                if (keyPresent(ParentKey, key)) keys.append(gpa, key) catch return error.OutOfMemory;
+                if (keyPresent(ParentKey, key)) keys.appendAssumeCapacity(key);
             }
             if (keys.items.len == 0) {
                 for (rows) |*parent| @field(parent, assoc.field_name) = &.{};
@@ -641,6 +717,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
             value.buildColumnMap(child_table, result.columns, &column_map);
 
             var joined: std.ArrayList(Joined) = .empty;
+            joined.ensureTotalCapacity(arena, result.rows.len) catch return error.OutOfMemory;
             for (result.rows) |row| {
                 var item = Joined{
                     .child = try value.scanCellsMapped(Child, child_table, result.columns, row, &column_map, arena),
@@ -653,7 +730,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
                     ),
                 };
                 try q.db.runAfterFind(&item.child);
-                joined.append(arena, item) catch return error.OutOfMemory;
+                joined.appendAssumeCapacity(item);
             }
 
             const slices = gpa.alloc(@TypeOf(@field(@as(Parent, undefined), assoc.field_name)), rows.len) catch
@@ -666,18 +743,40 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
             @memset(counts, 0);
             const owners = gpa.alloc(usize, joined.items.len) catch return error.OutOfMemory;
             defer gpa.free(owners);
-            for (joined.items, 0..) |item, child_index| {
-                owners[child_index] = std.math.maxInt(usize);
+            if (comptime value.keyMapType(ParentKey) != null) {
+                var map: value.keyMapType(ParentKey).? = .init(gpa);
+                defer map.deinit();
                 for (rows, 0..) |*parent, parent_index| {
-                    if (keyEqual(ParentKey, item.parent_key, ParentKey, @field(parent, assoc.primary_key))) {
-                        owners[child_index] = parent_index;
-                        counts[parent_index] += 1;
-                        break;
+                    if (value.normalizedKey(ParentKey, @field(parent, assoc.primary_key))) |k| {
+                        const gop = map.getOrPut(k) catch return error.OutOfMemory;
+                        if (!gop.found_existing) gop.value_ptr.* = parent_index;
+                    }
+                }
+                for (joined.items, 0..) |item, child_index| {
+                    owners[child_index] = std.math.maxInt(usize);
+                    if (value.normalizedKey(ParentKey, item.parent_key)) |k| {
+                        if (map.get(k)) |parent_index| {
+                            owners[child_index] = parent_index;
+                            counts[parent_index] += 1;
+                        }
+                    }
+                }
+            } else {
+                for (joined.items, 0..) |item, child_index| {
+                    owners[child_index] = std.math.maxInt(usize);
+                    for (rows, 0..) |*parent, parent_index| {
+                        if (keyEqual(ParentKey, item.parent_key, ParentKey, @field(parent, assoc.primary_key))) {
+                            owners[child_index] = parent_index;
+                            counts[parent_index] += 1;
+                            break;
+                        }
                     }
                 }
             }
             for (rows, 0..) |*parent, parent_index| {
                 slices[parent_index] = gpa.alloc(Child, counts[parent_index]) catch return error.OutOfMemory;
+                // Zero so a mid-fill error path frees only initialized slots.
+                @memset(std.mem.sliceAsBytes(slices[parent_index]), 0);
                 fill[parent_index] = 0;
                 @field(parent, assoc.field_name) = slices[parent_index];
             }
