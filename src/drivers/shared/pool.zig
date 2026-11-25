@@ -21,6 +21,7 @@ pub fn Pool(
     comptime createFn: fn (*Context) types.Error!Backend,
     comptime destroyFn: fn (Backend) void,
     comptime pingFn: fn (Backend) types.Error!void,
+    comptime healthyFn: fn (Backend) bool,
 ) type {
     return struct {
         const Self = @This();
@@ -68,11 +69,16 @@ pub fn Pool(
         pub fn deinit(pool: *Self) void {
             pool.mutex.lockUncancelable(pool.io);
             pool.closed = true;
-            std.debug.assert(pool.total == pool.idle.items.len);
+            // Idle connections are not in use: detach and account for them now.
             var idle = pool.idle;
             pool.idle = .empty;
-            pool.total = 0;
+            pool.total -= idle.items.len;
             pool.condition.broadcast(pool.io);
+            // Wait for in-use and still-creating connections to be returned or
+            // destroyed before freeing the pool, so no lease outlives it.
+            while (pool.total != 0) {
+                pool.condition.waitUncancelable(pool.io, &pool.mutex);
+            }
             pool.mutex.unlock(pool.io);
 
             for (idle.items) |entry| destroyFn(entry.backend);
@@ -90,6 +96,13 @@ pub fn Pool(
                 }
                 if (pool.idle.pop()) |entry| {
                     pool.mutex.unlock(pool.io);
+                    // Reject broken connections immediately, regardless of how
+                    // recently they were used.
+                    if (!healthyFn(entry.backend)) {
+                        destroyFn(entry.backend);
+                        pool.removeConnection();
+                        continue;
+                    }
                     // Recently used connections are assumed live; pinging on
                     // every acquire would add a round trip to each query.
                     if (pool.options.health_check_interval_ms == 0 or
@@ -129,19 +142,24 @@ pub fn Pool(
 
         fn release(pool: *Self, backend: Backend) void {
             pool.mutex.lockUncancelable(pool.io);
-            defer pool.mutex.unlock(pool.io);
-            if (pool.closed) {
-                destroyFn(backend);
+            if (pool.closed or !healthyFn(backend)) {
                 pool.total -= 1;
-            } else {
-                pool.idle.append(pool.gpa, .{ .backend = backend, .idle_since = std.Io.Clock.awake.now(pool.io) }) catch {
-                    destroyFn(backend);
-                    pool.total -= 1;
-                    pool.condition.signal(pool.io);
-                    return;
-                };
+                pool.condition.signal(pool.io);
+                pool.mutex.unlock(pool.io);
+                // Destroy outside the lock: destroyFn does network I/O and must
+                // not stall other acquire/release/stats callers.
+                destroyFn(backend);
+                return;
             }
+            pool.idle.append(pool.gpa, .{ .backend = backend, .idle_since = std.Io.Clock.awake.now(pool.io) }) catch {
+                pool.total -= 1;
+                pool.condition.signal(pool.io);
+                pool.mutex.unlock(pool.io);
+                destroyFn(backend);
+                return;
+            };
             pool.condition.signal(pool.io);
+            pool.mutex.unlock(pool.io);
         }
 
         fn removeConnection(pool: *Self) void {

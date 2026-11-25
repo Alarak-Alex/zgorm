@@ -53,6 +53,7 @@ pub const Pool = struct {
     max_size: usize,
 
     mutex: std.Io.Mutex = .init,
+    drain: std.Io.Condition = .init,
     wait_head: ?*Waiter = null,
     wait_tail: ?*Waiter = null,
     free: std.ArrayList(*pq.Conn) = .empty,
@@ -196,6 +197,9 @@ pub const Pool = struct {
         waiter.event.set(p.io);
     }
     fn wakeConnectorLocked(p: *Pool) void {
+        // Notify deinit (waiting for in-use connections to drain) on every
+        // change to the connection count.
+        p.drain.broadcast(p.io);
         if (p.total < p.max_size and p.connecting < p.options.max_connecting) {
             p.wakeRetryLocked();
         }
@@ -483,9 +487,20 @@ pub const Pool = struct {
             waiter.closed = true;
             waiter.event.set(p.io);
         }
-        while (p.free.pop()) |c| {
-            p.total -= 1;
-            c.close();
+        // Detach idle connections under the lock, then close them outside it:
+        // close() does network I/O and must not block release() (which needs
+        // the mutex to drain in-use connections).
+        var closing = p.free;
+        p.free = .empty;
+        p.total -= closing.items.len;
+        p.mutex.unlock(p.io);
+        for (closing.items) |c| c.close();
+        closing.deinit(p.gpa);
+        // Wait for in-use and still-connecting connections to be released or
+        // fail before tearing down, so no connection outlives the pool.
+        p.mutex.lockUncancelable(p.io);
+        while (p.total != 0) {
+            p.drain.waitUncancelable(p.io, &p.mutex);
         }
         p.mutex.unlock(p.io);
         p.free.deinit(p.gpa);

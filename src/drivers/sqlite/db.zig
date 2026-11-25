@@ -41,7 +41,12 @@ fn poolPing(db: *Db) Error!void {
     result.deinit();
 }
 
-pub const Pool = pool_mod.Pool(*Db, PoolContext, poolCreate, poolDestroy, poolPing);
+fn poolHealthy(db: *Db) bool {
+    _ = db;
+    return true;
+}
+
+pub const Pool = pool_mod.Pool(*Db, PoolContext, poolCreate, poolDestroy, poolPing, poolHealthy);
 
 pub fn openPool(gpa: std.mem.Allocator, io: std.Io, filename: []const u8, options: OpenOptions, pool_options: PoolOptions) Error!*Pool {
     return Pool.init(gpa, io, pool_options, .{ .gpa = gpa, .io = io, .filename = filename, .options = options });
