@@ -358,11 +358,14 @@ pub const Migrator = struct {
             for (changes.items) |change| change.deinit(gpa);
             changes.deinit(gpa);
         }
+        // Index the live columns once so both diff directions are O(cols+rows).
+        var actual_map: std.StringHashMap([]const u8) = .init(gpa);
+        defer actual_map.deinit();
+        for (res.rows) |row| {
+            actual_map.put(row[0].?, row[1].?) catch return error.OutOfMemory;
+        }
         inline for (table.columns) |column| {
-            var actual: ?[]const u8 = null;
-            for (res.rows) |row| {
-                if (std.mem.eql(u8, row[0].?, column.name)) actual = row[1].?;
-            }
+            const actual = actual_map.get(column.name);
             if (actual == null) {
                 changes.append(gpa, .{
                     .kind = .add,
@@ -382,11 +385,7 @@ pub const Migrator = struct {
             }
         }
         for (res.rows) |row| {
-            var found = false;
-            inline for (table.columns) |column| {
-                if (std.mem.eql(u8, row[0].?, column.name)) found = true;
-            }
-            if (!found) changes.append(gpa, .{
+            if (!table.hasColumn(row[0].?)) changes.append(gpa, .{
                 .kind = .drop,
                 .column = gpa.dupe(u8, row[0].?) catch return error.OutOfMemory,
                 .expected = gpa.dupe(u8, "") catch return error.OutOfMemory,

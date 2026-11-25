@@ -64,19 +64,21 @@ pub fn Association(comptime M: type, comptime field_name: []const u8) type {
     const assoc = comptime schema.tableOf(M).assoc(field_name) orelse
         @compileError("zgorm: unknown association " ++ field_name);
     const Child = assoc.model;
+    const join_table_q = qb_mod.QuotedIdent(assoc.join_table).value;
+    const join_fk_q = qb_mod.QuotedIdent(assoc.join_foreign_key).value;
+    const join_ak_q = qb_mod.QuotedIdent(assoc.join_association_key).value;
+    const count_sql = "SELECT count(*) FROM " ++ join_table_q ++ " WHERE " ++ join_fk_q ++ " = $1";
+    const join_insert_head = "INSERT INTO " ++ join_table_q ++ " (" ++ join_fk_q ++ ", " ++ join_ak_q ++ ") VALUES ";
+    const append_sql = join_insert_head ++ "($1, $2) ON CONFLICT DO NOTHING";
+    const clear_sql = "DELETE FROM " ++ join_table_q ++ " WHERE " ++ join_fk_q ++ " = $1";
+    const delete_sql = "DELETE FROM " ++ join_table_q ++ " WHERE " ++ join_fk_q ++ " = $1 AND " ++ join_ak_q ++ " = $2";
     return struct {
         sess: Session,
         parent: *M,
 
         pub fn count(a: *@This()) Error!i64 {
             if (assoc.kind == .many_to_many) {
-                var arena_state = std.heap.ArenaAllocator.init(a.sess.gpa);
-                defer arena_state.deinit();
-                const sql = std.fmt.allocPrint(arena_state.allocator(), "SELECT count(*) FROM {s} WHERE {s} = $1", .{
-                    try qb_mod.quoteIdent(arena_state.allocator(), assoc.join_table),
-                    try qb_mod.quoteIdent(arena_state.allocator(), assoc.join_foreign_key),
-                }) catch return error.OutOfMemory;
-                var res = try a.sess.exec(sql, .{value.getColumn(a.parent, associationColumn(M, assoc.primary_key))});
+                var res = try a.sess.exec(count_sql, .{value.getColumn(a.parent, associationColumn(M, assoc.primary_key))});
                 defer res.deinit();
                 return try value.decodeCell(i64, res.rows[0][0], res.columns[0].type_oid, res.columns[0].format, a.sess.gpa);
             }
@@ -102,15 +104,7 @@ pub fn Association(comptime M: type, comptime field_name: []const u8) type {
                 return;
             }
             try a.sess.save(child);
-            var arena_state = std.heap.ArenaAllocator.init(a.sess.gpa);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
-            const sql = std.fmt.allocPrint(arena, "INSERT INTO {s} ({s}, {s}) VALUES ($1, $2) ON CONFLICT DO NOTHING", .{
-                try qb_mod.quoteIdent(arena, assoc.join_table),
-                try qb_mod.quoteIdent(arena, assoc.join_foreign_key),
-                try qb_mod.quoteIdent(arena, assoc.join_association_key),
-            }) catch return error.OutOfMemory;
-            var res = try a.sess.exec(sql, .{
+            var res = try a.sess.exec(append_sql, .{
                 @field(a.parent, assoc.primary_key),
                 @field(child, assoc.association_key),
             });
@@ -118,15 +112,8 @@ pub fn Association(comptime M: type, comptime field_name: []const u8) type {
         }
 
         pub fn clear(a: *@This()) Error!void {
-            var arena_state = std.heap.ArenaAllocator.init(a.sess.gpa);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
             if (assoc.kind == .many_to_many) {
-                const sql = std.fmt.allocPrint(arena, "DELETE FROM {s} WHERE {s} = $1", .{
-                    try qb_mod.quoteIdent(arena, assoc.join_table),
-                    try qb_mod.quoteIdent(arena, assoc.join_foreign_key),
-                }) catch return error.OutOfMemory;
-                var res = try a.sess.exec(sql, .{@field(a.parent, assoc.primary_key)});
+                var res = try a.sess.exec(clear_sql, .{@field(a.parent, assoc.primary_key)});
                 res.deinit();
                 return;
             }
@@ -141,15 +128,7 @@ pub fn Association(comptime M: type, comptime field_name: []const u8) type {
                 _ = try a.sess.delete(child);
                 return;
             }
-            var arena_state = std.heap.ArenaAllocator.init(a.sess.gpa);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
-            const sql = std.fmt.allocPrint(arena, "DELETE FROM {s} WHERE {s} = $1 AND {s} = $2", .{
-                try qb_mod.quoteIdent(arena, assoc.join_table),
-                try qb_mod.quoteIdent(arena, assoc.join_foreign_key),
-                try qb_mod.quoteIdent(arena, assoc.join_association_key),
-            }) catch return error.OutOfMemory;
-            var res = try a.sess.exec(sql, .{
+            var res = try a.sess.exec(delete_sql, .{
                 @field(a.parent, assoc.primary_key),
                 @field(child, assoc.association_key),
             });
@@ -158,7 +137,38 @@ pub fn Association(comptime M: type, comptime field_name: []const u8) type {
 
         pub fn replace(a: *@This(), children: []Child) Error!void {
             try a.clear();
-            for (children) |*child| try a.append(child);
+            if (assoc.kind != .many_to_many) {
+                for (children) |*child| try a.append(child);
+                return;
+            }
+            for (children) |*child| try a.sess.save(child);
+            if (children.len == 0) return;
+            var arena_state = std.heap.ArenaAllocator.init(a.sess.gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const chunk_rows = @max(@as(usize, 1), max_params / 2);
+            var i: usize = 0;
+            while (i < children.len) {
+                const end = @min(i + chunk_rows, children.len);
+                const chunk = children[i..end];
+                var b = SqlBuf.init(arena);
+                const w = b.w();
+                w.writeAll(join_insert_head) catch return error.OutOfMemory;
+                const params = arena.alloc(pq.Param, chunk.len * 2) catch return error.OutOfMemory;
+                var np: usize = 0;
+                for (chunk, 0..) |*child, r| {
+                    if (r > 0) w.writeAll(", ") catch return error.OutOfMemory;
+                    w.print("(${d}, ${d})", .{ np + 1, np + 2 }) catch return error.OutOfMemory;
+                    params[np] = try value.toParam(@field(a.parent, assoc.primary_key), arena);
+                    np += 1;
+                    params[np] = try value.toParam(@field(child, assoc.association_key), arena);
+                    np += 1;
+                }
+                w.writeAll(" ON CONFLICT DO NOTHING") catch return error.OutOfMemory;
+                var res = try a.sess.runExec(b.slice(), params[0..np]);
+                res.deinit();
+                i = end;
+            }
         }
     };
 }
@@ -244,6 +254,173 @@ fn FindSql(comptime T: type, comptime unscoped: bool) type {
     };
 }
 
+fn updateSetCount(comptime table: schema.Table) usize {
+    var n: usize = 0;
+    for (table.columns, 0..) |col, i| {
+        if (!col.is_pk and (table.version_index == null or table.version_index.? != i)) n += 1;
+    }
+    return n;
+}
+
+fn UpdateSetCols(comptime T: type, comptime index: usize, comptime np: usize) type {
+    const table = schema.tableOf(T);
+    if (index == table.columns.len) return struct {
+        pub const value = [0]u8{};
+    };
+    const col = table.columns[index];
+    if (col.is_pk or (table.version_index != null and table.version_index.? == index))
+        return UpdateSetCols(T, index + 1, np);
+    const separator = if (np == 0) "" else ", ";
+    return struct {
+        pub const value = separator ++
+            qb_mod.QuotedIdent(col.name).value ++
+            " = $" ++
+            std.fmt.comptimePrint("{d}", .{np + 1}) ++
+            UpdateSetCols(T, index + 1, np + 1).value;
+    };
+}
+
+fn UpdateVersionSet(comptime T: type, comptime set_count: usize) type {
+    const table = schema.tableOf(T);
+    if (table.version_index == null) return struct {
+        pub const value = [0]u8{};
+    };
+    const col = table.columns[table.version_index.?];
+    const separator = if (set_count == 0) "" else ", ";
+    return struct {
+        pub const value = separator ++
+            qb_mod.QuotedIdent(col.name).value ++
+            " = " ++
+            qb_mod.QuotedIdent(col.name).value ++
+            " + 1";
+    };
+}
+
+fn UpdatePkPredicates(comptime T: type, comptime index: usize, comptime offset: usize) type {
+    const table = schema.tableOf(T);
+    if (index == table.pk_indexes.len) return struct {
+        pub const value = [0]u8{};
+    };
+    const column = table.columns[table.pk_indexes[index]];
+    const separator = if (index == 0) "" else " AND ";
+    return struct {
+        pub const value = separator ++
+            qb_mod.QuotedIdent(column.name).value ++
+            " = $" ++
+            std.fmt.comptimePrint("{d}", .{offset + index + 1}) ++
+            UpdatePkPredicates(T, index + 1, offset).value;
+    };
+}
+
+fn UpdateVersionWhere(comptime T: type, comptime param_index: usize) type {
+    const table = schema.tableOf(T);
+    if (table.version_index == null) return struct {
+        pub const value = [0]u8{};
+    };
+    const col = table.columns[table.version_index.?];
+    return struct {
+        pub const value = " AND " ++
+            qb_mod.QuotedIdent(col.name).value ++
+            " = $" ++
+            std.fmt.comptimePrint("{d}", .{param_index});
+    };
+}
+
+/// The full UPDATE statement is determined by the model and `unscoped` alone;
+/// building it at comptime leaves only parameter encoding at runtime.
+fn UpdateSql(comptime T: type, comptime unscoped: bool) type {
+    const table = schema.tableOf(T);
+    const set_count = updateSetCount(table);
+    return struct {
+        pub const value = "UPDATE " ++
+            qb_mod.QuotedIdent(table.name).value ++
+            " SET " ++
+            UpdateSetCols(T, 0, 0).value ++
+            UpdateVersionSet(T, set_count).value ++
+            " WHERE " ++
+            UpdatePkPredicates(T, 0, set_count).value ++
+            FindSoftDelete(T, unscoped).value ++
+            UpdateVersionWhere(T, set_count + table.pk_indexes.len + 1).value;
+    };
+}
+
+fn DeleteSql(comptime T: type, comptime hard: bool) type {
+    const table = schema.tableOf(T);
+    if (table.softDeletable() and !hard) {
+        const del_col = table.columns[table.deleted_at_index.?];
+        const stamp = qb_mod.softDeleteStampSql(value.columnFieldType(T, del_col));
+        return struct {
+            pub const value = "UPDATE " ++
+                qb_mod.QuotedIdent(table.name).value ++
+                " SET " ++
+                qb_mod.QuotedIdent(del_col.name).value ++
+                " = " ++
+                stamp ++
+                " WHERE " ++
+                FindPredicates(T, 0).value;
+        };
+    }
+    return struct {
+        pub const value = "DELETE FROM " ++
+            qb_mod.QuotedIdent(table.name).value ++
+            " WHERE " ++
+            FindPredicates(T, 0).value;
+    };
+}
+
+fn RestoreSql(comptime T: type) type {
+    const table = schema.tableOf(T);
+    const pkc = table.columns[table.pk_index.?];
+    const del_col = table.columns[table.deleted_at_index.?];
+    return struct {
+        pub const value = "UPDATE " ++
+            qb_mod.QuotedIdent(table.name).value ++
+            " SET " ++
+            qb_mod.QuotedIdent(del_col.name).value ++
+            " = NULL WHERE " ++
+            qb_mod.QuotedIdent(pkc.name).value ++
+            " = $1";
+    };
+}
+
+fn autoColumnCount(comptime table: schema.Table) usize {
+    var n: usize = 0;
+    for (table.columns) |col| {
+        if (col.is_auto) n += 1;
+    }
+    return n;
+}
+
+/// Compile-time INSERT for the common single-auto-increment-pk model.
+/// `include_auto` selects whether the auto pk is present (non-zero) or omitted
+/// (zero, to be generated); `returning` appends RETURNING for the omitted case.
+fn InsertSql(comptime T: type, comptime include_auto: bool, comptime returning: bool) type {
+    const table = schema.tableOf(T);
+    return struct {
+        pub const value = blk: {
+            var s: []const u8 = "INSERT INTO " ++ qb_mod.QuotedIdent(table.name).value ++ " (";
+            var first = true;
+            var n: usize = 0;
+            for (table.columns) |col| {
+                if (col.is_auto and !include_auto) continue;
+                if (!first) s = s ++ ", ";
+                s = s ++ qb_mod.QuotedIdent(col.name).value;
+                first = false;
+                n += 1;
+            }
+            s = s ++ ") VALUES (";
+            var k: usize = 0;
+            while (k < n) : (k += 1) {
+                if (k > 0) s = s ++ ", ";
+                s = s ++ "$" ++ std.fmt.comptimePrint("{d}", .{k + 1});
+            }
+            s = s ++ ")";
+            if (returning) s = s ++ " RETURNING " ++ qb_mod.QuotedIdent(table.pk().?.name).value;
+            break :blk s;
+        };
+    };
+}
+
 /// One unit of work against the database. Db hands out sessions; a session
 /// inside a transaction pins a single connection.
 pub const Session = struct {
@@ -289,8 +466,13 @@ pub const Session = struct {
         return if (remaining <= 0) error.TransactionTimeout else err;
     }
     fn instrumentationEnabled(s: *const Session) bool {
-        return s.logger.level != .silent or
-            s.observer.on_query != null or
+        return s.logger.level != .silent or s.needsObserverOrPlugins();
+    }
+
+    /// Observers and plugins need pre-query hooks and a full result event;
+    /// the text logger alone can be served after a streaming decode.
+    fn needsObserverOrPlugins(s: *const Session) bool {
+        return s.observer.on_query != null or
             s.observer.on_span != null or
             s.observer.metrics != null or
             s.observer.slow_queries != null or
@@ -335,6 +517,16 @@ pub const Session = struct {
 
     pub fn runExecTimeout(s: *Session, sql: []const u8, params: []const pq.Param, timeout_ms: u64) Error!pq.Result {
         if (!s.instrumentationEnabled()) return s.runExecFast(sql, params, timeout_ms);
+        if (!s.needsObserverOrPlugins()) {
+            // Logger only: no pre-query hooks or pool-wait accounting needed.
+            const started = std.Io.Clock.awake.now(s.io);
+            const res = s.runExecFast(sql, params, timeout_ms) catch |err| {
+                s.reportQuery(sql, params, started, 0, 0, 0, err, "");
+                return err;
+            };
+            s.reportQuery(sql, params, started, 0, res.affected, res.rows.len, null, "");
+            return res;
+        }
         if (!s.plugins.runBeforeQuery(sql) or !s.plugins.runBeforeCrud(sql)) return error.HookAborted;
         const started = std.Io.Clock.awake.now(s.io);
         const conn = s.acquire() catch |err| {
@@ -379,7 +571,7 @@ pub const Session = struct {
         out_gpa: std.mem.Allocator,
     ) Error![]T {
         const table = comptime schema.tableOf(T);
-        if (s.instrumentationEnabled() or timeout_ms != 0 or s.transaction_deadline != null) {
+        if (s.needsObserverOrPlugins() or timeout_ms != 0 or s.transaction_deadline != null) {
             var res = try s.runExecTimeout(sql, params, timeout_ms);
             defer res.deinit();
             const models = out_gpa.alloc(T, res.rows.len) catch return error.OutOfMemory;
@@ -398,8 +590,31 @@ pub const Session = struct {
             return models;
         }
 
+        // Streaming path: decode cells directly from the cursor without
+        // materializing the whole result. The text logger (if enabled) is
+        // served afterwards from the elapsed time and outcome.
+        const started = std.Io.Clock.awake.now(s.io);
+        const models = s.runModelsStream(T, table, sql, params, out_gpa) catch |err| {
+            if (s.logger.level != .silent) s.reportQuery(sql, params, started, 0, 0, 0, err, "");
+            return err;
+        };
+        if (s.logger.level != .silent) s.reportQuery(sql, params, started, 0, @intCast(models.len), models.len, null, "");
+        return models;
+    }
+
+    fn runModelsStream(
+        s: *Session,
+        comptime T: type,
+        comptime table: schema.Table,
+        sql: []const u8,
+        params: []const pq.Param,
+        out_gpa: std.mem.Allocator,
+    ) Error![]T {
         const conn = try s.acquire();
-        const rows = conn.queryParamsBinary(sql, params) catch |err| {
+        const rows = (if (conn.cfg.binary_results)
+            conn.queryParamsBinary(sql, params)
+        else
+            conn.queryParamsStream(sql, params)) catch |err| {
             s.captureError(conn);
             s.releaseConn(conn);
             return err;
@@ -532,9 +747,14 @@ pub const Session = struct {
             s.plugins.len != 0;
         if (!needs_observer) return;
         const pool = s.pool.stats();
+        // Metrics never reads the fingerprint; the slow log only needs it for
+        // queries above its threshold. Skip the hash otherwise.
+        const needs_fingerprint = s.observer.on_query != null or
+            s.observer.on_span != null or
+            (s.observer.slow_queries != null and elapsed_ns >= s.observer.slow_queries.?.threshold_ns);
         const event = observability.QueryEvent{
             .sql = sql,
-            .fingerprint = observability.fingerprint(sql),
+            .fingerprint = if (needs_fingerprint) observability.fingerprint(sql) else 0,
             .duration_ns = elapsed_ns,
             .pool_wait_ns = pool_wait_ns,
             .affected_rows = affected_rows,
@@ -567,44 +787,59 @@ pub const Session = struct {
         var arena_state = std.heap.ArenaAllocator.init(s.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        var params: std.ArrayList(pq.Param) = .empty;
-
-        var b = SqlBuf.init(arena);
-        const w = b.w();
+        const params = arena.alloc(pq.Param, table.columns.len) catch return error.OutOfMemory;
 
         const pk_col = comptime table.pk();
+        const single_auto = comptime autoColumnCount(table) == 1 and pk_col != null and pk_col.?.is_auto;
 
-        w.print("INSERT INTO {s} (", .{try qb_mod.quoteIdent(arena, table.name)}) catch return error.OutOfMemory;
-        var first = true;
-        inline for (table.columns) |col| {
-            if (!(col.is_auto and isZeroValue(value.getColumn(m, col)))) {
-                if (!first) w.writeAll(", ") catch return error.OutOfMemory;
-                w.writeAll(try qb_mod.quoteIdent(arena, col.name)) catch return error.OutOfMemory;
-                first = false;
-            }
-        }
-        w.writeAll(") VALUES (") catch return error.OutOfMemory;
-        var nparams: usize = 0;
-        inline for (table.columns) |col| {
-            if (!(col.is_auto and isZeroValue(value.getColumn(m, col)))) {
-                if (nparams > 0) w.writeAll(", ") catch return error.OutOfMemory;
-                w.print("${d}", .{nparams + 1}) catch return error.OutOfMemory;
-                params.append(arena, try value.toParam(value.getColumn(m, col), arena)) catch return error.OutOfMemory;
-                nparams += 1;
-            }
-        }
-        w.writeAll(")") catch return error.OutOfMemory;
-
+        var b = SqlBuf.init(arena);
+        var sql: []const u8 = undefined;
         var returning = false;
-        if (comptime (pk_col != null and pk_col.?.is_auto)) {
-            if (isZeroValue(value.getColumn(m, pk_col.?))) {
-                returning = true;
-                const pkc = pk_col.?;
-                w.print(" RETURNING {s}", .{try qb_mod.quoteIdent(arena, pkc.name)}) catch return error.OutOfMemory;
+        if (single_auto) {
+            // SQL is fully determined by whether the auto pk is zero; reuse a
+            // comptime template instead of rebuilding it per insert.
+            const pk_zero = isZeroValue(value.getColumn(m, pk_col.?));
+            returning = pk_zero;
+            sql = if (pk_zero) InsertSql(T, false, true).value else InsertSql(T, true, false).value;
+        } else {
+            const w = b.w();
+            w.print("INSERT INTO {s} (", .{qb_mod.quoted(table.name)}) catch return error.OutOfMemory;
+            var first = true;
+            inline for (table.columns) |col| {
+                if (!(col.is_auto and isZeroValue(value.getColumn(m, col)))) {
+                    if (!first) w.writeAll(", ") catch return error.OutOfMemory;
+                    w.writeAll(qb_mod.quoted(col.name)) catch return error.OutOfMemory;
+                    first = false;
+                }
+            }
+            w.writeAll(") VALUES (") catch return error.OutOfMemory;
+            var nparams: usize = 0;
+            inline for (table.columns) |col| {
+                if (!(col.is_auto and isZeroValue(value.getColumn(m, col)))) {
+                    if (nparams > 0) w.writeAll(", ") catch return error.OutOfMemory;
+                    w.print("${d}", .{nparams + 1}) catch return error.OutOfMemory;
+                    nparams += 1;
+                }
+            }
+            w.writeAll(")") catch return error.OutOfMemory;
+            if (comptime (pk_col != null and pk_col.?.is_auto)) {
+                if (isZeroValue(value.getColumn(m, pk_col.?))) {
+                    returning = true;
+                    w.print(" RETURNING {s}", .{qb_mod.quoted(pk_col.?.name)}) catch return error.OutOfMemory;
+                }
+            }
+            sql = b.slice();
+        }
+
+        var np: usize = 0;
+        inline for (table.columns) |col| {
+            if (!(col.is_auto and isZeroValue(value.getColumn(m, col)))) {
+                params[np] = try value.toParam(value.getColumn(m, col), arena);
+                np += 1;
             }
         }
 
-        var res = try s.runExec(b.slice(), params.items);
+        var res = try s.runExec(sql, params[0..np]);
         defer res.deinit();
 
         if (returning and res.rows.len > 0 and table.pk_index != null) {
@@ -655,12 +890,12 @@ pub const Session = struct {
         const pk_col = comptime table.pk();
         const return_pk = comptime pk_col != null and pk_col.?.is_auto and !containsName(fields, pk_col.?.name);
 
-        w.print("INSERT INTO {s} (", .{try qb_mod.quoteIdent(arena, table.name)}) catch return error.OutOfMemory;
+        w.print("INSERT INTO {s} (", .{qb_mod.quoted(table.name)}) catch return error.OutOfMemory;
         var first = true;
         inline for (table.columns) |col| {
             if (!(col.is_auto and isZeroValue(value.getColumn(m, col)))) {
                 if (!first) w.writeAll(", ") catch return error.OutOfMemory;
-                w.writeAll(try qb_mod.quoteIdent(arena, col.name)) catch return error.OutOfMemory;
+                w.writeAll(qb_mod.quoted(col.name)) catch return error.OutOfMemory;
                 first = false;
             }
         }
@@ -680,7 +915,7 @@ pub const Session = struct {
             w.writeAll(try qb_mod.quoteIdent(arena, name)) catch return error.OutOfMemory;
         }
         if (return_pk) {
-            w.print(", {s}", .{try qb_mod.quoteIdent(arena, pk_col.?.name)}) catch return error.OutOfMemory;
+            w.print(", {s}", .{qb_mod.quoted(pk_col.?.name)}) catch return error.OutOfMemory;
         }
 
         var res = try s.runExec(b.slice(), params.items);
@@ -771,12 +1006,12 @@ pub const Session = struct {
         const w = b.w();
         const pk_col = comptime table.pk();
 
-        w.print("INSERT INTO {s} (", .{try qb_mod.quoteIdent(arena, table.name)}) catch return error.OutOfMemory;
+        w.print("INSERT INTO {s} (", .{qb_mod.quoted(table.name)}) catch return error.OutOfMemory;
         var first = true;
         inline for (table.columns) |col| {
             if (!(col.is_auto and isZeroValue(value.getColumn(m, col)))) {
                 if (!first) w.writeAll(", ") catch return error.OutOfMemory;
-                w.writeAll(try qb_mod.quoteIdent(arena, col.name)) catch return error.OutOfMemory;
+                w.writeAll(qb_mod.quoted(col.name)) catch return error.OutOfMemory;
                 first = false;
             }
         }
@@ -795,7 +1030,7 @@ pub const Session = struct {
             w.writeAll(" (") catch return error.OutOfMemory;
             inline for (conflict.columns, 0..) |name, i| {
                 if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
-                w.writeAll(try qb_mod.quoteIdent(arena, name)) catch return error.OutOfMemory;
+                w.writeAll(qb_mod.quoted(name)) catch return error.OutOfMemory;
             }
             w.writeByte(')') catch return error.OutOfMemory;
         }
@@ -803,7 +1038,7 @@ pub const Session = struct {
             w.writeAll(" (") catch return error.OutOfMemory;
             inline for (table.pk_indexes, 0..) |pk_index, i| {
                 if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
-                w.writeAll(try qb_mod.quoteIdent(arena, table.columns[pk_index].name)) catch return error.OutOfMemory;
+                w.writeAll(qb_mod.quoted(table.columns[pk_index].name)) catch return error.OutOfMemory;
             }
             w.writeByte(')') catch return error.OutOfMemory;
         }
@@ -813,7 +1048,7 @@ pub const Session = struct {
             w.writeAll(" DO UPDATE SET ") catch return error.OutOfMemory;
             inline for (conflict.update, 0..) |name, i| {
                 if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
-                const quoted = try qb_mod.quoteIdent(arena, name);
+                const quoted = qb_mod.quoted(name);
                 w.print("{s} = EXCLUDED.{s}", .{ quoted, quoted }) catch return error.OutOfMemory;
             }
         }
@@ -822,7 +1057,7 @@ pub const Session = struct {
         if (comptime (pk_col != null and pk_col.?.is_auto)) {
             if (isZeroValue(value.getColumn(m, pk_col.?))) {
                 returning = true;
-                w.print(" RETURNING {s}", .{try qb_mod.quoteIdent(arena, pk_col.?.name)}) catch return error.OutOfMemory;
+                w.print(" RETURNING {s}", .{qb_mod.quoted(pk_col.?.name)}) catch return error.OutOfMemory;
             }
         }
         var res = try s.runExec(b.slice(), params.items);
@@ -922,17 +1157,24 @@ pub const Session = struct {
         var arena_state = std.heap.ArenaAllocator.init(s.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        var params: std.ArrayList(pq.Param) = .empty;
+        // The exact parameter count is known up front; a fixed slice avoids
+        // repeated ArrayList growth (each growth copies and strands the old
+        // block in the arena).
+        var col_count: usize = 0;
+        inline for (table.columns) |col| {
+            if (!(returning and col.is_pk)) col_count += 1;
+        }
+        const params = arena.alloc(pq.Param, models.len * col_count) catch return error.OutOfMemory;
 
         var b = SqlBuf.init(arena);
         const w = b.w();
 
-        w.print("INSERT INTO {s} (", .{try qb_mod.quoteIdent(arena, table.name)}) catch return error.OutOfMemory;
+        w.print("INSERT INTO {s} (", .{qb_mod.quoted(table.name)}) catch return error.OutOfMemory;
         var first_col = true;
         inline for (table.columns) |col| {
             if (!(returning and col.is_pk)) {
                 if (!first_col) w.writeAll(", ") catch return error.OutOfMemory;
-                w.writeAll(try qb_mod.quoteIdent(arena, col.name)) catch return error.OutOfMemory;
+                w.writeAll(qb_mod.quoted(col.name)) catch return error.OutOfMemory;
                 first_col = false;
             }
         }
@@ -947,7 +1189,7 @@ pub const Session = struct {
                 if (!(returning and col.is_pk)) {
                     if (!first) w.writeAll(", ") catch return error.OutOfMemory;
                     w.print("${d}", .{np + 1}) catch return error.OutOfMemory;
-                    params.append(arena, try value.toParam(value.getColumn(m, col), arena)) catch return error.OutOfMemory;
+                    params[np] = try value.toParam(value.getColumn(m, col), arena);
                     np += 1;
                     first = false;
                 }
@@ -956,11 +1198,11 @@ pub const Session = struct {
         }
 
         if (returning) {
-            const pkc = table.pk().?;
-            w.print(" RETURNING {s}", .{try qb_mod.quoteIdent(arena, pkc.name)}) catch return error.OutOfMemory;
+            const pkc = comptime table.pk().?;
+            w.print(" RETURNING {s}", .{qb_mod.quoted(pkc.name)}) catch return error.OutOfMemory;
         }
 
-        var res = try s.runExec(b.slice(), params.items);
+        var res = try s.runExec(b.slice(), params[0..np]);
         defer res.deinit();
         if (returning and (res.rows.len != models.len or res.columns.len == 0))
             return error.ProtocolViolation;
@@ -1046,38 +1288,17 @@ pub const Session = struct {
         var params: std.ArrayList(pq.Param) = .empty;
 
         var b = SqlBuf.init(arena);
-        const w = b.w();
+        b.w().writeAll(UpdateSql(T, unscoped).value) catch return error.OutOfMemory;
 
-        w.print("UPDATE {s} SET ", .{try qb_mod.quoteIdent(arena, table.name)}) catch return error.OutOfMemory;
-        var first = true;
-        comptime var np: usize = 0;
         inline for (table.columns, 0..) |col, col_index| {
             if (!col.is_pk and (table.version_index == null or table.version_index.? != col_index)) {
-                if (!first) w.writeAll(", ") catch return error.OutOfMemory;
-                w.print("{s} = ${d}", .{ try qb_mod.quoteIdent(arena, col.name), np + 1 }) catch return error.OutOfMemory;
                 params.append(arena, try value.toParam(value.getColumn(m, col), arena)) catch return error.OutOfMemory;
-                first = false;
-                np += 1;
             }
         }
-        if (comptime table.version()) |version_col| {
-            if (!first) w.writeAll(", ") catch return error.OutOfMemory;
-            const name = try qb_mod.quoteIdent(arena, version_col.name);
-            w.print("{s} = {s} + 1", .{ name, name }) catch return error.OutOfMemory;
-        }
-        w.writeAll(" WHERE ") catch return error.OutOfMemory;
-        inline for (table.pk_indexes, 0..) |pk_index, key_index| {
-            if (key_index > 0) w.writeAll(" AND ") catch return error.OutOfMemory;
-            const pk_col = table.columns[pk_index];
-            w.print("{s} = ${d}", .{ try qb_mod.quoteIdent(arena, pk_col.name), np + key_index + 1 }) catch return error.OutOfMemory;
-            params.append(arena, try value.toParam(value.getColumn(m, pk_col), arena)) catch return error.OutOfMemory;
-        }
-        if (comptime table.softDeletable() and !unscoped) {
-            const del_col = table.columns[table.deleted_at_index.?];
-            w.print(" AND {s} IS NULL", .{try qb_mod.quoteIdent(arena, del_col.name)}) catch return error.OutOfMemory;
+        inline for (table.pk_indexes) |pk_index| {
+            params.append(arena, try value.toParam(value.getColumn(m, table.columns[pk_index]), arena)) catch return error.OutOfMemory;
         }
         if (comptime table.version()) |version_col| {
-            w.print(" AND {s} = ${d}", .{ try qb_mod.quoteIdent(arena, version_col.name), np + table.pk_indexes.len + 1 }) catch return error.OutOfMemory;
             params.append(arena, try value.toParam(value.getColumn(m, version_col), arena)) catch return error.OutOfMemory;
         }
 
@@ -1129,23 +1350,12 @@ pub const Session = struct {
         const arena = arena_state.allocator();
 
         var b = SqlBuf.init(arena);
-        const w = b.w();
+        b.w().writeAll(DeleteSql(T, false).value) catch return error.OutOfMemory;
         const soft = comptime table.softDeletable();
         var params: std.ArrayList(pq.Param) = .empty;
-
-        if (soft) {
-            const del_col = table.columns[table.deleted_at_index.?];
-            w.print("UPDATE {s} SET {s} = {s}", .{
-                try qb_mod.quoteIdent(arena, table.name),
-                try qb_mod.quoteIdent(arena, del_col.name),
-                qb_mod.softDeleteStampSql(value.columnFieldType(T, del_col)),
-            }) catch return error.OutOfMemory;
-        } else {
-            w.print("DELETE FROM {s}", .{
-                try qb_mod.quoteIdent(arena, table.name),
-            }) catch return error.OutOfMemory;
+        inline for (table.pk_indexes) |pk_index| {
+            params.append(arena, try value.toParam(value.getColumn(m, table.columns[pk_index]), arena)) catch return error.OutOfMemory;
         }
-        try appendModelPrimaryKeyWhere(T, m, table, w, arena, &params);
 
         var res = try s.runExec(b.slice(), params.items);
         defer res.deinit();
@@ -1185,11 +1395,11 @@ pub const Session = struct {
         const arena = arena_state.allocator();
 
         var b = SqlBuf.init(arena);
-        b.w().print("DELETE FROM {s}", .{
-            try qb_mod.quoteIdent(arena, table.name),
-        }) catch return error.OutOfMemory;
+        b.w().writeAll(DeleteSql(T, true).value) catch return error.OutOfMemory;
         var params: std.ArrayList(pq.Param) = .empty;
-        try appendModelPrimaryKeyWhere(T, m, table, b.w(), arena, &params);
+        inline for (table.pk_indexes) |pk_index| {
+            params.append(arena, try value.toParam(value.getColumn(m, table.columns[pk_index]), arena)) catch return error.OutOfMemory;
+        }
 
         var res = try s.runExec(b.slice(), params.items);
         defer res.deinit();
@@ -1217,11 +1427,7 @@ pub const Session = struct {
         const arena = arena_state.allocator();
 
         var b = SqlBuf.init(arena);
-        b.w().print("UPDATE {s} SET {s} = NULL WHERE {s} = $1", .{
-            try qb_mod.quoteIdent(arena, table.name),
-            try qb_mod.quoteIdent(arena, del_col.name),
-            try qb_mod.quoteIdent(arena, pkc.name),
-        }) catch return error.OutOfMemory;
+        b.w().writeAll(RestoreSql(T).value) catch return error.OutOfMemory;
         const params = try arena.alloc(pq.Param, 1);
         params[0] = try value.toParam(value.getColumn(m, pkc), arena);
 
@@ -1257,14 +1463,14 @@ pub const Session = struct {
         if (soft) {
             const del_col = table.columns[table.deleted_at_index.?];
             w.print("UPDATE {s} SET {s} = {s} WHERE (", .{
-                try qb_mod.quoteIdent(arena, table.name),
-                try qb_mod.quoteIdent(arena, del_col.name),
+                qb_mod.quoted(table.name),
+                qb_mod.quoted(del_col.name),
                 qb_mod.softDeleteStampSql(value.columnFieldType(T, del_col)),
             }) catch return error.OutOfMemory;
             qb_mod.writeRenumbered(w, frag, 0) catch return error.OutOfMemory;
-            w.print(") AND {s} IS NULL", .{try qb_mod.quoteIdent(arena, del_col.name)}) catch return error.OutOfMemory;
+            w.print(") AND {s} IS NULL", .{qb_mod.quoted(del_col.name)}) catch return error.OutOfMemory;
         } else {
-            w.print("DELETE FROM {s} WHERE (", .{try qb_mod.quoteIdent(arena, table.name)}) catch return error.OutOfMemory;
+            w.print("DELETE FROM {s} WHERE (", .{qb_mod.quoted(table.name)}) catch return error.OutOfMemory;
             qb_mod.writeRenumbered(w, frag, 0) catch return error.OutOfMemory;
             w.writeByte(')') catch return error.OutOfMemory;
         }
@@ -1290,7 +1496,7 @@ pub const Session = struct {
         const SetsInfo = @typeInfo(@TypeOf(sets)).@"struct";
         if (SetsInfo.field_names.len == 0) return error.TypeMismatch;
 
-        w.print("UPDATE {s} SET ", .{try qb_mod.quoteIdent(arena, table.name)}) catch return error.OutOfMemory;
+        w.print("UPDATE {s} SET ", .{qb_mod.quoted(table.name)}) catch return error.OutOfMemory;
         inline for (SetsInfo.field_names, 0..) |set_name, i| {
             if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
             comptime var col_name: ?[]const u8 = null;
@@ -1298,7 +1504,7 @@ pub const Session = struct {
                 if (comptime std.mem.eql(u8, col.field_name, set_name)) col_name = col.name;
             }
             if (col_name == null) @compileError("zgorm: updateWhere set field '" ++ set_name ++ "' is not a column of " ++ @typeName(T));
-            w.print("{s} = ${d}", .{ try qb_mod.quoteIdent(arena, col_name.?), i + 1 }) catch return error.OutOfMemory;
+            w.print("{s} = ${d}", .{ qb_mod.quoted(col_name.?), i + 1 }) catch return error.OutOfMemory;
             params.append(arena, try value.toParam(@field(sets, set_name), arena)) catch return error.OutOfMemory;
         }
         w.writeAll(" WHERE (") catch return error.OutOfMemory;
@@ -1306,7 +1512,7 @@ pub const Session = struct {
         w.writeByte(')') catch return error.OutOfMemory;
         if (comptime table.softDeletable()) {
             const del_col = table.columns[table.deleted_at_index.?];
-            w.print(" AND {s} IS NULL", .{try qb_mod.quoteIdent(arena, del_col.name)}) catch return error.OutOfMemory;
+            w.print(" AND {s} IS NULL", .{qb_mod.quoted(del_col.name)}) catch return error.OutOfMemory;
         }
 
         const cond_params = try value.argsToParams(args, arena);
@@ -1447,7 +1653,7 @@ pub const Session = struct {
                 w.writeAll(", PRIMARY KEY (") catch return error.OutOfMemory;
                 inline for (table.pk_indexes, 0..) |pk_index, i| {
                     if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
-                    w.writeAll(try qb_mod.quoteIdent(arena, table.columns[pk_index].name)) catch return error.OutOfMemory;
+                    w.writeAll(qb_mod.quoted(table.columns[pk_index].name)) catch return error.OutOfMemory;
                 }
                 w.writeByte(')') catch return error.OutOfMemory;
             }
@@ -1473,7 +1679,10 @@ pub const Session = struct {
             inline for (table.columns) |col| {
                 var found = false;
                 for (existing.items) |name| {
-                    if (std.mem.eql(u8, name, col.name)) found = true;
+                    if (std.mem.eql(u8, name, col.name)) {
+                        found = true;
+                        break;
+                    }
                 }
                 if (!found) {
                     var b = SqlBuf.init(arena);
@@ -1513,7 +1722,7 @@ pub const Session = struct {
                 }) catch return error.OutOfMemory;
                 inline for (table.pk_indexes, 0..) |pk_index, i| {
                     if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
-                    w.writeAll(try qb_mod.quoteIdent(arena, table.columns[pk_index].name)) catch return error.OutOfMemory;
+                    w.writeAll(qb_mod.quoted(table.columns[pk_index].name)) catch return error.OutOfMemory;
                 }
                 w.writeByte(')') catch return error.OutOfMemory;
                 var res = try s.execRaw(b.slice());
@@ -1612,23 +1821,6 @@ pub const Session = struct {
         if (table.pk_indexes.len == 0) @compileError("zgorm: model has no primary key");
         inline for (table.pk_indexes) |pk_index| {
             if (isZeroValue(value.getColumn(m, table.columns[pk_index]))) return error.NullValue;
-        }
-    }
-
-    fn appendModelPrimaryKeyWhere(
-        comptime T: type,
-        m: *T,
-        comptime table: schema.Table,
-        w: *std.Io.Writer,
-        arena: std.mem.Allocator,
-        params: *std.ArrayList(pq.Param),
-    ) Error!void {
-        w.writeAll(" WHERE ") catch return error.OutOfMemory;
-        inline for (table.pk_indexes, 0..) |pk_index, i| {
-            if (i > 0) w.writeAll(" AND ") catch return error.OutOfMemory;
-            const col = table.columns[pk_index];
-            w.print("{s} = ${d}", .{ try qb_mod.quoteIdent(arena, col.name), params.items.len + 1 }) catch return error.OutOfMemory;
-            params.append(arena, try value.toParam(value.getColumn(m, col), arena)) catch return error.OutOfMemory;
         }
     }
 

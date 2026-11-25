@@ -131,15 +131,14 @@ pub fn toParam(value: anytype, arena: std.mem.Allocator) Error!Param {
         },
         .@"struct" => blk: {
             if (@hasDecl(T, "__zgorm_time")) {
-                // PostgreSQL receives its native binary instant; other
-                // drivers use the canonical timestamp text.
+                // PostgreSQL receives its native binary instant. Drivers that
+                // consume timestamps textually reconstruct the canonical text
+                // on demand (see timeParamToText), so the PG path skips it.
                 var buf: [8]u8 = undefined;
                 const pg_micros = value.micros - pg_epoch_us;
                 std.mem.writeInt(u64, &buf, @bitCast(pg_micros), .big);
-                var text_buf: [Time.pg_text_len]u8 = undefined;
                 break :blk mkBinary(.{
                     .oid = proto.Oid.timestamptz,
-                    .canonical = arena.dupe(u8, value.toPgText(&text_buf)) catch return error.OutOfMemory,
                     .data = arena.dupe(u8, &buf) catch return error.OutOfMemory,
                 });
             }
@@ -159,6 +158,20 @@ pub const proto = @import("../drivers/postgres/proto.zig");
 
 /// PostgreSQL internal epoch: 2000-01-01T00:00:00Z, in Unix microseconds.
 pub const pg_epoch_us: i64 = 946_684_800_000_000;
+
+/// Reconstructs canonical timestamp text from a binary timestamptz parameter
+/// (8-byte big-endian PG micros). Callers must ensure `format == 1` and
+/// `data.len == 8`. `buf` provides scratch space (`Time.pg_text_len` bytes).
+pub fn timeParamToText(param: Param, buf: *[Time.pg_text_len]u8) []const u8 {
+    const pg_micros: i64 = @bitCast(std.mem.readInt(u64, param.data[0..8], .big));
+    return Time.fromUnixMicros(pg_micros + pg_epoch_us).toPgText(buf);
+}
+
+/// Like `timeParamToText`, but naive (no `+00` suffix) for MySQL `DATETIME`.
+pub fn timeParamToNaiveText(param: Param, buf: *[Time.pg_text_len]u8) []const u8 {
+    const pg_micros: i64 = @bitCast(std.mem.readInt(u64, param.data[0..8], .big));
+    return Time.fromUnixMicros(pg_micros + pg_epoch_us).toSqlText(buf);
+}
 
 /// GORM-style embedded base model. A field of this type inside a model is
 /// flattened into `id`, `created_at`, `updated_at`, and `deleted_at` columns:
@@ -223,6 +236,41 @@ pub const Bytes = struct {
 
     pub const __zgorm_bytes = true;
 };
+
+/// Strips optional layers from an association key type.
+pub fn UnwrappedKey(comptime T: type) type {
+    var U = T;
+    while (@typeInfo(U) == .optional) U = @typeInfo(U).optional.child;
+    return U;
+}
+
+/// Normalizes a present association key for hashing, or null when absent.
+pub fn normalizedKey(comptime T: type, v: T) ?UnwrappedKey(T) {
+    if (@typeInfo(T) == .optional) {
+        return if (v) |inner| normalizedKey(@TypeOf(inner), inner) else null;
+    }
+    return v;
+}
+
+/// The hash-map type usable for association keys of `T`, or null when the key
+/// is not hashable (custom structs, non-text slices, ...). Callers fall back to
+/// linear matching in that case.
+pub fn keyMapType(comptime T: type) ?type {
+    const U = UnwrappedKey(T);
+    return switch (@typeInfo(U)) {
+        .int, .bool, .@"enum", .float => std.AutoHashMap(U, usize),
+        .pointer => |p| if (p.size == .slice and p.child == u8) std.StringHashMap(usize) else null,
+        else => null,
+    };
+}
+
+/// True when parent and child keys can be matched through a shared hash map
+/// (identical normalized, hashable key types).
+pub fn keysHashable(comptime A: type, comptime B: type) bool {
+    const MA = keyMapType(A);
+    const MB = keyMapType(B);
+    return MA != null and MB != null and MA.? == MB.?;
+}
 
 fn mkBinary(p: Param) Param {
     var r = p;
@@ -493,6 +541,22 @@ pub fn parseArrayText(comptime Elem: type, text: []const u8, gpa: std.mem.Alloca
         // Skip unquoted whitespace between elements.
         while (i < inner.len and (inner[i] == ' ' or inner[i] == '\t')) i += 1;
 
+        // Fast path: a plain element with no quotes/braces/escapes (numbers,
+        // NULL, simple text) is decoded straight from `inner`, skipping the
+        // per-byte copy into `raw`.
+        {
+            var j = i;
+            while (j < inner.len and inner[j] != ',' and inner[j] != '"' and
+                inner[j] != '{' and inner[j] != '}' and inner[j] != '\\') j += 1;
+            if (j == inner.len or inner[j] == ',') {
+                const simple = inner[i..j];
+                items.append(gpa, try decodeArrayElement(Elem, simple, false, simple.len > 0, gpa)) catch return error.OutOfMemory;
+                i = if (j < inner.len) j + 1 else j;
+                if (i >= inner.len) break;
+                continue;
+            }
+        }
+
         raw.clearRetainingCapacity();
         var quoted = false;
         var ever_quoted = false;
@@ -638,20 +702,37 @@ pub fn decodeCell(comptime T: type, cell: ?[]const u8, type_oid: u32, format: u1
 
 /// Reads a big-endian two's-complement signed integer of `byte_len` bytes.
 fn readSigned(data: []const u8) DecodeError!i64 {
-    var v: u64 = 0;
-    if (data.len == 0 or data.len > 8) return error.TypeMismatch;
-    for (data) |b| v = (v << 8) | b;
-    // Sign-extend from the actual width.
-    const shift: u6 = @intCast(64 - @as(u64, data.len) * 8);
-    const signed: i64 = @bitCast(v);
-    return (signed << @intCast(shift)) >> @intCast(shift);
+    // PostgreSQL binary integers are 2/4/8 bytes; a single byte-swap beats a
+    // variable-length shift loop. Other widths fall back to the general path.
+    switch (data.len) {
+        2 => return std.mem.readInt(i16, data[0..2], .big),
+        4 => return std.mem.readInt(i32, data[0..4], .big),
+        8 => return std.mem.readInt(i64, data[0..8], .big),
+        0 => return error.TypeMismatch,
+        else => {
+            if (data.len > 8) return error.TypeMismatch;
+            var v: u64 = 0;
+            for (data) |b| v = (v << 8) | b;
+            const shift: u6 = @intCast(64 - @as(u64, data.len) * 8);
+            const signed: i64 = @bitCast(v);
+            return (signed << shift) >> shift;
+        },
+    }
 }
 
 fn readUnsigned(data: []const u8) DecodeError!u64 {
-    var v: u64 = 0;
-    if (data.len == 0 or data.len > 8) return error.TypeMismatch;
-    for (data) |b| v = (v << 8) | b;
-    return v;
+    switch (data.len) {
+        2 => return std.mem.readInt(u16, data[0..2], .big),
+        4 => return std.mem.readInt(u32, data[0..4], .big),
+        8 => return std.mem.readInt(u64, data[0..8], .big),
+        0 => return error.TypeMismatch,
+        else => {
+            if (data.len > 8) return error.TypeMismatch;
+            var v: u64 = 0;
+            for (data) |b| v = (v << 8) | b;
+            return v;
+        },
+    }
 }
 
 /// Decodes a binary-format cell into `T`. Supports the same type set as the
@@ -908,12 +989,22 @@ fn decodeBytea(text: []const u8, gpa: std.mem.Allocator) ![]u8 {
     errdefer gpa.free(out);
     var i: usize = 0;
     while (i < out.len) : (i += 1) {
-        const hi = try std.fmt.charToDigit(hex_part[i * 2], 16);
-        const lo = try std.fmt.charToDigit(hex_part[i * 2 + 1], 16);
-        out[i] = @as(u8, hi) * 16 + lo;
+        const hi = hex_digit[hex_part[i * 2]];
+        const lo = hex_digit[hex_part[i * 2 + 1]];
+        if (hi == 0xFF or lo == 0xFF) return error.InvalidBytea;
+        out[i] = hi * 16 + lo;
     }
     return out;
 }
+
+/// Hex nibble lookup; 0xFF marks non-hex bytes.
+const hex_digit: [256]u8 = blk: {
+    var t: [256]u8 = @splat(0xFF);
+    for ('0'..'9' + 1) |ch| t[ch] = @intCast(ch - '0');
+    for ('a'..'f' + 1) |ch| t[ch] = @intCast(ch - 'a' + 10);
+    for ('A'..'F' + 1) |ch| t[ch] = @intCast(ch - 'A' + 10);
+    break :blk t;
+};
 
 /// Frees any heap memory owned by `value`'s string/optional fields.
 /// Only meaningful for values produced by `decodeCell` with the same `gpa`.
@@ -951,8 +1042,14 @@ pub fn deepCopy(comptime T: type, value: T, gpa: std.mem.Allocator) DecodeError!
                 // Empty slices (including static defaults) need no copy.
                 if (value.len == 0) break :blk value;
                 const copy = gpa.alloc(ptr.child, value.len) catch return error.OutOfMemory;
+                var initialized: usize = 0;
+                errdefer {
+                    for (copy[0..initialized]) |item| freeValue(ptr.child, item, gpa);
+                    gpa.free(copy);
+                }
                 for (value, 0..) |item, i| {
                     copy[i] = try deepCopy(ptr.child, item, gpa);
+                    initialized += 1;
                 }
                 break :blk copy;
             }
@@ -960,7 +1057,8 @@ pub fn deepCopy(comptime T: type, value: T, gpa: std.mem.Allocator) DecodeError!
         },
         .@"struct" => |info| blk: {
             if (@hasDecl(T, "__zgorm_time")) break :blk value;
-            var out: T = value;
+            var out: T = std.mem.zeroInit(T, .{});
+            errdefer freeValue(T, out, gpa);
             inline for (info.field_names, info.field_types) |fname, FT| {
                 @field(out, fname) = try deepCopy(FT, @field(value, fname), gpa);
             }
@@ -1114,7 +1212,13 @@ pub fn scanCellsMapped(
             setColumn(&out, col, try decodeCell(V, row[ci], columns[ci].type_oid, columns[ci].format, gpa));
         } else {
             const d = columnDefault(T, col);
-            if (d) |dv| setColumn(&out, col, dv);
+            if (d) |dv| {
+                // Defaults may be static strings; copy so the decoded value
+                // owns its heap fields uniformly (freeValue must not free
+                // static memory).
+                const V = columnFieldType(T, col);
+                setColumn(&out, col, try deepCopy(V, dv, gpa));
+            }
         }
     }
     return out;
@@ -1344,4 +1448,24 @@ test "Model JSON timestamps are RFC 3339 strings" {
         "{f}",
         .{std.json.fmt(payload, .{})},
     );
+}
+
+test "scanCellsMapped copies static defaults so freeValue is safe" {
+    const M = struct {
+        id: ?i64 = null,
+        name: []const u8 = "unknown",
+        pub const zgorm = .{ .table = "m" };
+    };
+    const table = comptime schema.tableOf(M);
+    const gpa = testing.allocator;
+    // Result selects only id; name falls back to its non-empty static default,
+    // which must be copied so freeValue does not free static memory.
+    const cols = [_]pq.Result.Column{.{ .name = "id", .type_oid = pq.proto.Oid.int8, .format = 0 }};
+    const row = [_]?[]const u8{"5"};
+    var map: [table.columns.len]?usize = .{ null, null };
+    map[0] = 0;
+    const out = try scanCellsMapped(M, table, &cols, &row, &map, gpa);
+    defer freeValue(M, out, gpa);
+    try testing.expectEqual(@as(?i64, 5), out.id);
+    try testing.expectEqualStrings("unknown", out.name);
 }

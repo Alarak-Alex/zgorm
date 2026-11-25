@@ -45,6 +45,7 @@ pub const Registry = struct {
     }
 
     pub fn runBeforeQuery(r: *const Registry, sql: []const u8) bool {
+        if (r.len == 0) return true;
         const context = QueryContext{ .sql = sql, .operation = operation(sql), .phase = .before };
         for (r.entries[0..r.len]) |plugin| {
             if (plugin.before_query) |callback| if (!callback(plugin.context, context)) return false;
@@ -53,11 +54,13 @@ pub const Registry = struct {
     }
 
     pub fn runAfterQuery(r: *const Registry, event: observability.QueryEvent) void {
+        if (r.len == 0) return;
         const context = QueryContext{ .sql = event.sql, .operation = operation(event.sql), .phase = .after, .event = event };
         for (r.entries[0..r.len]) |plugin| if (plugin.after_query) |callback| callback(plugin.context, context);
     }
 
     pub fn runBeforeCrud(r: *const Registry, sql: []const u8) bool {
+        if (r.len == 0) return true;
         const op = operation(sql);
         if (op == .select or op == .other) return true;
         const context = CrudContext{ .sql = sql, .operation = op, .phase = .before };
@@ -68,6 +71,7 @@ pub const Registry = struct {
     }
 
     pub fn runAfterCrud(r: *const Registry, sql: []const u8, affected_rows: i64) void {
+        if (r.len == 0) return;
         const op = operation(sql);
         if (op == .select or op == .other) return;
         const context = CrudContext{ .sql = sql, .operation = op, .phase = .after, .affected_rows = affected_rows };

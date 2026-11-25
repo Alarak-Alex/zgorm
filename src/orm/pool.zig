@@ -61,9 +61,7 @@ pub const Pool = struct {
     closed: bool = false,
     wait_count: u64 = 0,
     wait_duration_ns: u128 = 0,
-    retired_prepared_hits: u64 = 0,
-    retired_prepared_misses: u64 = 0,
-    retired_prepared_evictions: u64 = 0,
+    prepared_counters: pq.PreparedCounters = .{},
     maintenance: std.Io.Group = .init,
     maintenance_started: bool = false,
     maintenance_stop: std.Io.Event = .unset,
@@ -140,6 +138,7 @@ pub const Pool = struct {
                 p.mutex.unlock(p.io);
                 return err;
             };
+            conn.prepared_sink = &p.prepared_counters;
             p.mutex.lockUncancelable(p.io);
             p.connecting -= 1;
             p.wakeConnectorLocked();
@@ -224,17 +223,9 @@ pub const Pool = struct {
                 c.idleMilliseconds() >= p.options.idle_timeout_ms);
     }
 
-    fn absorbPrepared(p: *Pool, c: *const pq.Conn) void {
-        const prepared = c.preparedStats();
-        p.retired_prepared_hits +|= prepared.hits;
-        p.retired_prepared_misses +|= prepared.misses;
-        p.retired_prepared_evictions +|= prepared.evictions;
-    }
-
     fn retire(p: *Pool, c: *pq.Conn) void {
         p.mutex.lockUncancelable(p.io);
         p.total -= 1;
-        p.absorbPrepared(c);
         p.wakeConnectorLocked();
         p.mutex.unlock(p.io);
         c.close();
@@ -248,7 +239,6 @@ pub const Pool = struct {
                 if (p.isExpired(c) or !c.healthy()) {
                     expired = p.free.orderedRemove(i);
                     p.total -= 1;
-                    p.absorbPrepared(c);
                     p.wakeConnectorLocked();
                     break;
                 }
@@ -282,7 +272,6 @@ pub const Pool = struct {
                     const c = p.free.pop().?;
                     if (p.isExpired(c) or !c.healthy()) {
                         p.total -= 1;
-                        p.absorbPrepared(c);
                         p.wakeConnectorLocked();
                         p.mutex.unlock(p.io);
                         c.close();
@@ -316,6 +305,7 @@ pub const Pool = struct {
                         p.mutex.unlock(p.io);
                         return err;
                     };
+                    c.prepared_sink = &p.prepared_counters;
                     p.mutex.lockUncancelable(p.io);
                     p.connecting -= 1;
                     p.wakeConnectorLocked();
@@ -399,7 +389,6 @@ pub const Pool = struct {
             if (p.free.items.len < max_idle) {
                 p.free.append(p.gpa, c) catch {
                     p.total -= 1;
-                    p.absorbPrepared(c);
                     p.wakeConnectorLocked();
                     p.mutex.unlock(p.io);
                     c.close();
@@ -410,7 +399,6 @@ pub const Pool = struct {
             }
         }
         p.total -= 1;
-        p.absorbPrepared(c);
         p.wakeConnectorLocked();
         p.mutex.unlock(p.io);
         c.close();
@@ -425,15 +413,6 @@ pub const Pool = struct {
     pub fn stats(p: *Pool) PoolStats {
         p.mutex.lockUncancelable(p.io);
         defer p.mutex.unlock(p.io);
-        var hits = p.retired_prepared_hits;
-        var misses = p.retired_prepared_misses;
-        var evictions = p.retired_prepared_evictions;
-        for (p.free.items) |c| {
-            const prepared = c.preparedStats();
-            hits +|= prepared.hits;
-            misses +|= prepared.misses;
-            evictions +|= prepared.evictions;
-        }
         return .{
             .max_connections = p.max_size,
             .open = p.total,
@@ -441,9 +420,9 @@ pub const Pool = struct {
             .idle = p.free.items.len,
             .wait_count = p.wait_count,
             .wait_duration_ns = p.wait_duration_ns,
-            .prepared_hits = hits,
-            .prepared_misses = misses,
-            .prepared_evictions = evictions,
+            .prepared_hits = p.prepared_counters.hits.load(.monotonic),
+            .prepared_misses = p.prepared_counters.misses.load(.monotonic),
+            .prepared_evictions = p.prepared_counters.evictions.load(.monotonic),
         };
     }
 
@@ -506,7 +485,6 @@ pub const Pool = struct {
         }
         while (p.free.pop()) |c| {
             p.total -= 1;
-            p.absorbPrepared(c);
             c.close();
         }
         p.mutex.unlock(p.io);

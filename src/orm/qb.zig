@@ -32,24 +32,37 @@ pub const DryRun = struct {
 fn writeNamed(w: *std.Io.Writer, frag: []const u8, comptime field_names: []const [:0]const u8, start: usize) !void {
     var i: usize = 0;
     while (i < frag.len) {
-        if (frag[i] != ':' or (i + 1 < frag.len and frag[i + 1] == ':')) {
-            try w.writeByte(frag[i]);
-            i += 1;
+        const ch = frag[i];
+        if (ch == '\'' or ch == '"') {
+            i = try copyQuoted(w, frag, i);
             continue;
         }
-        var end = i + 1;
-        while (end < frag.len and (std.ascii.isAlphanumeric(frag[end]) or frag[end] == '_')) end += 1;
-        if (end == i + 1) return error.InvalidQuery;
-        const name = frag[i + 1 .. end];
-        var found = false;
-        inline for (field_names, 0..) |field_name, field_index| {
-            if (std.mem.eql(u8, name, field_name)) {
-                try w.print("${d}", .{start + field_index + 1});
-                found = true;
+        if (ch == ':') {
+            if (i + 1 < frag.len and frag[i + 1] == ':') {
+                try w.writeAll("::");
+                i += 2;
+                continue;
             }
+            var end = i + 1;
+            while (end < frag.len and (std.ascii.isAlphanumeric(frag[end]) or frag[end] == '_')) end += 1;
+            if (end == i + 1) return error.InvalidQuery;
+            const name = frag[i + 1 .. end];
+            var found = false;
+            for (field_names, 0..) |field_name, field_index| {
+                if (std.mem.eql(u8, name, field_name)) {
+                    try w.print("${d}", .{start + field_index + 1});
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.InvalidQuery;
+            i = end;
+            continue;
         }
-        if (!found) return error.InvalidQuery;
-        i = end;
+        var j = i + 1;
+        while (j < frag.len and frag[j] != ':' and frag[j] != '\'' and frag[j] != '"') j += 1;
+        try w.writeAll(frag[i..j]);
+        i = j;
     }
 }
 
@@ -395,7 +408,7 @@ pub fn Query(comptime T: type) type {
             if (comptime table.softDeletable()) {
                 if (!q.unscoped_flag) {
                     const del_col = table.columns[table.deleted_at_index.?];
-                    try w.print(" WHERE {s} IS NULL", .{try quoteIdent(q.a(), del_col.name)});
+                    try w.print(" WHERE {s} IS NULL", .{quoted(del_col.name)});
                     wrote_filter = true;
                 }
             }
@@ -411,7 +424,12 @@ pub fn Query(comptime T: type) type {
             }
         }
 
-        fn buildSelectSql(q: *Self, count_mode: bool) ![]const u8 {
+        const SelectMode = enum { normal, count, exists, count_inner };
+
+        fn buildSelectSql(q: *Self, mode: SelectMode) ![]const u8 {
+            const count_mode = mode == .count;
+            const exists_mode = mode == .exists;
+            const inner_mode = mode == .count_inner;
             var aw: std.Io.Writer.Allocating = .init(q.a());
             const w = &aw.writer;
             if (q.ctes.items.len > 0) {
@@ -427,7 +445,7 @@ pub fn Query(comptime T: type) type {
                 try w.writeByte(' ');
             }
 
-            const default_select = !count_mode and
+            const default_select = !count_mode and !exists_mode and
                 q.hint_text == null and
                 q.distinct_on_cols == null and
                 !q.is_distinct and
@@ -440,6 +458,8 @@ pub fn Query(comptime T: type) type {
                 if (!count_mode and q.hint_text != null) try w.print("/*+ {s} */ ", .{q.hint_text.?});
                 if (count_mode) {
                     try w.writeAll("count(*)");
+                } else if (exists_mode) {
+                    try w.writeAll("1");
                 } else {
                     if (q.distinct_on_cols) |cols| {
                         try w.writeAll("DISTINCT ON (");
@@ -490,17 +510,31 @@ pub fn Query(comptime T: type) type {
                     try w.writeAll(if (union_clause.all) " UNION ALL " else " UNION ");
                     try writeRenumbered(w, union_clause.sql, union_clause.args_start);
                 }
-                if (q.orders.items.len > 0) {
+                if (!exists_mode and !inner_mode and q.orders.items.len > 0) {
                     try w.writeAll(" ORDER BY ");
                     for (q.orders.items, 0..) |order, i| {
                         if (i > 0) try w.writeAll(", ");
                         try w.writeAll(order);
                     }
                 }
-                if (q.limit_n) |limit_value| try w.print(" LIMIT {d}", .{limit_value});
-                if (q.offset_n) |offset_value| try w.print(" OFFSET {d}", .{offset_value});
-                if (q.for_update_flag) try w.writeAll(" FOR UPDATE");
+                if (!inner_mode) {
+                    if (q.limit_n) |limit_value| try w.print(" LIMIT {d}", .{limit_value});
+                    if (q.offset_n) |offset_value| try w.print(" OFFSET {d}", .{offset_value});
+                    if (q.for_update_flag) try w.writeAll(" FOR UPDATE");
+                }
             }
+            return aw.writer.buffered();
+        }
+
+        /// count(*) over the configured query. Grouping/HAVING/UNION change the
+        /// row set, so wrap the full query in a subquery rather than dropping
+        /// those clauses (which would silently count the wrong rows).
+        fn buildCountSql(q: *Self) ![]const u8 {
+            if (q.groups.items.len == 0 and q.having_cond == null and q.unions.items.len == 0)
+                return q.buildSelectSql(.count);
+            const inner = try q.buildSelectSql(.count_inner);
+            var aw: std.Io.Writer.Allocating = .init(q.a());
+            aw.writer.print("SELECT count(*) FROM ({s}) AS _zgorm_count", .{inner}) catch return error.OutOfMemory;
             return aw.writer.buffered();
         }
 
@@ -511,15 +545,15 @@ pub fn Query(comptime T: type) type {
                 if (!q.unscoped_flag) {
                     const del_col = table.columns[table.deleted_at_index.?];
                     try w.print("UPDATE {s} SET {s} = {s}", .{
-                        try quoteIdent(q.a(), table.name),
-                        try quoteIdent(q.a(), del_col.name),
+                        quoted(table.name),
+                        quoted(del_col.name),
                         softDeleteStampSql(value.columnFieldType(T, del_col)),
                     });
                 } else {
-                    try w.print("DELETE FROM {s}", .{try quoteIdent(q.a(), table.name)});
+                    try w.print("DELETE FROM {s}", .{quoted(table.name)});
                 }
             } else {
-                try w.print("DELETE FROM {s}", .{try quoteIdent(q.a(), table.name)});
+                try w.print("DELETE FROM {s}", .{quoted(table.name)});
             }
             try q.buildWhere(w);
             return aw.writer.buffered();
@@ -553,7 +587,7 @@ pub fn Query(comptime T: type) type {
                 q.deinit();
                 return error.ProtocolViolation;
             }
-            const sql = q.buildSelectSql(false) catch {
+            const sql = q.buildSelectSql(.normal) catch {
                 q.deinit();
                 return error.OutOfMemory;
             };
@@ -591,7 +625,7 @@ pub fn Query(comptime T: type) type {
                 return err;
             };
             errdefer q.deinit();
-            const built = q.buildSelectSql(false) catch return error.OutOfMemory;
+            const built = q.buildSelectSql(.normal) catch return error.OutOfMemory;
             const sql = out_gpa.dupe(u8, built) catch return error.OutOfMemory;
             errdefer out_gpa.free(sql);
             const params = out_gpa.alloc(pq.Param, q.args.items.len) catch return error.OutOfMemory;
@@ -616,7 +650,7 @@ pub fn Query(comptime T: type) type {
                 return err;
             };
             errdefer q.deinit();
-            const built = q.buildSelectSql(false) catch return error.OutOfMemory;
+            const built = q.buildSelectSql(.normal) catch return error.OutOfMemory;
             var aw: std.Io.Writer.Allocating = .init(q.a());
             aw.writer.print("EXPLAIN ({s}, FORMAT TEXT) {s}", .{
                 if (analyze) "ANALYZE true" else "ANALYZE false",
@@ -634,7 +668,7 @@ pub fn Query(comptime T: type) type {
                 return e;
             };
             errdefer q.deinit();
-            const sql = q.buildSelectSql(false) catch return error.OutOfMemory;
+            const sql = q.buildSelectSql(.normal) catch return error.OutOfMemory;
             const rows = try q.sess.runModels(T, sql, q.args.items, q.timeout_ms, out_gpa);
             errdefer {
                 for (rows) |row| value.freeValue(T, row, out_gpa);
@@ -652,8 +686,10 @@ pub fn Query(comptime T: type) type {
                 return e;
             };
             errdefer q.deinit();
-            if (q.limit_n == null) q.limit_n = 1;
-            const sql = q.buildSelectSql(false) catch return error.OutOfMemory;
+            // Always limit to one row: a user-supplied larger limit would decode
+            // extra rows whose heap fields first() never frees.
+            q.limit_n = 1;
+            const sql = q.buildSelectSql(.normal) catch return error.OutOfMemory;
             const out_gpa = q.sess.gpa;
             const rows = try q.sess.runModels(T, sql, q.args.items, q.timeout_ms, out_gpa);
             defer out_gpa.free(rows);
@@ -675,7 +711,7 @@ pub fn Query(comptime T: type) type {
                 return e;
             };
             errdefer q.deinit();
-            const sql = q.buildSelectSql(true) catch return error.OutOfMemory;
+            const sql = q.buildCountSql() catch return error.OutOfMemory;
             var res = try q.run(sql);
             defer res.deinit();
             const out: i64 = if (res.rows.len == 0)
@@ -703,7 +739,7 @@ pub fn Query(comptime T: type) type {
             };
             errdefer q.deinit();
             q.limit_n = 1;
-            const sql = q.buildSelectSql(false) catch return error.OutOfMemory;
+            const sql = q.buildSelectSql(.exists) catch return error.OutOfMemory;
             var res = try q.run(sql);
             defer res.deinit();
             const out = res.rows.len > 0;
@@ -765,7 +801,7 @@ pub fn Query(comptime T: type) type {
             defer params.deinit(query_gpa);
             var aw: std.Io.Writer.Allocating = .init(q.a());
             const w = &aw.writer;
-            w.print("UPDATE {s} SET ", .{try quoteIdent(q.a(), table.name)}) catch return error.OutOfMemory;
+            w.print("UPDATE {s} SET ", .{quoted(table.name)}) catch return error.OutOfMemory;
             inline for (info.@"struct".field_names, 0..) |field_name, i| {
                 if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
                 comptime var column_name: ?[]const u8 = null;
@@ -773,7 +809,7 @@ pub fn Query(comptime T: type) type {
                     if (comptime std.mem.eql(u8, col.field_name, field_name)) column_name = col.name;
                 }
                 if (column_name == null) @compileError("zgorm: update field is not a model column: " ++ field_name);
-                w.print("{s} = ${d}", .{ try quoteIdent(q.a(), column_name.?), i + 1 }) catch return error.OutOfMemory;
+                w.print("{s} = ${d}", .{ quoted(column_name.?), i + 1 }) catch return error.OutOfMemory;
                 params.append(q.sess.gpa, try value.toParam(@field(sets, field_name), q.a())) catch return error.OutOfMemory;
             }
             q.buildWhereOffset(w, info.@"struct".field_names.len) catch return error.OutOfMemory;
@@ -938,9 +974,27 @@ fn loadSingleAssoc(
 
     var keys: std.ArrayList(ParentKey) = .empty;
     defer keys.deinit(gpa);
-    for (rows) |*parent| {
-        const key = value.getColumn(parent, parent_col);
-        if (keyPresent(ParentKey, key)) keys.append(gpa, key) catch return error.OutOfMemory;
+    keys.ensureTotalCapacity(gpa, rows.len) catch return error.OutOfMemory;
+    if (comptime assoc.kind == .belongs_to and value.keyMapType(ParentKey) != null) {
+        // Many parents can reference the same child; deduplicate the IN list
+        // so fan-in doesn't bloat the SQL and parameter count.
+        var seen: value.keyMapType(ParentKey).? = .init(gpa);
+        defer seen.deinit();
+        for (rows) |*parent| {
+            const key = value.getColumn(parent, parent_col);
+            if (value.normalizedKey(ParentKey, key)) |nk| {
+                const gop = seen.getOrPut(nk) catch return error.OutOfMemory;
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = 0;
+                    keys.appendAssumeCapacity(key);
+                }
+            }
+        }
+    } else {
+        for (rows) |*parent| {
+            const key = value.getColumn(parent, parent_col);
+            if (keyPresent(ParentKey, key)) keys.appendAssumeCapacity(key);
+        }
     }
     if (keys.items.len == 0) {
         if (assoc.kind != .has_many) {
@@ -978,23 +1032,46 @@ fn loadSingleAssoc(
 
             const owners = gpa.alloc(usize, children.items.len) catch return error.OutOfMemory;
             defer gpa.free(owners);
-            for (children.items, 0..) |*child, child_index| {
-                owners[child_index] = std.math.maxInt(usize);
+            const ChildKey = value.columnFieldType(Child, child_col);
+            if (comptime value.keysHashable(ParentKey, ChildKey)) {
+                var map: value.keyMapType(ParentKey).? = .init(gpa);
+                defer map.deinit();
                 for (rows, 0..) |*parent, parent_index| {
-                    if (keyEqual(
-                        value.columnFieldType(Child, child_col),
-                        value.getColumn(child, child_col),
-                        ParentKey,
-                        value.getColumn(parent, parent_col),
-                    )) {
-                        owners[child_index] = parent_index;
-                        counts[parent_index] += 1;
-                        break;
+                    if (value.normalizedKey(ParentKey, value.getColumn(parent, parent_col))) |k| {
+                        const gop = map.getOrPut(k) catch return error.OutOfMemory;
+                        if (!gop.found_existing) gop.value_ptr.* = parent_index;
+                    }
+                }
+                for (children.items, 0..) |*child, child_index| {
+                    owners[child_index] = std.math.maxInt(usize);
+                    if (value.normalizedKey(ChildKey, value.getColumn(child, child_col))) |k| {
+                        if (map.get(k)) |parent_index| {
+                            owners[child_index] = parent_index;
+                            counts[parent_index] += 1;
+                        }
+                    }
+                }
+            } else {
+                for (children.items, 0..) |*child, child_index| {
+                    owners[child_index] = std.math.maxInt(usize);
+                    for (rows, 0..) |*parent, parent_index| {
+                        if (keyEqual(
+                            ChildKey,
+                            value.getColumn(child, child_col),
+                            ParentKey,
+                            value.getColumn(parent, parent_col),
+                        )) {
+                            owners[child_index] = parent_index;
+                            counts[parent_index] += 1;
+                            break;
+                        }
                     }
                 }
             }
             for (rows, 0..) |*parent, parent_index| {
                 slices[parent_index] = gpa.alloc(Child, counts[parent_index]) catch return error.OutOfMemory;
+                // Zero so a mid-fill error path frees only initialized slots.
+                @memset(std.mem.sliceAsBytes(slices[parent_index]), 0);
                 fill[parent_index] = 0;
                 @field(parent, assoc.field_name) = slices[parent_index];
             }
@@ -1007,17 +1084,37 @@ fn loadSingleAssoc(
             }
         },
         .belongs_to, .has_one => {
-            for (rows) |*parent| {
-                @field(parent, assoc.field_name) = null;
-                for (children.items) |*child| {
-                    if (keyEqual(
-                        value.columnFieldType(Child, child_col),
-                        value.getColumn(child, child_col),
-                        ParentKey,
-                        value.getColumn(parent, parent_col),
-                    )) {
-                        @field(parent, assoc.field_name) = try value.deepCopy(Child, child.*, gpa);
-                        break;
+            const ChildKey = value.columnFieldType(Child, child_col);
+            if (comptime value.keysHashable(ParentKey, ChildKey)) {
+                var map: value.keyMapType(ChildKey).? = .init(gpa);
+                defer map.deinit();
+                for (children.items, 0..) |*child, child_index| {
+                    if (value.normalizedKey(ChildKey, value.getColumn(child, child_col))) |k| {
+                        const gop = map.getOrPut(k) catch return error.OutOfMemory;
+                        if (!gop.found_existing) gop.value_ptr.* = child_index;
+                    }
+                }
+                for (rows) |*parent| {
+                    @field(parent, assoc.field_name) = null;
+                    if (value.normalizedKey(ParentKey, value.getColumn(parent, parent_col))) |k| {
+                        if (map.get(k)) |child_index| {
+                            @field(parent, assoc.field_name) = try value.deepCopy(Child, children.items[child_index], gpa);
+                        }
+                    }
+                }
+            } else {
+                for (rows) |*parent| {
+                    @field(parent, assoc.field_name) = null;
+                    for (children.items) |*child| {
+                        if (keyEqual(
+                            ChildKey,
+                            value.getColumn(child, child_col),
+                            ParentKey,
+                            value.getColumn(parent, parent_col),
+                        )) {
+                            @field(parent, assoc.field_name) = try value.deepCopy(Child, child.*, gpa);
+                            break;
+                        }
                     }
                 }
             }
@@ -1040,9 +1137,10 @@ fn loadManyToMany(
 
     var keys: std.ArrayList(ParentKey) = .empty;
     defer keys.deinit(gpa);
+    keys.ensureTotalCapacity(gpa, rows.len) catch return error.OutOfMemory;
     for (rows) |*parent| {
         const key = @field(parent, assoc.primary_key);
-        if (keyPresent(ParentKey, key)) keys.append(gpa, key) catch return error.OutOfMemory;
+        if (keyPresent(ParentKey, key)) keys.appendAssumeCapacity(key);
     }
     if (keys.items.len == 0) {
         for (rows) |*parent| @field(parent, assoc.field_name) = &.{};
@@ -1079,18 +1177,40 @@ fn loadManyToMany(
 
     const owners = gpa.alloc(usize, joined.items.len) catch return error.OutOfMemory;
     defer gpa.free(owners);
-    for (joined.items, 0..) |item, child_index| {
-        owners[child_index] = std.math.maxInt(usize);
+    if (comptime value.keyMapType(ParentKey) != null) {
+        var map: value.keyMapType(ParentKey).? = .init(gpa);
+        defer map.deinit();
         for (rows, 0..) |*parent, parent_index| {
-            if (keyEqual(ParentKey, item.parent_key, ParentKey, @field(parent, assoc.primary_key))) {
-                owners[child_index] = parent_index;
-                counts[parent_index] += 1;
-                break;
+            if (value.normalizedKey(ParentKey, @field(parent, assoc.primary_key))) |k| {
+                const gop = map.getOrPut(k) catch return error.OutOfMemory;
+                if (!gop.found_existing) gop.value_ptr.* = parent_index;
+            }
+        }
+        for (joined.items, 0..) |item, child_index| {
+            owners[child_index] = std.math.maxInt(usize);
+            if (value.normalizedKey(ParentKey, item.parent_key)) |k| {
+                if (map.get(k)) |parent_index| {
+                    owners[child_index] = parent_index;
+                    counts[parent_index] += 1;
+                }
+            }
+        }
+    } else {
+        for (joined.items, 0..) |item, child_index| {
+            owners[child_index] = std.math.maxInt(usize);
+            for (rows, 0..) |*parent, parent_index| {
+                if (keyEqual(ParentKey, item.parent_key, ParentKey, @field(parent, assoc.primary_key))) {
+                    owners[child_index] = parent_index;
+                    counts[parent_index] += 1;
+                    break;
+                }
             }
         }
     }
     for (rows, 0..) |*parent, parent_index| {
         slices[parent_index] = gpa.alloc(Child, counts[parent_index]) catch return error.OutOfMemory;
+        // Zero so a mid-fill error path frees only initialized slots.
+        @memset(std.mem.sliceAsBytes(slices[parent_index]), 0);
         fill[parent_index] = 0;
         @field(parent, assoc.field_name) = slices[parent_index];
     }
@@ -1135,18 +1255,43 @@ fn loadCompositeAssoc(
         @memset(counts, 0);
         const owners = gpa.alloc(usize, children.items.len) catch return error.OutOfMemory;
         defer gpa.free(owners);
-        for (children.items, 0..) |*child, child_index| {
-            owners[child_index] = std.math.maxInt(usize);
+        if (comptime compositeHashable(Child, child_keys, M, parent_keys)) {
+            var map: std.StringHashMap(usize) = .init(gpa);
+            defer map.deinit();
+            var kbuf: std.ArrayList(u8) = .empty;
+            defer kbuf.deinit(gpa);
             for (rows, 0..) |*parent, parent_index| {
-                if (compositeKeyEqual(Child, child.*, child_keys, M, parent.*, parent_keys)) {
+                kbuf.clearRetainingCapacity();
+                if (!try appendCompositeKey(M, parent_keys, parent.*, &kbuf, gpa)) continue;
+                const key_copy = arena.dupe(u8, kbuf.items) catch return error.OutOfMemory;
+                const gop = map.getOrPut(key_copy) catch return error.OutOfMemory;
+                if (!gop.found_existing) gop.value_ptr.* = parent_index;
+            }
+            for (children.items, 0..) |*child, child_index| {
+                owners[child_index] = std.math.maxInt(usize);
+                kbuf.clearRetainingCapacity();
+                if (!try appendCompositeKey(Child, child_keys, child.*, &kbuf, gpa)) continue;
+                if (map.get(kbuf.items)) |parent_index| {
                     owners[child_index] = parent_index;
                     counts[parent_index] += 1;
-                    break;
+                }
+            }
+        } else {
+            for (children.items, 0..) |*child, child_index| {
+                owners[child_index] = std.math.maxInt(usize);
+                for (rows, 0..) |*parent, parent_index| {
+                    if (compositeKeyEqual(Child, child.*, child_keys, M, parent.*, parent_keys)) {
+                        owners[child_index] = parent_index;
+                        counts[parent_index] += 1;
+                        break;
+                    }
                 }
             }
         }
         for (rows, 0..) |*parent, parent_index| {
             slices[parent_index] = gpa.alloc(Child, counts[parent_index]) catch return error.OutOfMemory;
+            // Zero so a mid-fill error path frees only initialized slots.
+            @memset(std.mem.sliceAsBytes(slices[parent_index]), 0);
             fill[parent_index] = 0;
             @field(parent, assoc.field_name) = slices[parent_index];
         }
@@ -1160,12 +1305,34 @@ fn loadCompositeAssoc(
         return;
     }
 
-    for (rows) |*parent| {
-        @field(parent, assoc.field_name) = null;
-        for (children.items) |*child| {
-            if (compositeKeyEqual(Child, child.*, child_keys, M, parent.*, parent_keys)) {
-                @field(parent, assoc.field_name) = try value.deepCopy(Child, child.*, gpa);
-                break;
+    if (comptime compositeHashable(Child, child_keys, M, parent_keys)) {
+        var map: std.StringHashMap(usize) = .init(gpa);
+        defer map.deinit();
+        var kbuf: std.ArrayList(u8) = .empty;
+        defer kbuf.deinit(gpa);
+        for (children.items, 0..) |*child, child_index| {
+            kbuf.clearRetainingCapacity();
+            if (!try appendCompositeKey(Child, child_keys, child.*, &kbuf, gpa)) continue;
+            const key_copy = arena.dupe(u8, kbuf.items) catch return error.OutOfMemory;
+            const gop = map.getOrPut(key_copy) catch return error.OutOfMemory;
+            if (!gop.found_existing) gop.value_ptr.* = child_index;
+        }
+        for (rows) |*parent| {
+            @field(parent, assoc.field_name) = null;
+            kbuf.clearRetainingCapacity();
+            if (!try appendCompositeKey(M, parent_keys, parent.*, &kbuf, gpa)) continue;
+            if (map.get(kbuf.items)) |child_index| {
+                @field(parent, assoc.field_name) = try value.deepCopy(Child, children.items[child_index], gpa);
+            }
+        }
+    } else {
+        for (rows) |*parent| {
+            @field(parent, assoc.field_name) = null;
+            for (children.items) |*child| {
+                if (compositeKeyEqual(Child, child.*, child_keys, M, parent.*, parent_keys)) {
+                    @field(parent, assoc.field_name) = try value.deepCopy(Child, child.*, gpa);
+                    break;
+                }
             }
         }
     }
@@ -1192,9 +1359,20 @@ fn keyEqual(comptime A: type, a: A, comptime B: type, b: B) bool {
         .optional => if (a) |unwrapped| keyEqual(@TypeOf(unwrapped), unwrapped, B, b) else false,
         else => switch (@typeInfo(B)) {
             .optional => if (b) |unwrapped| keyEqual(A, a, @TypeOf(unwrapped), unwrapped) else false,
-            else => false,
+            else => intKeyEqual(A, a, B, b),
         },
     };
+}
+
+/// Cross-width/signedness integer keys compare numerically (SQL coerces them),
+/// so an i32 foreign key still matches an i64 primary key.
+fn intKeyEqual(comptime A: type, a: A, comptime B: type, b: B) bool {
+    if (@typeInfo(A) == .int and @typeInfo(B) == .int) {
+        const ia = std.math.cast(i128, a) orelse return false;
+        const ib = std.math.cast(i128, b) orelse return false;
+        return ia == ib;
+    }
+    return false;
 }
 
 fn compositeKeyEqual(
@@ -1213,6 +1391,76 @@ fn compositeKeyEqual(
             @TypeOf(@field(right, right_keys[i])),
             @field(right, right_keys[i]),
         )) return false;
+    }
+    return true;
+}
+
+/// True when every composite key position has an identical, hashable
+/// normalized type on both sides, so matching can use a hash map.
+fn compositeHashable(
+    comptime L: type,
+    comptime lkeys: []const []const u8,
+    comptime R: type,
+    comptime rkeys: []const []const u8,
+) bool {
+    if (lkeys.len != rkeys.len) return false;
+    for (lkeys, 0..) |lk, i| {
+        const LT = value.UnwrappedKey(@TypeOf(@field(@as(L, undefined), lk)));
+        const RT = value.UnwrappedKey(@TypeOf(@field(@as(R, undefined), rkeys[i])));
+        if (LT != RT) return false;
+        // Only types with an unambiguous, compile-safe byte serialization.
+        // Floats (±0.0), >64-bit ints and signed enums fall back to linear
+        // matching via compositeKeyEqual.
+        switch (@typeInfo(LT)) {
+            .int => |info| if (info.bits > 64) return false,
+            .bool => {},
+            .@"enum" => |e| if (e.is_signed) return false,
+            .pointer => |p| if (!(p.size == .slice and p.child == u8)) return false,
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// Serializes a composite key to canonical bytes. Returns false when any
+/// component is null (such a row can never match, mirroring `keyEqual`).
+fn appendCompositeKey(
+    comptime M: type,
+    comptime keys: []const []const u8,
+    m: M,
+    buf: *std.ArrayList(u8),
+    buf_alloc: std.mem.Allocator,
+) Error!bool {
+    inline for (keys) |k| {
+        const FT = @TypeOf(@field(m, k));
+        const nk = value.normalizedKey(FT, @field(m, k)) orelse return false;
+        const U = value.UnwrappedKey(FT);
+        switch (@typeInfo(U)) {
+            .int => |info| {
+                var b: [8]u8 = undefined;
+                const wide: u64 = if (info.signedness == .signed) @bitCast(@as(i64, nk)) else @as(u64, nk);
+                std.mem.writeInt(u64, &b, wide, .big);
+                buf.appendSlice(buf_alloc, &b) catch return error.OutOfMemory;
+            },
+            .bool => buf.append(buf_alloc, @intFromBool(nk)) catch return error.OutOfMemory,
+            .@"enum" => {
+                var b: [8]u8 = undefined;
+                std.mem.writeInt(u64, &b, @backingInt(nk), .big);
+                buf.appendSlice(buf_alloc, &b) catch return error.OutOfMemory;
+            },
+            .float => {
+                var b: [8]u8 = undefined;
+                std.mem.writeInt(u64, &b, @bitCast(@as(f64, nk)), .big);
+                buf.appendSlice(buf_alloc, &b) catch return error.OutOfMemory;
+            },
+            .pointer => {
+                var lb: [8]u8 = undefined;
+                std.mem.writeInt(u64, &lb, nk.len, .big);
+                buf.appendSlice(buf_alloc, &lb) catch return error.OutOfMemory;
+                buf.appendSlice(buf_alloc, nk) catch return error.OutOfMemory;
+            },
+            else => return error.UnsupportedType,
+        }
     }
     return true;
 }
@@ -1238,7 +1486,7 @@ fn queryChildrenForKeys(
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     w.print("SELECT * FROM {s} WHERE {s} IN (", .{
-        try quoteIdent(arena, child_table.name),
+        quoted(child_table.name),
         try quoteIdent(arena, key_column),
     }) catch return error.OutOfMemory;
     for (keys, 0..) |_, i| {
@@ -1274,10 +1522,11 @@ fn queryChildrenSql(
     var column_map: [child_table.columns.len]?usize = undefined;
     value.buildColumnMap(child_table, res.columns, &column_map);
     var items: std.ArrayList(Child) = .empty;
+    items.ensureTotalCapacity(arena, res.rows.len) catch return error.OutOfMemory;
     for (res.rows) |row| {
         var child = try value.scanCellsMapped(Child, child_table, res.columns, row, &column_map, arena);
         try db_mod.Session.callHook(Child, "afterFind", &child, s);
-        items.append(arena, child) catch return error.OutOfMemory;
+        items.appendAssumeCapacity(child);
     }
     return items;
 }
@@ -1337,6 +1586,7 @@ fn queryJoinedChildren(
     var column_map: [child_table.columns.len]?usize = undefined;
     value.buildColumnMap(child_table, res.columns, &column_map);
     var items: std.ArrayList(Joined) = .empty;
+    items.ensureTotalCapacity(arena, res.rows.len) catch return error.OutOfMemory;
     for (res.rows) |row| {
         var item = Joined{
             .child = try value.scanCellsMapped(Child, child_table, res.columns, row, &column_map, arena),
@@ -1349,7 +1599,7 @@ fn queryJoinedChildren(
             ),
         };
         try db_mod.Session.callHook(Child, "afterFind", &item.child, s);
-        items.append(arena, item) catch return error.OutOfMemory;
+        items.appendAssumeCapacity(item);
     }
     return items;
 }
@@ -1366,7 +1616,7 @@ fn queryCompositeChildren(
     if (rows.len == 0) return .empty;
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
-    w.print("SELECT * FROM {s} WHERE ", .{try quoteIdent(arena, schema.tableOf(Child).name)}) catch
+    w.print("SELECT * FROM {s} WHERE ", .{quoted(schema.tableOf(Child).name)}) catch
         return error.OutOfMemory;
     const params = arena.alloc(pq.Param, rows.len * child_keys.len) catch return error.OutOfMemory;
     var param_index: usize = 0;
@@ -1432,6 +1682,12 @@ pub fn QuotedIdent(comptime name: []const u8) type {
     };
 }
 
+/// Zero-allocation access to a compile-time quoted identifier, for hot paths
+/// where the name comes from comptime model metadata.
+pub fn quoted(comptime name: []const u8) []const u8 {
+    return &QuotedIdent(name).value;
+}
+
 fn DefaultSelectPrefix(comptime T: type) type {
     const table = schema.tableOf(T);
     return struct {
@@ -1441,10 +1697,13 @@ fn DefaultSelectPrefix(comptime T: type) type {
 
 fn writeIdent(w: *std.Io.Writer, identifier: []const u8) !void {
     try w.writeByte('"');
-    for (identifier) |ch| {
-        try w.writeByte(ch);
-        if (ch == '"') try w.writeByte('"');
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, identifier, i, '"')) |q| {
+        try w.writeAll(identifier[i..q]);
+        try w.writeAll("\"\"");
+        i = q + 1;
     }
+    try w.writeAll(identifier[i..]);
     try w.writeByte('"');
 }
 
@@ -1475,10 +1734,16 @@ pub fn quoteIdent(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
 }
 
 /// Copies `frag` into `w`, shifting every `$N` placeholder by `base`.
+/// Placeholders inside single/double-quoted literals are left untouched.
 pub fn writeRenumbered(w: *std.Io.Writer, frag: []const u8, base: usize) !void {
     var i: usize = 0;
     while (i < frag.len) {
-        if (frag[i] == '$' and i + 1 < frag.len and frag[i + 1] >= '0' and frag[i + 1] <= '9') {
+        const ch = frag[i];
+        if (ch == '\'' or ch == '"') {
+            i = try copyQuoted(w, frag, i);
+            continue;
+        }
+        if (ch == '$' and i + 1 < frag.len and frag[i + 1] >= '0' and frag[i + 1] <= '9') {
             var j = i + 1;
             while (j < frag.len and frag[j] >= '0' and frag[j] <= '9') j += 1;
             const n = std.fmt.parseInt(usize, frag[i + 1 .. j], 10) catch {
@@ -1492,11 +1757,41 @@ pub fn writeRenumbered(w: *std.Io.Writer, frag: []const u8, base: usize) !void {
                 try w.print("${d}", .{n + base});
             }
             i = j;
-        } else {
-            try w.writeByte(frag[i]);
-            i += 1;
+            continue;
         }
+        // Plain run (including a non-placeholder '$') up to the next quote or
+        // placeholder start.
+        var j = i + 1;
+        while (j < frag.len) {
+            const c2 = frag[j];
+            if (c2 == '\'' or c2 == '"') break;
+            if (c2 == '$' and j + 1 < frag.len and frag[j + 1] >= '0' and frag[j + 1] <= '9') break;
+            j += 1;
+        }
+        try w.writeAll(frag[i..j]);
+        i = j;
     }
+}
+
+/// Copies a single/double-quoted run (handling doubled-quote escapes)
+/// verbatim, returning the index just past the closing quote.
+fn copyQuoted(w: *std.Io.Writer, frag: []const u8, start: usize) !usize {
+    const q = frag[start];
+    try w.writeByte(q);
+    var i = start + 1;
+    while (i < frag.len) {
+        try w.writeByte(frag[i]);
+        if (frag[i] == q) {
+            if (i + 1 < frag.len and frag[i + 1] == q) {
+                try w.writeByte(frag[i + 1]);
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    return i;
 }
 
 const testing = std.testing;
@@ -1510,6 +1805,32 @@ test "placeholder renumbering" {
     var edge_writer: std.Io.Writer = .fixed(&edge_buf);
     try writeRenumbered(&edge_writer, "$0 $99999999999999999999999999999999999999", 3);
     try testing.expectEqualStrings("$0 $99999999999999999999999999999999999999", edge_writer.buffered());
+}
+
+test "placeholder renumbering skips quoted literals" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeRenumbered(&w, "note = '$100' AND id = $1", 3);
+    try testing.expectEqualStrings("note = '$100' AND id = $4", w.buffered());
+
+    var buf2: [256]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    try writeRenumbered(&w2, "x = \"a$1b\" AND y = $2", 1);
+    try testing.expectEqualStrings("x = \"a$1b\" AND y = $3", w2.buffered());
+
+    var buf3: [256]u8 = undefined;
+    var w3: std.Io.Writer = .fixed(&buf3);
+    try writeRenumbered(&w3, "s = 'it''s $1' AND id = $1", 5);
+    try testing.expectEqualStrings("s = 'it''s $1' AND id = $6", w3.buffered());
+}
+
+test "cross-width integer association keys match numerically" {
+    try testing.expect(keyEqual(i32, @as(i32, 7), i64, @as(i64, 7)));
+    try testing.expect(keyEqual(i64, @as(i64, 7), i32, @as(i32, 7)));
+    try testing.expect(!keyEqual(i32, @as(i32, 7), i64, @as(i64, 8)));
+    try testing.expect(keyEqual(?i32, @as(?i32, 7), i64, @as(i64, 7)));
+    try testing.expect(!keyEqual(?i32, @as(?i32, null), i64, @as(i64, 7)));
+    try testing.expect(keyEqual(u32, @as(u32, 9), i64, @as(i64, 9)));
 }
 
 test "quoteIdent escapes quotes" {

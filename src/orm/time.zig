@@ -87,6 +87,24 @@ pub const Time = struct {
 
     pub const pg_text_len = 32;
 
+    /// Formats as naive UTC text without a timezone suffix, e.g.
+    /// `2026-08-29 12:34:56.789012`, for MySQL `DATETIME` columns (which reject
+    /// PG-style `+00` offsets). `buf` must be >= `pg_text_len`.
+    pub fn toSqlText(t: Time, buf: []u8) []const u8 {
+        const dt = t.dateTimeUtc();
+        if (dt.micros != 0) {
+            return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
+                @as(u64, @intCast(@max(dt.year, 0))), dt.month,  dt.day,
+                dt.hour,                              dt.minute, dt.second,
+                dt.micros,
+            }) catch unreachable;
+        }
+        return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+            @as(u64, @intCast(@max(dt.year, 0))), dt.month,  dt.day,
+            dt.hour,                              dt.minute, dt.second,
+        }) catch unreachable;
+    }
+
     /// Serializes as an RFC 3339 UTC string instead of exposing `micros`.
     pub fn jsonStringify(t: Time, jw: anytype) !void {
         var buf: [pg_text_len]u8 = undefined;
@@ -266,6 +284,17 @@ test "format and parse round trip" {
     try testing.expectEqualStrings("2027-01-15 08:00:00.123456+00", text2);
     const back2 = try Time.parsePg(text2);
     try testing.expectEqual(t2.micros, back2.micros);
+}
+
+test "naive SQL text round trip" {
+    var buf: [Time.pg_text_len]u8 = undefined;
+    const t = Time.fromUnixMicros(1_800_000_000_123_456);
+    const text = t.toSqlText(&buf);
+    try testing.expectEqualStrings("2027-01-15 08:00:00.123456", text);
+    const back = try Time.parsePg(text);
+    try testing.expectEqual(t.micros, back.micros);
+    const whole = Time.fromUnix(1_800_000_000);
+    try testing.expectEqualStrings("2027-01-15 08:00:00", whole.toSqlText(&buf));
 }
 
 test "parse PG variants" {

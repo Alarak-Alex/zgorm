@@ -173,32 +173,40 @@ fn formatParamValue(w: *std.Io.Writer, p: pq.Param) !void {
 fn inlineSqlParams(w: *std.Io.Writer, sql: []const u8, params: []const pq.Param) !void {
     var i: usize = 0;
     var in_string = false;
-    while (i < sql.len) : (i += 1) {
-        const ch = sql[i];
+    while (i < sql.len) {
         if (in_string) {
-            try w.writeByte(ch);
-            if (ch == '\'') in_string = false;
+            const end = std.mem.indexOfScalarPos(u8, sql, i, '\'') orelse {
+                try w.writeAll(sql[i..]);
+                return;
+            };
+            try w.writeAll(sql[i .. end + 1]);
+            i = end + 1;
+            in_string = false;
             continue;
         }
-        switch (ch) {
-            '\'' => {
-                in_string = true;
-                try w.writeByte(ch);
-            },
-            '$' => {
-                var j = i + 1;
-                while (j < sql.len and sql[j] >= '0' and sql[j] <= '9') j += 1;
-                if (j > i + 1) {
-                    const n = std.fmt.parseInt(usize, sql[i + 1 .. j], 10) catch 0;
-                    if (n >= 1 and n <= params.len) {
-                        try formatParamValue(w, params[n - 1]);
-                        i = j - 1;
-                        continue;
-                    }
+        const special = std.mem.indexOfAnyPos(u8, sql, i, "'$") orelse {
+            try w.writeAll(sql[i..]);
+            return;
+        };
+        try w.writeAll(sql[i..special]);
+        i = special;
+        if (sql[i] == '\'') {
+            in_string = true;
+            try w.writeByte('\'');
+            i += 1;
+        } else {
+            var j = i + 1;
+            while (j < sql.len and sql[j] >= '0' and sql[j] <= '9') j += 1;
+            if (j > i + 1) {
+                const n = std.fmt.parseInt(usize, sql[i + 1 .. j], 10) catch 0;
+                if (n >= 1 and n <= params.len) {
+                    try formatParamValue(w, params[n - 1]);
+                    i = j;
+                    continue;
                 }
-                try w.writeByte(ch);
-            },
-            else => try w.writeByte(ch),
+            }
+            try w.writeByte('$');
+            i += 1;
         }
     }
 }
