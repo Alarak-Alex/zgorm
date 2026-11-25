@@ -8,6 +8,7 @@ pub const dsn = @import("dsn.zig");
 const conn_mod = @import("conn.zig");
 
 pub const Conn = conn_mod.Conn;
+pub const PreparedCounters = conn_mod.PreparedCounters;
 pub const Error = conn_mod.Error;
 pub const PgError = conn_mod.PgError;
 pub const Param = conn_mod.Param;

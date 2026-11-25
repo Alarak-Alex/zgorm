@@ -60,6 +60,14 @@ pub const PreparedStats = struct {
     }
 };
 
+/// Pool-wide prepared-statement counters. Connections owned by a pool share
+/// one of these so aggregate stats need no lock or per-connection scan.
+pub const PreparedCounters = struct {
+    hits: std.atomic.Value(u64) = .init(0),
+    misses: std.atomic.Value(u64) = .init(0),
+    evictions: std.atomic.Value(u64) = .init(0),
+};
+
 const PreparedStatement = struct {
     sql: []u8,
     oids: []u32,
@@ -70,7 +78,28 @@ const PreparedStatement = struct {
     fn statementName(s: *const PreparedStatement) []const u8 {
         return s.name[0..s.name_len];
     }
+
+    fn key(s: *const PreparedStatement) PreparedKey {
+        return .{ .sql = s.sql, .oids = s.oids };
+    }
 };
+
+/// Cache key: SQL text plus the parameter OID signature.
+const PreparedKey = struct { sql: []const u8, oids: []const u32 };
+
+const PreparedContext = struct {
+    pub fn hash(_: PreparedContext, k: PreparedKey) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(k.sql);
+        h.update(std.mem.sliceAsBytes(k.oids));
+        return h.final();
+    }
+    pub fn eql(_: PreparedContext, a: PreparedKey, b: PreparedKey) bool {
+        return std.mem.eql(u8, a.sql, b.sql) and std.mem.eql(u32, a.oids, b.oids);
+    }
+};
+
+const PreparedMap = std.hash_map.HashMapUnmanaged(PreparedKey, PreparedStatement, PreparedContext, 80);
 
 pub const Conn = struct {
     /// Optional hook for server notices (e.g. advisory messages).
@@ -105,12 +134,16 @@ pub const Conn = struct {
     backend_secret: u32 = 0,
     opened_at: Io.Timestamp,
     last_used_at: Io.Timestamp,
-    prepared: std.ArrayList(PreparedStatement) = .empty,
+    prepared: PreparedMap = .empty,
+    prepared_lookup_oids: std.ArrayList(u32) = .empty,
     prepared_clock: u64 = 0,
     prepared_next_id: u64 = 0,
     prepared_hits: u64 = 0,
     prepared_misses: u64 = 0,
     prepared_evictions: u64 = 0,
+    prepared_sink: ?*PreparedCounters = null,
+    leaked_stmt: [32]u8 = undefined,
+    leaked_stmt_len: u8 = 0,
 
     // ------------------------------------------------------------------ open
 
@@ -576,6 +609,9 @@ pub const Conn = struct {
     };
 
     fn ensureRead(c: *Conn, n: usize) Error!void {
+        // Already buffered: no network read happens, so no timeout guard is
+        // needed. This avoids spawning/cancelling a timer task per message.
+        if (c.rd.buffered().len >= n) return;
         var guard = TransportGuard{ .conn = c, .timeout_ms = c.cfg.read_timeout_ms };
         guard.start();
         c.rd.fill(n) catch {
@@ -604,6 +640,14 @@ pub const Conn = struct {
             return error.ProtocolViolation;
         }
         const payload_len = total - 4;
+        // Fast path: the whole payload is already buffered. Return a borrowed
+        // slice (valid until the next readMessage, same contract as `c.msg`)
+        // and skip the per-message copy.
+        if (c.rd.buffered().len >= payload_len) {
+            const data = c.rd.buffered()[0..payload_len];
+            c.rd.seek += payload_len;
+            return .{ .tag = tag, .data = data };
+        }
         c.msg.clearRetainingCapacity();
         try c.msg.resize(c.gpa, payload_len);
         var off: usize = 0;
@@ -655,6 +699,9 @@ pub const Conn = struct {
     }
 
     fn storeError(c: *Conn, payload: []const u8) Error!void {
+        // Clear before resetting the arena: on a dupe OOM, last_error must not
+        // keep pointing into the freed arena.
+        c.last_error = null;
         _ = c.err_arena_state.reset(.retain_capacity);
         const arena = c.err_arena_state.allocator();
         const src = parseError(payload);
@@ -703,14 +750,10 @@ pub const Conn = struct {
         };
     }
 
-    fn findPrepared(c: *Conn, sql: []const u8, params: []const Param) ?usize {
-        for (c.prepared.items, 0..) |entry, i| {
-            if (!std.mem.eql(u8, entry.sql, sql) or entry.oids.len != params.len) continue;
-            for (params, entry.oids) |param, oid| {
-                if (param.oid != oid) break;
-            } else return i;
-        }
-        return null;
+    fn findPrepared(c: *Conn, sql: []const u8, params: []const Param) ?*PreparedStatement {
+        c.prepared_lookup_oids.clearRetainingCapacity();
+        for (params) |p| c.prepared_lookup_oids.append(c.gpa, p.oid) catch return null;
+        return c.prepared.getPtr(.{ .sql = sql, .oids = c.prepared_lookup_oids.items });
     }
 
     fn freePrepared(c: *Conn, entry: PreparedStatement) void {
@@ -718,8 +761,20 @@ pub const Conn = struct {
         c.gpa.free(entry.oids);
     }
 
-    fn removePrepared(c: *Conn, index: usize) void {
-        c.freePrepared(c.prepared.orderedRemove(index));
+    /// A just-Parse'd statement whose first execution failed must still be
+    /// Close'd on the server. Remember its name so the next sendParams
+    /// piggybacks the Close (sending a standalone Sync here would leave an
+    /// extra ReadyForQuery that desyncs the following query).
+    fn discardPending(c: *Conn, entry: PreparedStatement) void {
+        if (entry.name_len <= c.leaked_stmt.len) {
+            @memcpy(c.leaked_stmt[0..entry.name_len], entry.name[0..entry.name_len]);
+            c.leaked_stmt_len = entry.name_len;
+        }
+        c.freePrepared(entry);
+    }
+
+    fn removePrepared(c: *Conn, entry: *const PreparedStatement) void {
+        if (c.prepared.fetchRemove(entry.key())) |kv| c.freePrepared(kv.value);
     }
 
     fn queueCloseStatement(c: *Conn, name: []const u8) Error!void {
@@ -743,31 +798,47 @@ pub const Conn = struct {
     ) Error!?PreparedStatement {
         c.last_error = null;
         c.wbuf.clearRetainingCapacity();
+        // Reserve the whole extended-query message batch up front so building
+        // a parameter-heavy Bind frame never reallocates mid-write.
+        var estimate: usize = 64 + sql.len + 4 * params.len + 2 * params.len;
+        for (params) |p| estimate += 4 + p.data.len;
+        if (close_first) |name| estimate += 8 + name.len;
+        try c.wbuf.ensureUnusedCapacity(c.gpa, estimate);
+        if (c.leaked_stmt_len > 0) {
+            c.queueCloseStatement(c.leaked_stmt[0..c.leaked_stmt_len]) catch {};
+            c.leaked_stmt_len = 0;
+        }
         if (close_first) |name| try c.queueCloseStatement(name);
 
         const cache_enabled = c.cfg.prepared_statement_cache_size > 0;
         var statement_name: []const u8 = "";
         var parse = true;
         var pending: ?PreparedStatement = null;
-        errdefer if (pending) |entry| c.freePrepared(entry);
+        errdefer if (pending) |entry| c.discardPending(entry);
 
         if (cache_enabled) {
             c.prepared_clock +%= 1;
-            if (c.findPrepared(sql, params)) |index| {
+            if (c.findPrepared(sql, params)) |entry| {
                 c.prepared_hits +%= 1;
-                c.prepared.items[index].last_used = c.prepared_clock;
-                statement_name = c.prepared.items[index].statementName();
+                if (c.prepared_sink) |sink| _ = sink.hits.fetchAdd(1, .monotonic);
+                entry.last_used = c.prepared_clock;
+                statement_name = entry.statementName();
                 parse = false;
             } else {
                 c.prepared_misses +%= 1;
-                if (c.prepared.items.len >= c.cfg.prepared_statement_cache_size) {
-                    var oldest: usize = 0;
-                    for (c.prepared.items[1..], 1..) |entry, i| {
-                        if (entry.last_used < c.prepared.items[oldest].last_used) oldest = i;
+                if (c.prepared_sink) |sink| _ = sink.misses.fetchAdd(1, .monotonic);
+                if (c.prepared.count() >= c.cfg.prepared_statement_cache_size) {
+                    var oldest: ?*PreparedStatement = null;
+                    var it = c.prepared.valueIterator();
+                    while (it.next()) |entry| {
+                        if (oldest == null or entry.last_used < oldest.?.last_used) oldest = entry;
                     }
-                    try c.queueCloseStatement(c.prepared.items[oldest].statementName());
-                    c.removePrepared(oldest);
-                    c.prepared_evictions +%= 1;
+                    if (oldest) |victim| {
+                        try c.queueCloseStatement(victim.statementName());
+                        c.removePrepared(victim);
+                        c.prepared_evictions +%= 1;
+                        if (c.prepared_sink) |sink| _ = sink.evictions.fetchAdd(1, .monotonic);
+                    }
                 }
                 try c.prepared.ensureUnusedCapacity(c.gpa, 1);
                 const sql_copy = try c.gpa.dupe(u8, sql);
@@ -833,10 +904,10 @@ pub const Conn = struct {
 
     fn execParamsOnce(c: *Conn, sql: []const u8, params: []const Param, close_first: ?[]const u8) Error!Result {
         var pending = try c.sendParams(sql, params, if (c.cfg.binary_results) 1 else 0, close_first);
-        errdefer if (pending) |entry| c.freePrepared(entry);
+        errdefer if (pending) |entry| c.discardPending(entry);
         const result = try c.collectResults();
         if (pending) |entry| {
-            c.prepared.appendAssumeCapacity(entry);
+            c.prepared.putAssumeCapacity(entry.key(), entry);
             pending = null;
         }
         return result;
@@ -890,11 +961,11 @@ pub const Conn = struct {
     fn execParamsCached(c: *Conn, sql: []const u8, params: []const Param) Error!Result {
         return c.execParamsOnce(sql, params, null) catch |err| {
             if (!c.planInvalidated()) return err;
-            const index = c.findPrepared(sql, params) orelse return err;
+            const entry = c.findPrepared(sql, params) orelse return err;
             var old_name: [32]u8 = undefined;
-            const name = c.prepared.items[index].statementName();
+            const name = entry.statementName();
             @memcpy(old_name[0..name.len], name);
-            c.removePrepared(index);
+            c.removePrepared(entry);
             return c.execParamsOnce(sql, params, old_name[0..name.len]);
         };
     }
@@ -939,10 +1010,10 @@ pub const Conn = struct {
         }
         var pending = try c.sendParams(sql, params, result_format, close_first);
         sent = true;
-        errdefer if (pending) |entry| c.freePrepared(entry);
+        errdefer if (pending) |entry| c.discardPending(entry);
         try rows.readDescription();
         if (pending) |entry| {
-            c.prepared.appendAssumeCapacity(entry);
+            c.prepared.putAssumeCapacity(entry.key(), entry);
             pending = null;
         }
         return rows;
@@ -951,11 +1022,11 @@ pub const Conn = struct {
     fn queryParamsRowsCached(c: *Conn, sql: []const u8, params: []const Param, result_format: u16) Error!*Rows {
         return c.queryParamsRowsOnce(sql, params, result_format, null) catch |err| {
             if (!c.planInvalidated()) return err;
-            const index = c.findPrepared(sql, params) orelse return err;
+            const entry = c.findPrepared(sql, params) orelse return err;
             var old_name: [32]u8 = undefined;
-            const name = c.prepared.items[index].statementName();
+            const name = entry.statementName();
             @memcpy(old_name[0..name.len], name);
-            c.removePrepared(index);
+            c.removePrepared(entry);
             return c.queryParamsRowsOnce(sql, params, result_format, old_name[0..name.len]);
         };
     }
@@ -995,9 +1066,15 @@ pub const Conn = struct {
         const a = arena.allocator();
 
         var result: Result = .{ .arena = arena };
+        // Grow the row/column lists on the GPA (realloc can extend in place)
+        // rather than the arena, where every growth strands the old buffer.
+        // They are copied into the arena once at the end.
         var columns: std.ArrayList(Result.Column) = .empty;
         var rows: std.ArrayList(Result.Row) = .empty;
-        var row_cells: std.ArrayList(?[]const u8) = .empty;
+        defer {
+            columns.deinit(c.gpa);
+            rows.deinit(c.gpa);
+        }
         var got_error = false;
         var has_row_description = false;
 
@@ -1020,11 +1097,10 @@ pub const Conn = struct {
                         if (m.data.len - name_end < 19) return error.ProtocolViolation;
                         const type_oid = std.mem.readInt(u32, m.data[name_end + 7 ..][0..4], .big);
                         const col_format = std.mem.readInt(u16, m.data[name_end + 17 ..][0..2], .big);
-                        try columns.append(a, .{ .name = name, .type_oid = type_oid, .format = col_format });
+                        try columns.append(c.gpa, .{ .name = name, .type_oid = type_oid, .format = col_format });
                         i = name_end + 19; // NUL + table oid(4) + attr(2) + oid(4) + len(2) + mod(4) + format(2)
                     }
                     if (i != m.data.len) return error.ProtocolViolation;
-                    result.columns = columns.items;
                 },
                 proto.Tag.data_row => {
                     if (m.data.len < 2) return error.ProtocolViolation;
@@ -1032,33 +1108,33 @@ pub const Conn = struct {
                     if (ncols < 0) return error.ProtocolViolation;
                     if (!has_row_description or @as(usize, @intCast(ncols)) != columns.items.len)
                         return error.ProtocolViolation;
-                    row_cells.clearRetainingCapacity();
+                    // One arena copy of the whole payload; cells are slices into
+                    // it (the length prefixes ride along, a few bytes per row).
+                    const payload = try a.dupe(u8, m.data);
+                    const row = try a.alloc(?[]const u8, @intCast(ncols));
                     var i: usize = 2;
                     var n: i16 = 0;
                     while (n < ncols) : (n += 1) {
-                        if (i + 4 > m.data.len) return error.ProtocolViolation;
-                        const len = std.mem.readInt(i32, m.data[i..][0..4], .big);
+                        if (i + 4 > payload.len) return error.ProtocolViolation;
+                        const len = std.mem.readInt(i32, payload[i..][0..4], .big);
                         i += 4;
                         if (len < -1) return error.ProtocolViolation;
                         if (len == -1) {
-                            try row_cells.append(a, null);
+                            row[@intCast(n)] = null;
                         } else {
                             const ulen: usize = @intCast(len);
-                            if (i + ulen > m.data.len) return error.ProtocolViolation;
-                            try row_cells.append(a, try a.dupe(u8, m.data[i..][0..ulen]));
+                            if (i + ulen > payload.len) return error.ProtocolViolation;
+                            row[@intCast(n)] = payload[i..][0..ulen];
                             i += ulen;
                         }
                     }
-                    if (i != m.data.len) return error.ProtocolViolation;
-                    const row = try a.alloc(?[]const u8, row_cells.items.len);
-                    @memcpy(row, row_cells.items);
-                    try rows.append(a, row);
+                    if (i != payload.len) return error.ProtocolViolation;
+                    try rows.append(c.gpa, row);
                 },
                 proto.Tag.command_complete => {
                     if (!has_row_description) {
                         columns.clearRetainingCapacity();
                         rows.clearRetainingCapacity();
-                        result.columns = columns.items;
                     }
                     if (m.data.len == 0 or m.data[m.data.len - 1] != 0)
                         return error.ProtocolViolation;
@@ -1089,7 +1165,8 @@ pub const Conn = struct {
             }
         }
 
-        result.rows = rows.items;
+        result.columns = try a.dupe(Result.Column, columns.items);
+        result.rows = try a.dupe(Result.Row, rows.items);
         if (got_error) return c.errorForLastError();
         return result;
     }
@@ -1120,8 +1197,10 @@ pub const Conn = struct {
             c.gpa.destroy(b);
             c.ca_bundle = null;
         }
-        for (c.prepared.items) |entry| c.freePrepared(entry);
+        var it = c.prepared.valueIterator();
+        while (it.next()) |entry| c.freePrepared(entry.*);
         c.prepared.deinit(c.gpa);
+        c.prepared_lookup_oids.deinit(c.gpa);
         c.msg.deinit(c.gpa);
         c.wbuf.deinit(c.gpa);
         c.err_arena_state.deinit();
