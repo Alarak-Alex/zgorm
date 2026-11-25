@@ -773,7 +773,29 @@ pub const Session = struct {
 
     /// Inserts one model. Auto-increment primary keys are filled back in.
     /// `created_at` / `updated_at` columns are auto-stamped when empty.
+    /// When the model saves associations and no transaction is active, the
+    /// insert and its association writes run in one internal transaction so a
+    /// mid-way failure cannot leave a committed parent with orphaned children.
     pub fn insert(s: *Session, m: anytype) Error!void {
+        const MP = @typeInfo(@TypeOf(m));
+        if (MP != .pointer or MP.pointer.size != .one or MP.pointer.attrs.@"const")
+            @compileError("zgorm: insert expects a mutable pointer to a model, e.g. db.insert(&user)");
+        const T = MP.pointer.child;
+        const table = comptime schema.tableOf(T);
+        const needs_tx = comptime blk: {
+            for (table.assocs) |a| {
+                if (a.kind != .belongs_to) break :blk true;
+            }
+            break :blk false;
+        };
+        if (!needs_tx or s.pinned != null) return s.insertImpl(m);
+        var tx = try s.begin();
+        errdefer tx.rollback();
+        try s.insertImpl(m);
+        try tx.commit();
+    }
+
+    fn insertImpl(s: *Session, m: anytype) Error!void {
         const MP = @typeInfo(@TypeOf(m));
         if (MP != .pointer or MP.pointer.size != .one or MP.pointer.attrs.@"const")
             @compileError("zgorm: insert expects a mutable pointer to a model, e.g. db.insert(&user)");
@@ -1232,12 +1254,32 @@ pub const Session = struct {
     /// key. `updated_at` is refreshed. Soft-deleted rows are not updated.
     /// Returns affected rows (0 or 1).
     pub fn update(s: *Session, m: anytype) Error!i64 {
-        return s.updateImpl(m, false);
+        return s.updateTx(m, false);
     }
 
     /// Like `update`, but also updates soft-deleted rows.
     pub fn updateUnscoped(s: *Session, m: anytype) Error!i64 {
-        return s.updateImpl(m, true);
+        return s.updateTx(m, true);
+    }
+
+    fn updateTx(s: *Session, m: anytype, comptime unscoped: bool) Error!i64 {
+        const MP = @typeInfo(@TypeOf(m));
+        if (MP != .pointer or MP.pointer.size != .one or MP.pointer.attrs.@"const")
+            @compileError("zgorm: update expects a mutable pointer to a model, e.g. db.update(&user)");
+        const T = MP.pointer.child;
+        const table = comptime schema.tableOf(T);
+        const needs_tx = comptime blk: {
+            for (table.assocs) |a| {
+                if (a.kind != .belongs_to) break :blk true;
+            }
+            break :blk false;
+        };
+        if (!needs_tx or s.pinned != null) return s.updateImpl(m, unscoped);
+        var tx = try s.begin();
+        errdefer tx.rollback();
+        const affected = try s.updateImpl(m, unscoped);
+        try tx.commit();
+        return affected;
     }
 
     /// Updates a mutable model slice with optimistic-lock all-or-nothing
@@ -1334,7 +1376,30 @@ pub const Session = struct {
     }
 
     /// Deletes the model by primary key. Returns affected rows.
+    /// Cascade deletes and the parent delete run in one internal transaction
+    /// when no transaction is active, so a failed parent delete cannot leave
+    /// children already permanently removed.
     pub fn delete(s: *Session, m: anytype) Error!i64 {
+        const MP = @typeInfo(@TypeOf(m));
+        if (MP != .pointer or MP.pointer.size != .one)
+            @compileError("zgorm: delete expects a pointer to a model");
+        const T = MP.pointer.child;
+        const table = comptime schema.tableOf(T);
+        const needs_tx = comptime blk: {
+            for (table.assocs) |a| {
+                if (a.cascade_delete) break :blk true;
+            }
+            break :blk false;
+        };
+        if (!needs_tx or s.pinned != null) return s.deleteImpl(m);
+        var tx = try s.begin();
+        errdefer tx.rollback();
+        const affected = try s.deleteImpl(m);
+        try tx.commit();
+        return affected;
+    }
+
+    fn deleteImpl(s: *Session, m: anytype) Error!i64 {
         const MP = @typeInfo(@TypeOf(m));
         if (MP != .pointer or MP.pointer.size != .one)
             @compileError("zgorm: delete expects a pointer to a model");
@@ -1380,6 +1445,26 @@ pub const Session = struct {
     /// Hard-deletes the model row even when the model has a `deleted_at`
     /// column. Returns affected rows.
     pub fn deleteHard(s: *Session, m: anytype) Error!i64 {
+        const MP = @typeInfo(@TypeOf(m));
+        if (MP != .pointer or MP.pointer.size != .one)
+            @compileError("zgorm: deleteHard expects a pointer to a model");
+        const T = MP.pointer.child;
+        const table = comptime schema.tableOf(T);
+        const needs_tx = comptime blk: {
+            for (table.assocs) |a| {
+                if (a.cascade_delete) break :blk true;
+            }
+            break :blk false;
+        };
+        if (!needs_tx or s.pinned != null) return s.deleteHardImpl(m);
+        var tx = try s.begin();
+        errdefer tx.rollback();
+        const affected = try s.deleteHardImpl(m);
+        try tx.commit();
+        return affected;
+    }
+
+    fn deleteHardImpl(s: *Session, m: anytype) Error!i64 {
         const MP = @typeInfo(@TypeOf(m));
         if (MP != .pointer or MP.pointer.size != .one)
             @compileError("zgorm: deleteHard expects a pointer to a model");
