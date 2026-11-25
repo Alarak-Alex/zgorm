@@ -597,6 +597,16 @@ pub fn Query(comptime T: type) type {
                 q.deinit();
                 return err;
             };
+            // Streaming keeps a cursor open on this connection. Inside a
+            // transaction the session is pinned to that same connection, so
+            // any other statement (or a hook query) would overlap the cursor,
+            // and committing would return the connection while the iterator
+            // still holds it. Refuse streaming on a pinned session; use all().
+            if (sess.pinned == conn) {
+                sess.releaseConn(conn);
+                q.deinit();
+                return error.ProtocolViolation;
+            }
             const rows = conn.queryParamsStream(sql, q.args.items) catch |err| {
                 sess.releaseConn(conn);
                 q.deinit();
