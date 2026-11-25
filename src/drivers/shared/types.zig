@@ -106,7 +106,7 @@ pub fn writeHex(w: *std.Io.Writer, bytes: []const u8) error{OutOfMemory}!void {
     var buf: [512]u8 = undefined;
     var i: usize = 0;
     while (i < bytes.len) {
-        const n = @min(bytes.len - i, buf.len / 2);
+        const n: usize = @min(bytes.len - i, buf.len / 2);
         for (bytes[i..][0..n], 0..) |b, j| {
             buf[j * 2] = digits[b >> 4];
             buf[j * 2 + 1] = digits[b & 0xF];
@@ -121,6 +121,16 @@ test "writeHex matches per-byte formatting" {
     defer aw.deinit();
     try writeHex(&aw.writer, "\x00\x0f\xde\xad\xff");
     try std.testing.expectEqualStrings("000fdeadff", aw.writer.buffered());
+}
+
+test "writeHex large input" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const big = try std.testing.allocator.alloc(u8, 17 * 1024 * 1024);
+    defer std.testing.allocator.free(big);
+    @memset(big, 0xab);
+    try writeHex(&aw.writer, big);
+    try std.testing.expectEqual(big.len * 2, aw.writer.buffered().len);
 }
 
 pub const Result = struct {
