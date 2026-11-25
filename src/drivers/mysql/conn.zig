@@ -43,7 +43,11 @@ fn poolPing(conn: *Conn) Error!void {
     try conn.ping();
 }
 
-pub const Pool = pool_mod.Pool(*Conn, PoolContext, poolCreate, poolDestroy, poolPing);
+fn poolHealthy(conn: *Conn) bool {
+    return !conn.broken;
+}
+
+pub const Pool = pool_mod.Pool(*Conn, PoolContext, poolCreate, poolDestroy, poolPing, poolHealthy);
 
 pub fn openPool(gpa: std.mem.Allocator, io: std.Io, config: Config, options: PoolOptions) Error!*Pool {
     return Pool.init(gpa, io, options, .{ .gpa = gpa, .io = io, .config = config });
@@ -164,46 +168,86 @@ pub const Conn = struct {
     }
 
     fn ensureRead(conn: *Conn, n: usize) Error!void {
-        conn.rd.fill(n) catch return error.ConnectionClosed;
+        conn.rd.fill(n) catch {
+            conn.broken = true;
+            return error.ConnectionClosed;
+        };
     }
 
     fn readPacket(conn: *Conn) Error![]const u8 {
         try conn.ensureRead(4);
         const head = conn.rd.buffered()[0..4];
-        const len = @as(usize, head[0]) | (@as(usize, head[1]) << 8) | (@as(usize, head[2]) << 16);
+        var len = @as(usize, head[0]) | (@as(usize, head[1]) << 8) | (@as(usize, head[2]) << 16);
         conn.rd.seek += 4;
-        // Fast path: the whole packet is already buffered. Return a borrowed
-        // slice (valid until the next readPacket, same contract as `packet`).
-        if (conn.rd.buffered().len >= len) {
+        // Single short packet: return a borrowed slice when fully buffered
+        // (valid until the next readPacket, same contract as `packet`).
+        if (len < 0xffffff and conn.rd.buffered().len >= len) {
             const data = conn.rd.buffered()[0..len];
             conn.rd.seek += len;
             return data;
         }
+        // A 0xffffff-length segment signals a multi-packet transfer: keep
+        // reading and concatenating segments until one is shorter than
+        // 0xffffff (the terminator, possibly zero-length).
         conn.packet.clearRetainingCapacity();
-        conn.packet.resize(conn.gpa, len) catch return error.OutOfMemory;
+        while (true) {
+            try conn.appendPacketBytes(len);
+            if (len < 0xffffff) break;
+            try conn.ensureRead(4);
+            const h = conn.rd.buffered()[0..4];
+            len = @as(usize, h[0]) | (@as(usize, h[1]) << 8) | (@as(usize, h[2]) << 16);
+            conn.rd.seek += 4;
+        }
+        return conn.packet.items;
+    }
+
+    fn appendPacketBytes(conn: *Conn, len: usize) Error!void {
+        const base = conn.packet.items.len;
+        conn.packet.resize(conn.gpa, base + len) catch return error.OutOfMemory;
         var offset: usize = 0;
         while (offset < len) {
             try conn.ensureRead(1);
             const available = conn.rd.buffered();
             const take = @min(available.len, len - offset);
-            @memcpy(conn.packet.items[offset .. offset + take], available[0..take]);
+            @memcpy(conn.packet.items[base + offset ..][0..take], available[0..take]);
             conn.rd.seek += take;
             offset += take;
         }
-        return conn.packet.items;
     }
 
     fn writePacket(conn: *Conn, sequence: u8, payload: []const u8) Error!void {
-        if (payload.len > 0xffffff) return error.ProtocolViolation;
-        const head = [4]u8{
-            @truncate(payload.len),
-            @truncate(payload.len >> 8),
-            @truncate(payload.len >> 16),
-            sequence,
-        };
-        conn.wr.writeAll(&head) catch return error.ConnectionClosed;
-        conn.wr.writeAll(payload) catch return error.ConnectionClosed;
-        conn.wr.flush() catch return error.ConnectionClosed;
+        // Split payloads larger than 0xffffff into 16MB-1 segments with
+        // incrementing sequence numbers; an exact multiple is terminated by a
+        // zero-length packet. Any I/O failure marks the connection broken so
+        // the pool retires it instead of reusing a half-written stream.
+        var seq = sequence;
+        var offset: usize = 0;
+        while (true) {
+            const chunk = @min(payload.len - offset, 0xffffff);
+            const head = [4]u8{
+                @truncate(chunk),
+                @truncate(chunk >> 8),
+                @truncate(chunk >> 16),
+                seq,
+            };
+            conn.wr.writeAll(&head) catch return conn.writeFailed();
+            conn.wr.writeAll(payload[offset..][0..chunk]) catch return conn.writeFailed();
+            conn.wr.flush() catch return conn.writeFailed();
+            offset += chunk;
+            seq +%= 1;
+            if (chunk < 0xffffff) break;
+            if (offset == payload.len) {
+                const zero_head = [4]u8{ 0, 0, 0, seq };
+                conn.wr.writeAll(&zero_head) catch return conn.writeFailed();
+                conn.wr.flush() catch return conn.writeFailed();
+                break;
+            }
+        }
+    }
+
+    fn writeFailed(conn: *Conn) Error {
+        conn.broken = true;
+        return error.ConnectionClosed;
     }
 
     fn authenticate(conn: *Conn, cfg: Config) Error!void {
