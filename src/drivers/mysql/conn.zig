@@ -4,6 +4,7 @@ const std = @import("std");
 const net = std.Io.net;
 const types = @import("../shared/types.zig");
 const pool_mod = @import("../shared/pool.zig");
+const value_mod = @import("../../orm/value.zig");
 const auth = @import("auth.zig");
 
 pub const Error = types.Error;
@@ -66,17 +67,19 @@ pub const Conn = struct {
     write_buf: []u8,
     packet: std.ArrayList(u8) = .empty,
     last_error: ?types.ServerError = null,
+    err_arena: std.heap.ArenaAllocator,
 
     query_timeout_ms: u64 = 0,
     broken: bool = false,
     prepared_cache_size: usize = 64,
     prepared_next_id: u64 = 1,
-    prepared: std.ArrayList(PreparedEntry) = .empty,
+    prepared: std.StringHashMapUnmanaged(PreparedEntry) = .empty,
 
     const PreparedEntry = struct {
         sql: []u8,
         name: [32]u8 = undefined,
         name_len: u8,
+        id: u64,
 
         fn statementName(entry: *const PreparedEntry) []const u8 {
             return entry.name[0..entry.name_len];
@@ -135,6 +138,7 @@ pub const Conn = struct {
             .write_buf = write_buf,
             .query_timeout_ms = cfg.query_timeout_ms,
             .prepared_cache_size = cfg.prepared_cache_size,
+            .err_arena = std.heap.ArenaAllocator.init(gpa),
         };
         conn.rd = &conn.sock_rd.interface;
         conn.wr = &conn.sock_wr.interface;
@@ -148,9 +152,11 @@ pub const Conn = struct {
         conn.writePacket(0, &.{0x01}) catch {};
         conn.deinitTls();
         conn.stream.close(conn.io);
-        for (conn.prepared.items) |entry| conn.gpa.free(entry.sql);
+        var it = conn.prepared.valueIterator();
+        while (it.next()) |entry| conn.gpa.free(entry.sql);
         conn.prepared.deinit(conn.gpa);
         conn.packet.deinit(conn.gpa);
+        conn.err_arena.deinit();
         conn.gpa.free(conn.read_buf);
         conn.gpa.free(conn.write_buf);
         const gpa = conn.gpa;
@@ -166,6 +172,13 @@ pub const Conn = struct {
         const head = conn.rd.buffered()[0..4];
         const len = @as(usize, head[0]) | (@as(usize, head[1]) << 8) | (@as(usize, head[2]) << 16);
         conn.rd.seek += 4;
+        // Fast path: the whole packet is already buffered. Return a borrowed
+        // slice (valid until the next readPacket, same contract as `packet`).
+        if (conn.rd.buffered().len >= len) {
+            const data = conn.rd.buffered()[0..len];
+            conn.rd.seek += len;
+            return data;
+        }
         conn.packet.clearRetainingCapacity();
         conn.packet.resize(conn.gpa, len) catch return error.OutOfMemory;
         var offset: usize = 0;
@@ -217,10 +230,16 @@ pub const Conn = struct {
         @memset(scramble[8..], 0);
         @memcpy(scramble[8 .. 8 + auth_tail_len], greeting[pos .. pos + auth_tail_len]);
         pos += @min(greeting.len - pos, @max(@as(usize, 13), advertised_tail_len));
-        var plugin = if (pos < greeting.len)
-            greeting[pos .. std.mem.indexOfScalarPos(u8, greeting, pos, 0) orelse greeting.len]
-        else
-            "mysql_native_password";
+        // Copy the plugin name out of the greeting buffer: with TLS, startTls
+        // reads further handshake records through the same reader and would
+        // otherwise invalidate this borrowed slice before it is used below.
+        var plugin_buf: [64]u8 = undefined;
+        var plugin: []const u8 = if (pos < greeting.len) blk: {
+            const name = greeting[pos .. std.mem.indexOfScalarPos(u8, greeting, pos, 0) orelse greeting.len];
+            const n = @min(name.len, plugin_buf.len);
+            @memcpy(plugin_buf[0..n], name[0..n]);
+            break :blk plugin_buf[0..n];
+        } else "mysql_native_password";
 
         const protocol_41: u32 = 0x00000200;
         const ssl: u32 = 0x00000800;
@@ -284,8 +303,14 @@ pub const Conn = struct {
                     const switched_plugin = server[1..name_end];
                     plugin = switched_plugin;
                     var switched_scramble: [20]u8 = @splat(0);
-                    const bytes = std.mem.trimEnd(u8, server[name_end + 1 ..], &.{0});
-                    @memcpy(switched_scramble[0..@min(bytes.len, switched_scramble.len)], bytes[0..@min(bytes.len, switched_scramble.len)]);
+                    // The switch payload is the new nonce (20 bytes) plus a NUL
+                    // terminator; copy the nonce verbatim (trimEnd would eat
+                    // legitimate trailing 0x00 bytes) and make it current so a
+                    // subsequent RSA full-auth step uses the right nonce.
+                    const bytes = server[name_end + 1 ..];
+                    const take = @min(bytes.len, switched_scramble.len);
+                    @memcpy(switched_scramble[0..take], bytes[0..take]);
+                    scramble = switched_scramble;
                     const switched = try auth.response(switched_plugin, cfg.password, &switched_scramble, &auth_buf);
                     sequence += 2;
                     try conn.writePacket(sequence, switched);
@@ -460,7 +485,9 @@ pub const Conn = struct {
         while (true) {
             const packet = try conn.readPacket();
             if (packet.len == 0) return error.ProtocolViolation;
-            if ((packet[0] == 0xfe and packet.len < 9) or packet[0] == 0x00) break;
+            // Result sets end with EOF (0xfe, short) or ERR (0xff). A leading
+            // 0x00 is a valid row byte (empty first column), not a terminator.
+            if (packet[0] == 0xfe and packet.len < 9) break;
             if (packet[0] == 0xff) return conn.serverError(packet);
             const row = arena.alloc(?[]const u8, column_count) catch return error.OutOfMemory;
             @memset(row, null);
@@ -518,20 +545,30 @@ pub const Conn = struct {
     }
 
     fn ensurePrepared(conn: *Conn, sql: []const u8) Error![]const u8 {
-        for (conn.prepared.items) |*entry| {
-            if (std.mem.eql(u8, entry.sql, sql)) return entry.statementName();
-        }
-        if (conn.prepared.items.len >= conn.prepared_cache_size) {
-            const old = conn.prepared.orderedRemove(0);
-            var deallocate_buf: [64]u8 = undefined;
-            const command = std.fmt.bufPrint(&deallocate_buf, "DEALLOCATE PREPARE {s}", .{old.statementName()}) catch
-                return error.OutOfMemory;
-            conn.execControl(command) catch {};
-            conn.gpa.free(old.sql);
+        if (conn.prepared.getPtr(sql)) |entry| return entry.statementName();
+        if (conn.prepared.count() >= conn.prepared_cache_size) {
+            // Evict the oldest entry (FIFO). Eviction is rare (only on a miss
+            // with a full cache), so a linear scan here is acceptable.
+            var oldest_id: u64 = std.math.maxInt(u64);
+            var oldest_key: []const u8 = "";
+            var it = conn.prepared.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.id < oldest_id) {
+                    oldest_id = e.value_ptr.id;
+                    oldest_key = e.key_ptr.*;
+                }
+            }
+            if (conn.prepared.fetchRemove(oldest_key)) |kv| {
+                var deallocate_buf: [64]u8 = undefined;
+                const command = std.fmt.bufPrint(&deallocate_buf, "DEALLOCATE PREPARE {s}", .{kv.value.statementName()}) catch "";
+                if (command.len > 0) conn.execControl(command) catch {};
+                conn.gpa.free(kv.value.sql);
+            }
         }
         var entry = PreparedEntry{
             .sql = conn.gpa.dupe(u8, sql) catch return error.OutOfMemory,
             .name_len = 0,
+            .id = conn.prepared_next_id,
         };
         errdefer conn.gpa.free(entry.sql);
         const name = std.fmt.bufPrint(&entry.name, "zgorm_{x}", .{conn.prepared_next_id}) catch
@@ -543,20 +580,20 @@ pub const Conn = struct {
         defer arena_state.deinit();
         var set_source: std.Io.Writer.Allocating = .init(arena_state.allocator());
         set_source.writer.writeAll("SET @zgorm_sql = CONVERT(X'") catch return error.OutOfMemory;
-        for (sql) |byte| set_source.writer.print("{x:0>2}", .{byte}) catch return error.OutOfMemory;
+        types.writeHex(&set_source.writer, sql) catch return error.OutOfMemory;
         set_source.writer.writeAll("' USING utf8mb4)") catch return error.OutOfMemory;
         try conn.execControl(set_source.writer.buffered());
         var prepare_buf: [96]u8 = undefined;
         const prepare_sql = std.fmt.bufPrint(&prepare_buf, "PREPARE {s} FROM @zgorm_sql", .{entry.statementName()}) catch
             return error.OutOfMemory;
         try conn.execControl(prepare_sql);
-        conn.prepared.append(conn.gpa, entry) catch {
+        conn.prepared.put(conn.gpa, entry.sql, entry) catch {
             var deallocate_buf: [64]u8 = undefined;
             const command = std.fmt.bufPrint(&deallocate_buf, "DEALLOCATE PREPARE {s}", .{entry.statementName()}) catch "";
             if (command.len > 0) conn.execControl(command) catch {};
             return error.OutOfMemory;
         };
-        return conn.prepared.items[conn.prepared.items.len - 1].statementName();
+        return conn.prepared.getPtr(entry.sql).?.statementName();
     }
 
     pub fn execParams(conn: *Conn, sql: []const u8, params: []const types.Param) Error!Result {
@@ -594,10 +631,16 @@ pub const Conn = struct {
             state = packet[4..9];
             message_at = 9;
         }
+        // Copy into connection-owned storage: the packet buffer is reused by
+        // the next readPacket, but lastError() may be read afterwards. Clear
+        // first so a dupe OOM cannot leave last_error pointing into freed memory.
+        conn.last_error = null;
+        _ = conn.err_arena.reset(.retain_capacity);
+        const a = conn.err_arena.allocator();
         conn.last_error = .{
             .severity = "ERROR",
-            .code = state,
-            .message = packet[message_at..],
+            .code = a.dupe(u8, state) catch return error.OutOfMemory,
+            .message = a.dupe(u8, packet[message_at..]) catch return error.OutOfMemory,
         };
         return switch (number) {
             1062 => error.UniqueViolation,
@@ -779,7 +822,17 @@ fn writeParam(w: *std.Io.Writer, param: types.Param) Error!void {
             }
         },
         .bytes => try writeHexLiteral(w, param.data, false),
-        .text, .json, .time => {
+        .time => {
+            if (param.canonical.len > 0) {
+                try writeHexLiteral(w, param.canonical, true);
+            } else if (param.format == 1 and param.data.len == 8) {
+                var buf: [value_mod.Time.pg_text_len]u8 = undefined;
+                try writeHexLiteral(w, value_mod.timeParamToNaiveText(param, &buf), true);
+            } else {
+                try writeHexLiteral(w, param.data, true);
+            }
+        },
+        .text, .json => {
             const text = if (param.canonical.len > 0) param.canonical else param.data;
             try writeHexLiteral(w, text, true);
         },
@@ -804,7 +857,7 @@ fn writeCheckedNumber(w: *std.Io.Writer, text: []const u8) Error!void {
 fn writeHexLiteral(w: *std.Io.Writer, bytes: []const u8, text: bool) Error!void {
     if (text) w.writeAll("CONVERT(") catch return error.OutOfMemory;
     w.writeAll("X'") catch return error.OutOfMemory;
-    for (bytes) |byte| w.print("{x:0>2}", .{byte}) catch return error.OutOfMemory;
+    try types.writeHex(w, bytes);
     w.writeByte('\'') catch return error.OutOfMemory;
     if (text) w.writeAll(" USING utf8mb4)") catch return error.OutOfMemory;
 }
@@ -837,7 +890,9 @@ fn takeInt(comptime T: type, data: []const u8, at: *usize) Error!T {
 
 fn readLenBytes(data: []const u8, at: *usize) Error![]const u8 {
     const len: usize = @intCast(try readLenInt(data, at));
-    if (at.* + len > data.len) return error.ProtocolViolation;
+    // Subtract instead of add: a hostile 8-byte length near 2^64 would overflow
+    // `at.* + len` (panic in safe builds, wraparound in ReleaseFast).
+    if (len > data.len - at.*) return error.ProtocolViolation;
     defer at.* += len;
     return data[at.* .. at.* + len];
 }
