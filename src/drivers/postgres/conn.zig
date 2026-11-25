@@ -946,9 +946,16 @@ pub const Conn = struct {
         var guard = QueryGuard{ .conn = c, .timeout_ms = effective };
         guard.start();
         const result = c.execSimpleOnce(sql) catch |err| {
-            return if (guard.finish()) error.QueryTimeout else err;
+            if (guard.finish()) {
+                c.broken = true;
+                return error.QueryTimeout;
+            }
+            return err;
         };
         if (guard.finish()) {
+            // Retire the connection: a CancelRequest already in flight must not
+            // cancel a later query that reuses this connection from the pool.
+            c.broken = true;
             var owned = result;
             owned.deinit();
             return error.QueryTimeout;
@@ -981,9 +988,16 @@ pub const Conn = struct {
         var guard = QueryGuard{ .conn = c, .timeout_ms = effective };
         guard.start();
         const result = c.execParamsCached(sql, params) catch |err| {
-            return if (guard.finish()) error.QueryTimeout else err;
+            if (guard.finish()) {
+                c.broken = true;
+                return error.QueryTimeout;
+            }
+            return err;
         };
         if (guard.finish()) {
+            // Retire the connection: a CancelRequest already in flight must not
+            // cancel a later query that reuses this connection from the pool.
+            c.broken = true;
             var owned = result;
             owned.deinit();
             return error.QueryTimeout;
