@@ -2,6 +2,10 @@
 
 记录一个在真实项目里踩到的问题：zgorm 的 `build.zig` 无条件链接系统 `sqlite3`，导致消费者无法交叉编译，也无法在静态链接场景使用。
 
+> **状态：0.11.1 已修复。** 模块本身不再调用 `linkSystemLibrary`，只有 example 与测试目标按需链接。消费者可以恢复使用 `b.dependency(...).module("zgorm")`，SQLite 实现由消费者自己提供（系统库或静态 amalgamation 均可）。实测 aarch64-linux-musl 交叉编译通过。
+>
+> 下文保留原始分析与绕过方案，供仍停留在 0.11.0 及更早版本时参考。
+
 > 状态：v0.11.1 已修复，采用下方「方案一」。`zgorm` 模块不再携带 `-lsqlite3`，使用 SQLite 驱动的构建目标自行 `linkSystemLibrary("sqlite3")`；本仓库的 example、单元测试与驱动测试已各自链接。以下保留原始分析与下游绕过记录。
 
 ## 现象
