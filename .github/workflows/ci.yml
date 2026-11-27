@@ -14,10 +14,10 @@ jobs:
         image: postgres:16
         env:
           POSTGRES_USER: zgorm
-          POSTGRES_PASSWORD: {{SECRET_mfzqzqzj}}
+          POSTGRES_PASSWORD: "{{SECRET_mfzqzqzj}}"
           POSTGRES_DB: zgorm_test
         ports:
-          - 5432:5432
+          - "5432:5432"
         options: >-
           --health-cmd "pg_isready -U zgorm -d zgorm_test"
           --health-interval 5s
