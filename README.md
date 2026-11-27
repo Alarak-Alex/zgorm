@@ -174,11 +174,49 @@ pub fn main(init: std.process.Init) !void {
 
 ## Memory ownership
 
-- **Strings** decoded by `db.find` / `Query.all` / `Query.first` are allocated with the allocator you pass in; release them with `zg.free(T, value, gpa)` / `zg.freeSlice(T, slice, gpa)`.
+- **Strings** decoded by `db.find` / `Query.all` are allocated with the allocator you pass in; release them with `zg.free(T, value, gpa)` / `zg.freeSlice(T, slice, gpa)`.
+- `Query.first` and `db.find` allocate with the session's gpa (the allocator given to `Db.connect*`); release with that same allocator.
 - `zg.free` must only be called on values whose string/slice fields were **not reassigned** after decoding (assigning a literal replaces the heap pointer with a static one). When in doubt, pass an arena.
 - To free a whole batch at once, pass an `ArenaAllocator` allocator (`zg.free*` are harmless on arenas).
 - `db.exec` / `execRaw` return a `pq.Result` that owns its memory: call `res.deinit()`.
 - Query builders are one-shot: terminal operations (`all`/`first`/`count`/`exists`/`delete`) release everything automatically.
+
+### Easy mode: one arena to free them all
+
+Skip per-value `zg.free` entirely: give each request/task its own arena, pass its allocator to every decoding call, and release everything with a single `deinit`:
+
+```zig
+var arena_state = std.heap.ArenaAllocator.init(gpa);
+defer arena_state.deinit();               // the only release point
+const arena = arena_state.allocator();
+
+const adults = try zg.query(User, db)
+    .where("age >= $1", .{18})
+    .preload("posts")
+    .all(arena);                          // strings and preloaded children live in the arena
+var res = try db.exec("SELECT count(*)::text FROM \"user\"", .{});
+defer res.deinit();                       // Result owns its memory; deinit is still required (harmless on arenas)
+
+for (adults) |u| {
+    std.debug.print("{s}: {d} posts\n", .{ u.name, u.posts.len });
+}
+// No zg.free / zg.freeSlice anywhere — arena_state.deinit() reclaims it all
+```
+
+Two notes:
+
+- APIs that **take an allocator explicitly** — `all(arena)`, `stream(arena)`, `dryRun(arena)` — become fully release-free when you pass an arena.
+- `find` / `first` always use the session gpa. To route them into the arena too, override the session: `var s = db.session(); s.gpa = arena;` then `s.find(...)` / `s.query(...).first()` decode into the arena (use `s.query(User)` in place of `zg.query(User, db)`).
+
+```zig
+var s = db.session();
+s.gpa = arena;                            // every decode on this session lands in the arena
+const one = try s.query(User).whereEq("name", "Alice").first();
+const by_id = try s.find(User, id);
+// all released together at arena_state.deinit()
+```
+
+A complete runnable version lives in `example/arena.zig` (`zig build run-arena -Ddsn=...`).
 
 ## DSN
 
@@ -197,6 +235,7 @@ Preload paths nest with dots and are validated at compile time:
 
 ```zig
 const authors = try zg.query(Author, db).preload("posts.comments").all(gpa);
+defer zg.freeSlice(Author, authors, gpa); // releases preloaded children too
 // authors[0].posts[i].comments[j] are filled
 ```
 
@@ -218,7 +257,9 @@ pub const Post = struct {
 // Author.posts -> Post.author_id
 // Post.author  -> Post.author_id
 const authors = try zg.query(Author, db).preload("posts").all(gpa);
+defer zg.freeSlice(Author, authors, gpa);
 const posts   = try zg.query(Post, db).preload("author").all(gpa);
+defer zg.freeSlice(Post, posts, gpa);
 
 // Explicit configuration when naming does not follow convention:
 pub const ExplicitAuthor = struct {
@@ -352,6 +393,7 @@ var q = zg.query(User, db);
 q = (zg.TenantFilterPlugin{}).apply(q, tenant_id);
 q = (zg.PaginationPlugin{ .page = 0, .per_page = 50 }).apply(q);
 const page = try q.all(gpa);
+defer zg.freeSlice(User, page, gpa);
 ```
 
 ### MySQL/MariaDB and SQLite

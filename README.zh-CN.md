@@ -167,11 +167,51 @@ pub fn main(init: std.process.Init) !void {
 
 ## 内存所有权约定
 
-- `db.find` / `Query.all` / `Query.first` 解码出的**字符串**由你传入的分配器分配，配套的 `zg.free(T, value, gpa)` 与 `zg.freeSlice(T, slice, gpa)` 负责释放。
+- `db.find` / `Query.all` 解码出的**字符串**由你传入的分配器分配，配套的 `zg.free(T, value, gpa)` 与 `zg.freeSlice(T, slice, gpa)` 负责释放。
+- `Query.first` 与 `db.find` 用会话的 gpa（即 `Db.connect*` 传入的分配器）分配字符串，释放时传同一个分配器。
 - `zg.free` 只能用于字符串/切片字段**未被重新赋值**的结果（给字段赋字面量会把堆指针换成静态指针）。拿不准时请改用 arena。
 - 想要一次性释放整批结果，传 `ArenaAllocator` 的分配器即可（`zg.free*` 对 arena 无害）。
 - `db.exec` / `execRaw` 返回的 `pq.Result` 拥有自身内存：调用 `res.deinit()`。
 - 查询构建器为一次性对象：终端操作（`all`/`first`/`count`/`exists`/`delete`）自动释放，无需手动清理。
+
+### 简单模式：arena 一把梭
+
+不想逐个 `zg.free`？给一次请求/任务配一个 arena，所有解码结果传它的分配器，结束时一次 `deinit` 全部释放：
+
+```zig
+var arena_state = std.heap.ArenaAllocator.init(gpa);
+defer arena_state.deinit();               // 唯一的释放点
+const arena = arena_state.allocator();
+
+// find / all / preload / exec 的结果全部落在 arena 上
+const found = (try db.find(User, id)).?;  // find 用会话 gpa，见下方说明
+const adults = try zg.query(User, db)
+    .where("age >= $1", .{18})
+    .preload("posts")
+    .all(arena);                          // 字符串、预加载的子行都在 arena
+var res = try db.exec("SELECT count(*)::text FROM \"user\"", .{});
+defer res.deinit();                       // Result 自带内存，仍需 deinit（对 arena 无害）
+
+for (adults) |u| {
+    std.debug.print("{s}: {d} posts\n", .{ u.name, u.posts.len });
+}
+// 无需任何 zg.free / zg.freeSlice —— arena_state.deinit() 统一回收
+```
+
+两点注意：
+
+- `all(arena)` / `stream(arena)` / `dryRun(arena)` 等**显式收分配器**的接口，传 arena 即可完全免手动释放。
+- `find` / `first` 固定用会话 gpa。想让它们也进 arena，用会话覆盖：`var s = db.session(); s.gpa = arena;` 之后 `s.find(...)` / `s.query(...).first()` 的结果就都在 arena 上（`zg.query(User, db)` 同理可换成 `s.query(User)`）。
+
+```zig
+var s = db.session();
+s.gpa = arena;                            // 本会话所有解码都进 arena
+const one = try s.query(User).whereEq("name", "Alice").first();
+const by_id = try s.find(User, id);
+// arena_state.deinit() 时统一释放
+```
+
+完整可运行的对照示例见 `example/arena.zig`（`zig build run-arena -Ddsn=...`）。
 
 ## DSN
 
@@ -190,6 +230,7 @@ host=/var/run/postgresql user=pg dbname=app          # unix socket 目录
 
 ```zig
 const authors = try zg.query(Author, db).preload("posts.comments").all(gpa);
+defer zg.freeSlice(Author, authors, gpa); // 预加载的子行一并释放
 // authors[0].posts[i].comments[j] 已填充
 ```
 
@@ -211,7 +252,9 @@ pub const Post = struct {
 // Author.posts -> Post.author_id
 // Post.author  -> Post.author_id
 const authors = try zg.query(Author, db).preload("posts").all(gpa);
+defer zg.freeSlice(Author, authors, gpa);
 const posts = try zg.query(Post, db).preload("author").all(gpa);
+defer zg.freeSlice(Post, posts, gpa);
 ```
 
 不符合命名约定时，可以使用类型化配置显式声明关联：
@@ -342,6 +385,7 @@ var q = zg.query(User, db);
 q = (zg.TenantFilterPlugin{}).apply(q, tenant_id);
 q = (zg.PaginationPlugin{ .page = 0, .per_page = 50 }).apply(q);
 const page = try q.all(gpa);
+defer zg.freeSlice(User, page, gpa);
 ```
 
 ### MySQL/MariaDB 与 SQLite

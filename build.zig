@@ -40,6 +40,23 @@ pub fn build(b: *std.Build) void {
     if (dsn_opt) |dsn| run_cmd.setEnvironmentVariable("ZORM_DSN", dsn);
     run_step.dependOn(&run_cmd.step);
 
+    // Arena "easy mode" example: one arena, one deinit, no per-value frees.
+    const arena_example = b.addExecutable(.{
+        .name = "zgorm-arena-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("example/arena.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zgorm", .module = mod },
+            },
+        }),
+    });
+    const run_arena_step = b.step("run-arena", "Run the arena easy-mode example (set ZORM_DSN to override)");
+    const run_arena_cmd = b.addRunArtifact(arena_example);
+    if (dsn_opt) |dsn| run_arena_cmd.setEnvironmentVariable("ZORM_DSN", dsn);
+    run_arena_step.dependOn(&run_arena_cmd.step);
+
     // Unit tests. A separate module keeps the sqlite link off the library
     // module that consumers import.
     const unit_test_module = b.createModule(.{
