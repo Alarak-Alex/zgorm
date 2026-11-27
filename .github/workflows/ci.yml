@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: zgorm
+          POSTGRES_PASSWORD: {{SECRET_mfzqzqzj}}
+          POSTGRES_DB: zgorm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zgorm -d zgorm_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ZORM_TEST_DSN: postgres://zgorm:{{PASSWORD_wzjijijl}}@127.0.0.1:5432/zgorm_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.17.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Install sqlite3
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Format check
+        run: zig fmt --check build.zig build.zig.zon src tests example
+
+      - name: Unit tests
+        run: zig build test --summary all
+
+      - name: Driver tests (SQLite)
+        run: zig build test-drivers --summary all
+
+      # Integration tests silently skip without a DSN. Build through zig build,
+      # then run the compiled binary directly so every test's execution is
+      # auditable, and fail if any test skipped or the count is short.
+      - name: Integration tests (live PostgreSQL, no silent skips)
+        run: |
+          zig build test-integration -Ddsn="$ZORM_TEST_DSN" --summary all
+          BIN=$(find .zig-cache/o -maxdepth 2 -name test -type f -exec stat -c '%Y %n' {} \; | sort -rn | head -1 | cut -d' ' -f2-)
+          test -x "$BIN"
+          "$BIN" 2>&1 | tee integration-direct.log
+          total=$(grep -c '^test "' tests/integration.zig)
+          passed=$(grep -c '\.\.\.OK' integration-direct.log)
+          echo "integration tests executed: $passed/$total"
+          test "$total" -gt 0
+          test "$passed" -eq "$total"
+          grep -q "All $total tests passed" integration-direct.log
+
+      - name: ReleaseSafe build
+        run: zig build -Doptimize=ReleaseSafe --summary all
+
+      - name: Arena example (live PostgreSQL)
+        run: zig build run-arena -Ddsn="$ZORM_TEST_DSN"
