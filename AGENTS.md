@@ -58,14 +58,24 @@ zig build benchmark-build
 
 - `src/root.zig`: 公共 API 和模块导出。
 - `src/orm/schema.zig`: 模型反射、字段类型、表元数据和关联推导。
-- `src/orm/db.zig`: Db/Session/Tx、CRUD、连接执行和关联操作。
-- `src/orm/qb.zig`: 查询 builder、SQL 组合、preload 和结果装配。
+- `src/orm/db.zig`: Db 入口、连接生命周期、一次性 CRUD 委托与事务重试；re-export Session/Tx/Association。
+- `src/orm/session.zig`: Session 执行核心：连接获取、raw/typed 执行、流式解码、观测上报；CRUD 委托到 `session/crud.zig`。
+- `src/orm/session/crud.zig`: 类型化 CRUD/Upsert/批量/乐观锁实现。
+- `src/orm/session/crud_sql.zig`: comptime CRUD SQL 模板与 SqlBuf。
+- `src/orm/session/crud_helpers.zig`: 时间戳、关联保存/级联、主键校验、版本递增。
+- `src/orm/session/migrate.zig`: 增量 autoMigrate。
+- `src/orm/tx.zig`: Tx/Savepoint 包装。
+- `src/orm/association.zig`: 关联管理器（append/replace/delete/clear/count）。
+- `src/orm/qb.zig`: 查询 builder、SQL 组合和结果装配。
+- `src/orm/sql.zig`: SQL 文本助手：标识符 quoting、占位符重编号、命名参数、软删除 stamp。
+- `src/orm/preload.zig`: 关联预加载（批量子查询、复合键、嵌套路径）。
 - `src/orm/value.zig`: Zig 值编码、驱动参数、结果解码和释放。
 - `src/orm/pool.zig`: 连接池、超时、健康检查、预热和维护。
 - `src/orm/migrator.zig`: 版本迁移、schema diff、约束和索引。
 - `src/drivers/shared/dialect.zig`: 方言能力、参数上限、标识符和 DDL 差异。
 - `build.zig`: 构建步骤、测试目标、示例、benchmark 和自定义选项。
 - `build.zig.zon`: 包名、版本、最低 Zig 版本和依赖。
+- `.github/workflows/ci.yml`: CI（PG service + 全部测试目标 + ReleaseSafe + 集成测试执行断言）。
 
 ## Runtime/Tooling Preferences
 
