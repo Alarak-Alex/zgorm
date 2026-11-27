@@ -47,6 +47,7 @@ pub extern fn sqlite3_extended_result_codes(db: *sqlite3, onoff: c_int) c_int;
 pub extern fn sqlite3_busy_timeout(db: *sqlite3, ms: c_int) c_int;
 pub extern fn sqlite3_changes64(db: *sqlite3) i64;
 pub extern fn sqlite3_last_insert_rowid(db: *sqlite3) i64;
+pub extern fn sqlite3_get_autocommit(db: *sqlite3) c_int;
 pub extern fn sqlite3_interrupt(db: *sqlite3) void;
 pub extern fn sqlite3_progress_handler(
     db: *sqlite3,

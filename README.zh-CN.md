@@ -167,51 +167,35 @@ pub fn main(init: std.process.Init) !void {
 
 ## 内存所有权约定
 
-- `db.find` / `Query.all` 解码出的**字符串**由你传入的分配器分配，配套的 `zg.free(T, value, gpa)` 与 `zg.freeSlice(T, slice, gpa)` 负责释放。
-- `Query.first` 与 `db.find` 用会话的 gpa（即 `Db.connect*` 传入的分配器）分配字符串，释放时传同一个分配器。
-- `zg.free` 只能用于字符串/切片字段**未被重新赋值**的结果（给字段赋字面量会把堆指针换成静态指针）。拿不准时请改用 arena。
-- 想要一次性释放整批结果，传 `ArenaAllocator` 的分配器即可（`zg.free*` 对 arena 无害）。
-- `db.exec` / `execRaw` 返回的 `pq.Result` 拥有自身内存：调用 `res.deinit()`。
-- 查询构建器为一次性对象：终端操作（`all`/`first`/`count`/`exists`/`delete`）自动释放，无需手动清理。
+- PostgreSQL 的 `find` 和 `first` 使用会话分配器。取得模型后，在同一作用域写 `defer zg.free(User, user, s.gpa)`。
+- `all(gpa)` 使用调用方传入的分配器。`defer zg.freeSlice(User, users, gpa)` 同时释放模型、字符串和预加载的子项。保留原有字符串和切片字段直到释放，或将结果放进 arena。
+- 终端操作会释放查询构建器。`exec`、`execRaw` 和 `dryRun` 返回的结果各有自己的 `deinit()`。
 
-### 简单模式：arena 一把梭
+### 简单模式：每次请求使用一个 arena
 
-不想逐个 `zg.free`？给一次请求/任务配一个 arena，所有解码结果传它的分配器，结束时一次 `deinit` 全部释放：
+把 arena 分配器交给本次请求的会话，`find`、`first` 以及传入同一分配器的 `all` 都由这一个 arena 回收。数据库连接池继续使用创建 `Db` 时的分配器。
 
 ```zig
 var arena_state = std.heap.ArenaAllocator.init(gpa);
-defer arena_state.deinit();               // 唯一的释放点
+defer arena_state.deinit();
 const arena = arena_state.allocator();
-
-// find / all / preload / exec 的结果全部落在 arena 上
-const found = (try db.find(User, id)).?;  // find 用会话 gpa，见下方说明
-const adults = try zg.query(User, db)
-    .where("age >= $1", .{18})
-    .preload("posts")
-    .all(arena);                          // 字符串、预加载的子行都在 arena
-var res = try db.exec("SELECT count(*)::text FROM \"user\"", .{});
-defer res.deinit();                       // Result 自带内存，仍需 deinit（对 arena 无害）
-
-for (adults) |u| {
-    std.debug.print("{s}: {d} posts\n", .{ u.name, u.posts.len });
-}
-// 无需任何 zg.free / zg.freeSlice —— arena_state.deinit() 统一回收
-```
-
-两点注意：
-
-- `all(arena)` / `stream(arena)` / `dryRun(arena)` 等**显式收分配器**的接口，传 arena 即可完全免手动释放。
-- `find` / `first` 固定用会话 gpa。想让它们也进 arena，用会话覆盖：`var s = db.session(); s.gpa = arena;` 之后 `s.find(...)` / `s.query(...).first()` 的结果就都在 arena 上（`zg.query(User, db)` 同理可换成 `s.query(User)`）。
-
-```zig
 var s = db.session();
-s.gpa = arena;                            // 本会话所有解码都进 arena
-const one = try s.query(User).whereEq("name", "Alice").first();
-const by_id = try s.find(User, id);
-// arena_state.deinit() 时统一释放
+s.gpa = arena;
+
+if (try s.find(User, id)) |user| {
+    std.debug.print("{s}\n", .{user.name});
+}
+const adults = try s.query(User).where("age >= $1", .{18}).all(arena);
+for (adults) |user| std.debug.print("{s}\n", .{user.name});
+
+var rows = try s.query(User).whereEq("active", true).stream(arena);
+defer rows.deinit();
+if (try rows.next()) |user| std.debug.print("{s}\n", .{user.name});
 ```
 
-完整可运行的对照示例见 `example/arena.zig`（`zig build run-arena -Ddsn=...`）。
+`stream(arena)` 把解码的行放进 arena。迭代器持有一个数据库连接，读到末尾或调用 `rows.deinit()` 时才归还。创建迭代器后立即写 `defer rows.deinit()`，提前返回或只取第一行也会归还连接。所有模型和字段须在 `arena_state.deinit()` 前使用。
+
+可运行的示例在 `example/arena.zig`，运行命令为 `zig build run-arena -Ddsn=...`。
 
 ## DSN
 
@@ -314,15 +298,21 @@ db.setLogger(.{ .level = .warn, .slow_threshold_ms = 500 });
 
 ### 软删除
 
-模型带 `deleted_at` 列（`?zg.Time` 或 `?i64`，`zg.Model` 已内含）即启用 GORM 风格软删除：
+模型带 `deleted_at` 列（`?zg.Time` 或 `?i64`，`zg.Model` 已内含）即启用软删除。默认过滤作用于每个 `orWhere` 分支和每层预加载。调用 `unscoped()` 会同时包含已删除的父行和子行。
 
 ```zig
 _ = try db.delete(&user);            // UPDATE ... SET deleted_at = now()
-_ = try db.find(User, id);           // 自动过滤已删除行
+if (try db.find(User, id)) |visible| {
+    defer zg.free(User, visible, gpa);
+    std.debug.print("{s}\n", .{visible.name});
+}
 _ = try zg.query(User, db).count();   // count/update/deleteWhere 同样过滤
 
 _ = try zg.query(User, db).unscoped().count();  // 包含已删除行
-_ = try db.findUnscoped(User, id);   // 按主键取回已删除行
+if (try db.findUnscoped(User, id)) |archived| {
+    defer zg.free(User, archived, gpa);
+    std.debug.print("{s}\n", .{archived.name});
+}
 _ = try db.updateUnscoped(&user);    // 更新已删除行
 _ = try db.restore(&user);           // 按主键清除 deleted_at
 _ = try db.deleteHard(&user);        // 真 DELETE
@@ -338,7 +328,7 @@ defer tx.rollback();
 var sp = try tx.begin();     // SAVEPOINT zgorm_sp_1
 var u2 = User{ .name = "maybe" };
 try sp.insert(&u2);
-try sp.rollback();           // 仅撤销 savepoint 内的操作；commit() 则 RELEASE
+sp.rollback();           // 仅撤销 savepoint 内的操作；commit() 则 RELEASE
 try tx.commit();
 ```
 
@@ -416,6 +406,10 @@ MySQL/MariaDB 与 SQLite ORM 共享同级的类型化 CRUD/Upsert、乐观锁、
 可观测性与显式事务重试 API。方言差异保持显式：`DISTINCT ON`、迁移 advisory
 lock、破坏性 Schema Diff 与二进制流式结果仅适用于 PostgreSQL；MySQL 模拟写操作
 `RETURNING`，SQLite 依赖 `libsqlite3`。
+
+MySQL/MariaDB 的 `insertBatch` 在需要回填自增主键时，会在同一事务内逐行插入并读取服务器返回的 ID。这会增加数据库往返次数，也适用于自定义自增步长。`updateReturning` 和 `deleteReturning` 先按排序、`limit` 和 `offset` 选定主键，随后只修改这些行。
+
+这两个接口要求模型声明主键。通过它们修改主键，或使用聚合、CTE、联合查询、`distinct`、`selectRaw` 时，会在写入前返回 `InvalidQuery`。
 
 ## 错误处理
 

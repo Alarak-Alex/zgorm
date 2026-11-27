@@ -223,6 +223,26 @@ pub fn setColumn(m: anytype, comptime col: schema.Column, v: columnFieldType(@Ty
     }
 }
 
+/// Saves auto-generated primary keys so a rolled-back write can be retried with the same models.
+pub fn AutoKeys(comptime T: type) type {
+    const pk = comptime schema.tableOf(T).pk();
+    const tracked = pk != null and pk.?.is_auto;
+    const Key = if (tracked) columnFieldType(T, pk.?) else void;
+    return struct {
+        pub fn capture(gpa: std.mem.Allocator, models: []const T) Error![]Key {
+            if (!tracked) return &.{};
+            const keys = try gpa.alloc(Key, models.len);
+            for (models, keys) |*model, *key| key.* = getColumn(model, pk.?);
+            return keys;
+        }
+
+        pub fn restore(models: []T, keys: []const Key) void {
+            if (!tracked) return;
+            for (models, keys) |*model, key| setColumn(model, pk.?, key);
+        }
+    };
+}
+
 /// Wrapper mapping a raw-JSON field to a `jsonb` column.
 pub const Json = struct {
     data: []const u8,

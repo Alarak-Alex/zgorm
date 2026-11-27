@@ -21,22 +21,17 @@ pub fn autoStamp(s: *Session, comptime T: type, m: anytype, comptime is_insert: 
         const is_updated = table.updated_at_index != null and table.updated_at_index.? == i;
         if ((is_created and is_insert) or is_updated) {
             const FType = value.columnFieldType(T, col);
-            switch (FType) {
-                Time => {
-                    if (value.getColumn(m, col).micros == 0) value.setColumn(m, col, now);
-                },
-                ?Time => {
-                    if (value.getColumn(m, col) == null) value.setColumn(m, col, now);
-                },
-                i64 => {
-                    if (value.getColumn(m, col) == 0) value.setColumn(m, col, now.micros);
-                },
-
-                ?i64 => {
-                    if (value.getColumn(m, col) == null) value.setColumn(m, col, now.micros);
-                },
+            const stamp = !is_insert or switch (FType) {
+                Time => value.getColumn(m, col).micros == 0,
+                i64 => value.getColumn(m, col) == 0,
+                ?Time, ?i64 => value.getColumn(m, col) == null,
+                else => false,
+            };
+            if (stamp) switch (FType) {
+                Time, ?Time => value.setColumn(m, col, now),
+                i64, ?i64 => value.setColumn(m, col, now.micros),
                 else => {},
-            }
+            };
         }
     }
 }

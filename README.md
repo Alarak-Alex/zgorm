@@ -174,49 +174,35 @@ pub fn main(init: std.process.Init) !void {
 
 ## Memory ownership
 
-- **Strings** decoded by `db.find` / `Query.all` are allocated with the allocator you pass in; release them with `zg.free(T, value, gpa)` / `zg.freeSlice(T, slice, gpa)`.
-- `Query.first` and `db.find` allocate with the session's gpa (the allocator given to `Db.connect*`); release with that same allocator.
-- `zg.free` must only be called on values whose string/slice fields were **not reassigned** after decoding (assigning a literal replaces the heap pointer with a static one). When in doubt, pass an arena.
-- To free a whole batch at once, pass an `ArenaAllocator` allocator (`zg.free*` are harmless on arenas).
-- `db.exec` / `execRaw` return a `pq.Result` that owns its memory: call `res.deinit()`.
-- Query builders are one-shot: terminal operations (`all`/`first`/`count`/`exists`/`delete`) release everything automatically.
+- PostgreSQL `find` and `first` use the session allocator. After retrieving a model, use `defer zg.free(User, user, s.gpa)` in the same scope.
+- `all(gpa)` uses the supplied allocator. `defer zg.freeSlice(User, users, gpa)` releases the models, their strings and their preloaded children. Keep the original string and slice fields until cleanup, or use an arena for the results.
+- A terminal operation releases the query builder. Results from `exec`, `execRaw` and `dryRun` each have their own `deinit()`.
 
-### Easy mode: one arena to free them all
+### One arena per request
 
-Skip per-value `zg.free` entirely: give each request/task its own arena, pass its allocator to every decoding call, and release everything with a single `deinit`:
+Set the allocator on a session for this request. Its `find` and `first` results and any rows fetched with `all(arena)` then share one lifetime. The connection pool keeps the allocator supplied to `Db`.
 
 ```zig
 var arena_state = std.heap.ArenaAllocator.init(gpa);
-defer arena_state.deinit();               // the only release point
+defer arena_state.deinit();
 const arena = arena_state.allocator();
-
-const adults = try zg.query(User, db)
-    .where("age >= $1", .{18})
-    .preload("posts")
-    .all(arena);                          // strings and preloaded children live in the arena
-var res = try db.exec("SELECT count(*)::text FROM \"user\"", .{});
-defer res.deinit();                       // Result owns its memory; deinit is still required (harmless on arenas)
-
-for (adults) |u| {
-    std.debug.print("{s}: {d} posts\n", .{ u.name, u.posts.len });
-}
-// No zg.free / zg.freeSlice anywhere — arena_state.deinit() reclaims it all
-```
-
-Two notes:
-
-- APIs that **take an allocator explicitly** — `all(arena)`, `stream(arena)`, `dryRun(arena)` — become fully release-free when you pass an arena.
-- `find` / `first` always use the session gpa. To route them into the arena too, override the session: `var s = db.session(); s.gpa = arena;` then `s.find(...)` / `s.query(...).first()` decode into the arena (use `s.query(User)` in place of `zg.query(User, db)`).
-
-```zig
 var s = db.session();
-s.gpa = arena;                            // every decode on this session lands in the arena
-const one = try s.query(User).whereEq("name", "Alice").first();
-const by_id = try s.find(User, id);
-// all released together at arena_state.deinit()
+s.gpa = arena;
+
+if (try s.find(User, id)) |user| {
+    std.debug.print("{s}\n", .{user.name});
+}
+const adults = try s.query(User).where("age >= $1", .{18}).all(arena);
+for (adults) |user| std.debug.print("{s}\n", .{user.name});
+
+var rows = try s.query(User).whereEq("active", true).stream(arena);
+defer rows.deinit();
+if (try rows.next()) |user| std.debug.print("{s}\n", .{user.name});
 ```
 
-A complete runnable version lives in `example/arena.zig` (`zig build run-arena -Ddsn=...`).
+`stream(arena)` allocates decoded rows in the arena. The iterator holds a database connection until it reaches the end or you call `rows.deinit()`. Place `defer rows.deinit()` immediately after opening it, including when you only read the first row. Use all decoded values before `arena_state.deinit()`.
+
+Run the example in `example/arena.zig` with `zig build run-arena -Ddsn=...`.
 
 ## DSN
 
@@ -321,15 +307,21 @@ quoting handled), so they can be copied straight into `psql`.
 
 ### Soft delete
 
-Models with a `deleted_at` column (`?zg.Time` or `?i64`, also included in `zg.Model`) get GORM-style soft deletes:
+Models with a `deleted_at` column (`?zg.Time` or `?i64`, also included in `zg.Model`) get GORM-style soft deletes. The default filter applies to every `orWhere` branch and each level of a preload. Calling `unscoped()` includes deleted parents and children.
 
 ```zig
 _ = try db.delete(&user);            // UPDATE ... SET deleted_at = now()
-_ = try db.find(User, id);           // excludes soft-deleted rows
+if (try db.find(User, id)) |visible| {
+    defer zg.free(User, visible, gpa);
+    std.debug.print("{s}\n", .{visible.name});
+}
 _ = try zg.query(User, db).count();   // filtered too; update/deleteWhere as well
 
 _ = try zg.query(User, db).unscoped().count();  // include soft-deleted rows
-_ = try db.findUnscoped(User, id);   // fetch a soft-deleted row by pk
+if (try db.findUnscoped(User, id)) |archived| {
+    defer zg.free(User, archived, gpa);
+    std.debug.print("{s}\n", .{archived.name});
+}
 _ = try db.updateUnscoped(&user);    // update it too
 _ = try db.restore(&user);           // clear deleted_at by primary key
 _ = try db.deleteHard(&user);        // real DELETE
@@ -345,7 +337,7 @@ defer tx.rollback();
 var sp = try tx.begin();     // SAVEPOINT zgorm_sp_1
 var u2 = User{ .name = "maybe" };
 try sp.insert(&u2);
-try sp.rollback();           // undoes only this savepoint; use commit() to RELEASE
+sp.rollback();           // undoes only this savepoint; use commit() to RELEASE
 try tx.commit();
 ```
 
@@ -426,6 +418,10 @@ transaction-retry APIs. Dialect-specific SQL remains explicit: PostgreSQL alone
 supports `DISTINCT ON`, advisory migration locks, destructive schema diffs, and
 binary streaming; MySQL emulates mutation `RETURNING`, while SQLite requires
 `libsqlite3`.
+
+For MySQL/MariaDB batches that need generated IDs, `insertBatch` inserts each row in the same transaction and reads its ID from the server. This uses more database round trips and works with a custom auto-increment step. For `updateReturning` and `deleteReturning`, ordering, limit and offset select the primary keys that the mutation will affect.
+
+MySQL requires a mapped primary key for these operations. A primary-key rewrite or a selection with aggregates, CTEs, unions, `distinct` or `selectRaw` returns `InvalidQuery` before writing.
 
 ## Error handling
 

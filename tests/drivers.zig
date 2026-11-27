@@ -96,6 +96,61 @@ const AdditiveV2 = struct {
     pub const zgorm = .{ .table = "additive_users" };
 };
 
+fn checkSoftDeletedPreloads(db: anytype) !void {
+    const Member = struct {
+        id: ?i64 = null,
+        parent_id: ?i64 = null,
+        name: []const u8 = "",
+        deleted_at: ?zg.Time = null,
+        pub const zgorm = .{ .table = "scope_children" };
+    };
+    const Group = struct {
+        id: ?i64 = null,
+        name: []const u8 = "",
+        members: []Member = &.{},
+        tags: []Member = &.{},
+        pub const zgorm = .{ .table = "scope_groups" };
+        pub const members_relation = zg.hasManyWith(Member, .{ .foreign_key = "parent_id" });
+        pub const tags_relation = zg.manyToManyWith(Member, .{
+            .join_table = "scope_memberships",
+            .join_foreign_key = "group_id",
+            .join_association_key = "child_id",
+        });
+    };
+    const gpa = std.testing.allocator;
+    try db.autoMigrateAll(.{ Group, Member });
+    try db.exec("CREATE TEMPORARY TABLE scope_memberships (group_id bigint, child_id bigint)");
+    var group = Group{ .name = "visibility" };
+    try db.insert(&group);
+    var live = Member{ .parent_id = group.id, .name = "live" };
+    var hidden = Member{ .parent_id = group.id, .name = "hidden" };
+    try db.insert(&live);
+    try db.insert(&hidden);
+    var links = try db.execArgs("INSERT INTO scope_memberships VALUES (?, ?), (?, ?)", .{ group.id, live.id, group.id, hidden.id });
+    links.deinit();
+    try db.delete(&hidden);
+    for ([_]bool{ false, true }) |unscoped| {
+        var query = db.query(Group).whereEq("id", group.id).preload("members").preload("tags");
+        if (unscoped) _ = query.unscoped();
+        const loaded = (try query.first(gpa)).?;
+        defer zg.free(Group, loaded, gpa);
+        const expected: usize = if (unscoped) 2 else 1;
+        try std.testing.expectEqual(expected, loaded.members.len);
+        try std.testing.expectEqual(expected, loaded.tags.len);
+        if (!unscoped) {
+            try std.testing.expectEqual(live.id, loaded.members[0].id);
+            try std.testing.expectEqual(live.id, loaded.tags[0].id);
+        }
+    }
+}
+
+test "SQLite preloads apply soft-delete scope to children and joined rows" {
+    const raw = try zg.drivers.sqlite.Db.open(std.testing.allocator, ":memory:");
+    defer raw.deinit();
+    var db = zg.drivers.sqlite.orm(raw);
+    try checkSoftDeletedPreloads(&db);
+}
+
 test "SQLite driver executes CRUD" {
     const db = try zg.drivers.sqlite.Db.open(std.testing.allocator, ":memory:");
     defer db.deinit();
@@ -122,10 +177,21 @@ test "SQLite pool leases and reuses connections" {
     defer pool.deinit();
     var lease = try pool.acquire();
     try std.testing.expectEqual(@as(usize, 1), pool.stats().in_use);
-    var result = try lease.backend.exec("SELECT 1");
-    result.deinit();
+    var db = zg.drivers.sqlite.orm(lease.backend);
+    try db.exec("CREATE TABLE lease_rows (id INTEGER)");
+    var abandoned = try db.begin();
+    try db.exec("INSERT INTO lease_rows VALUES (1)");
     lease.deinit();
     try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
+    var reused = try pool.acquire();
+    defer reused.deinit();
+    try std.testing.expectEqual(db.backend, reused.backend);
+    var next = try db.begin();
+    try std.testing.expectError(error.TransactionFinished, abandoned.rollback());
+    var count = try reused.backend.exec("SELECT count(*) FROM lease_rows");
+    defer count.deinit();
+    try std.testing.expectEqualStrings("0", count.rows[0][0].?);
+    try next.commit();
 }
 
 test "SQLite migrator applies scripts and rolls back latest version" {
@@ -197,6 +263,12 @@ test "SQLite lifecycle hooks timestamps and optimistic locking" {
     try std.testing.expect(timestamped.base.updated_at != null);
     try std.testing.expect(timestamped.base.id != null);
     try db.delete(&timestamped);
+    try std.testing.expectEqual(@as(i64, 0), try db.query(TimestampedUser)
+        .whereEq("name", "clocked").orWhere("name = ?", .{"absent"}).count());
+    try std.testing.expectEqual(@as(i64, 0), try db.query(TimestampedUser)
+        .whereEq("name", "clocked").orWhere("name = ?", .{"absent"}).update(.{ .name = "changed" }));
+    try std.testing.expectEqual(@as(i64, 1), try db.query(TimestampedUser).unscoped()
+        .whereEq("name", "clocked").orWhere("name = ?", .{"absent"}).count());
     try std.testing.expect((try db.find(TimestampedUser, timestamped.base.id.?, std.testing.allocator)) == null);
     try std.testing.expectEqual(@as(i64, 1), try db.restore(&timestamped));
     const restored = (try db.find(TimestampedUser, timestamped.base.id.?, std.testing.allocator)).?;
@@ -289,6 +361,158 @@ test "SQLite association manager appends counts and clears children" {
     try std.testing.expectEqual(@as(i64, 0), try children.count());
     try std.testing.expectEqual(@as(i64, 0), try children2.count());
 }
+const ReplaceChild = struct {
+    id: ?i64 = null,
+    parent_id: ?i64 = null,
+    name: []const u8 = "",
+
+    pub const zgorm = .{ .table = "replace_children", .unique = .{"name"} };
+};
+
+const ReplaceParent = struct {
+    id: ?i64 = null,
+    name: []const u8 = "",
+    children: []ReplaceChild = &.{},
+    tags: []ReplaceChild = &.{},
+
+    pub const zgorm = .{
+        .table = "replace_parents",
+        .has_many = .{ .children = .{ .model = ReplaceChild, .foreign_key = "parent_id" } },
+        .many_to_many = .{ .tags = .{
+            .model = ReplaceChild,
+            .foreign_key = "parent_id",
+            .join_table = "replace_tags",
+            .join_foreign_key = "parent_id",
+            .join_association_key = "child_id",
+        } },
+    };
+};
+
+fn checkAssociationReplace(db: anytype) !void {
+    try db.exec("DROP TABLE IF EXISTS replace_tags");
+    try db.exec("DROP TABLE IF EXISTS replace_children");
+    try db.exec("DROP TABLE IF EXISTS replace_parents");
+    try db.autoMigrateAll(.{ ReplaceParent, ReplaceChild });
+    try db.exec("CREATE TABLE replace_tags (parent_id BIGINT NOT NULL, child_id BIGINT NOT NULL, " ++
+        "PRIMARY KEY (parent_id, child_id), FOREIGN KEY (child_id) REFERENCES replace_children(id))");
+    var parent = ReplaceParent{ .name = "owner" };
+    var old = ReplaceChild{ .name = "old" };
+    var occupied = ReplaceChild{ .name = "occupied" };
+    try db.insert(&parent);
+    var children = db.association(&parent, "children");
+    var tags = db.association(&parent, "tags");
+    try children.append(&old);
+    try tags.append(&occupied);
+
+    var replacement = [_]ReplaceChild{ .{ .name = "fresh" }, .{ .name = "occupied" } };
+    // The missing child makes the join fail after the first child was successfully saved.
+    var missing = [_]ReplaceChild{ .{ .name = "tag" }, .{ .id = 9000, .name = "missing" } };
+    for ([_]bool{ false, true }) |nested| {
+        var outer = if (nested) @as(?@TypeOf(db.*).Transaction, try db.begin()) else null;
+        errdefer if (outer) |*tx| tx.rollback() catch {};
+        try std.testing.expectError(error.UniqueViolation, children.replace(&replacement));
+        try std.testing.expectError(error.ForeignKeyViolation, tags.replace(&missing));
+        try std.testing.expectEqual(null, replacement[0].id);
+        try std.testing.expectEqual(null, missing[0].id);
+        try std.testing.expectEqual(@as(i64, 1), try children.count());
+        try std.testing.expectEqual(@as(i64, 1), try tags.count());
+        try std.testing.expectEqual(@as(i64, 2), try db.query(ReplaceChild).count());
+        if (outer) |*tx| {
+            var marker = ReplaceParent{ .name = "still open" };
+            try tx.insert(&marker);
+            try tx.commit();
+        }
+    }
+    try std.testing.expectEqual(@as(i64, 1), try db.query(ReplaceParent).whereEq("name", "still open").count());
+    replacement[1].name = "second";
+    try children.replace(&replacement);
+    var duplicates = [_]ReplaceChild{ occupied, occupied };
+    try tags.replace(&duplicates);
+    try std.testing.expectEqual(@as(i64, 2), try children.count());
+    try std.testing.expectEqual(@as(i64, 1), try tags.count());
+    var outer = try db.begin();
+    try children.replace(&.{});
+    try tags.replace(&.{});
+    try std.testing.expectEqual(@as(i64, 0), try children.count());
+    try std.testing.expectEqual(@as(i64, 0), try tags.count());
+    try outer.rollback();
+    try std.testing.expectEqual(@as(i64, 2), try children.count());
+    try std.testing.expectEqual(@as(i64, 1), try tags.count());
+}
+
+test "SQLite association replacement rolls back children and links" {
+    const raw = try zg.drivers.sqlite.Db.open(std.testing.allocator, ":memory:");
+    defer raw.deinit();
+    var db = zg.drivers.sqlite.orm(raw);
+    try checkAssociationReplace(&db);
+}
+
+fn checkNestedBatches(db: anytype) !void {
+    const count = try db.query(DriverUser).count();
+    var outer = try db.begin();
+    var caller = DriverUser{ .name = "outer batch" };
+    try outer.insert(&caller);
+    var batch = [_]DriverUser{ .{ .name = "generated one" }, .{ .name = "generated two" } };
+    try outer.db.insertBatch(&batch);
+    var mixed = [_]DriverUser{ .{ .id = 700, .name = "supplied key" }, .{ .name = "generated after supplied" } };
+    try outer.insertBatch(&mixed);
+    try std.testing.expectEqual(@as(?i64, 700), mixed[0].id);
+    for (batch ++ mixed) |row| {
+        const found = (try db.find(DriverUser, row.id.?, std.testing.allocator)).?;
+        defer zg.free(DriverUser, found, std.testing.allocator);
+        try std.testing.expectEqualStrings(row.name, found.name);
+    }
+    var inner = try outer.begin();
+    var upserts = [_]DriverUser{.{ .name = "upsert batch" }};
+    _ = try inner.upsertBatch(&upserts, .{ .columns = &.{"name"}, .update = &.{"age"} });
+    try std.testing.expectError(error.InvalidQuery, outer.commit());
+    try inner.rollback();
+    try std.testing.expectEqual(@as(i64, 0), try db.query(DriverUser).whereEq("name", "upsert batch").count());
+    var duplicate = [_]DriverUser{ .{ .name = "discard me" }, .{ .id = 700, .name = "duplicate" } };
+    try std.testing.expectError(error.UniqueViolation, outer.insertBatch(&duplicate));
+    try std.testing.expectEqual(null, duplicate[0].id);
+    try std.testing.expectEqual(count + 5, try db.query(DriverUser).count());
+    try outer.rollback();
+    try std.testing.expectEqual(count, try db.query(DriverUser).count());
+    try std.testing.expectError(error.TransactionFinished, inner.begin());
+
+    try db.backend.beginTransaction();
+    var alias = @TypeOf(db.*).init(db.backend);
+    var raw_batch = [_]DriverUser{.{ .name = "raw outer" }};
+    try alias.insertBatch(&raw_batch);
+    try db.backend.rollback();
+    try std.testing.expectEqual(count, try db.query(DriverUser).count());
+}
+
+test "SQLite nested batches preserve outer transactions and failed commits can roll back" {
+    const raw = try zg.drivers.sqlite.Db.open(std.testing.allocator, ":memory:");
+    defer raw.deinit();
+    var db = zg.drivers.sqlite.orm(raw);
+    try db.autoMigrate(DriverUser);
+    try checkNestedBatches(&db);
+
+    try db.exec("CREATE TABLE deferred_child (user_id INTEGER REFERENCES zgorm_driver_users(id) DEFERRABLE INITIALLY DEFERRED)");
+    var outer = try db.begin();
+    try db.exec("INSERT INTO deferred_child VALUES (987654)");
+    try std.testing.expectError(error.ForeignKeyViolation, outer.commit());
+    try outer.rollback();
+    var next = try db.begin();
+    try next.commit();
+
+    const Hooked = struct {
+        id: ?i64 = null,
+        fail: bool = false,
+        pub fn afterCreate(row: *@This(), _: *zg.drivers.sqlite.Orm) zg.drivers.Error!void {
+            if (row.fail) return error.HookAborted;
+        }
+    };
+    try db.autoMigrate(Hooked);
+    var batch = [_]Hooked{ .{}, .{ .fail = true } };
+    try std.testing.expectError(error.HookAborted, db.insertBatch(&batch));
+    try std.testing.expectEqual(null, batch[0].id);
+    try std.testing.expectEqual(@as(i64, 0), try db.query(Hooked).count());
+}
+
 test "SQLite ORM executes typed lifecycle" {
     const gpa = std.testing.allocator;
     const raw = try zg.drivers.sqlite.Db.open(gpa, ":memory:");
@@ -349,8 +573,39 @@ test "SQLite ORM executes typed lifecycle" {
     try std.testing.expect((try db.find(DriverUser, ada.id.?, gpa)) == null);
 }
 
+fn checkMySqlBatchChunks(db: *zg.drivers.mysql.Orm) !void {
+    const Row = struct {
+        id: ?i64 = null,
+        a: i64 = 0,
+        b: i64 = 0,
+        c: i64 = 0,
+        pub const zgorm = .{ .table = "batch_chunk_rows" };
+    };
+    try db.exec("CREATE TEMPORARY TABLE batch_chunk_rows (id BIGINT PRIMARY KEY AUTO_INCREMENT, a BIGINT, b BIGINT, c BIGINT)");
+    const chunk = zg.drivers.Dialect.mysql.maxParameters() / 4;
+    const rows = try std.testing.allocator.alloc(Row, chunk + 1);
+    defer std.testing.allocator.free(rows);
+    for (rows, 1..) |*row, id| row.* = .{ .id = @intCast(id) };
+    var outer = try db.begin();
+    rows[chunk].id = 1;
+    try std.testing.expectError(error.UniqueViolation, outer.insertBatch(rows));
+    try std.testing.expectEqual(@as(i64, 0), try db.query(Row).count());
+    rows[chunk].id = @intCast(rows.len);
+    try outer.insertBatch(rows);
+    try std.testing.expectEqual(@as(i64, @intCast(rows.len)), try db.query(Row).count());
+    try outer.rollback();
+    try std.testing.expectEqual(@as(i64, 0), try db.query(Row).count());
+
+    try db.exec("SET SESSION autocommit = 0");
+    var generated = [_]Row{ .{}, .{} };
+    try db.insertBatch(&generated);
+    try db.exec("ROLLBACK");
+    try std.testing.expectEqual(@as(i64, 0), try db.query(Row).count());
+    try db.exec("SET SESSION autocommit = DEFAULT");
+}
+
 test "MySQL driver connects, pings, and executes CRUD" {
-    const port = options.mysql_port orelse return;
+    const port = options.mysql_port orelse return error.SkipZigTest;
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const temporary_database = options.mysql_database.len == 0;
@@ -396,6 +651,11 @@ test "MySQL driver connects, pings, and executes CRUD" {
     drop_orm.deinit();
     var db = zg.drivers.mysql.orm(conn);
     try db.autoMigrate(DriverUser);
+    try db.exec("SET SESSION auto_increment_increment = 2");
+    try checkNestedBatches(&db);
+    try checkMySqlBatchChunks(&db);
+    try db.exec("SET SESSION auto_increment_increment = DEFAULT");
+    try checkAssociationReplace(&db);
 
     var linus = DriverUser{ .name = "Linus", .age = 55 };
     try db.insert(&linus);
@@ -442,6 +702,8 @@ test "MySQL driver connects, pings, and executes CRUD" {
     defer zg.freeSlice(AssocParent, parents, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), parents[0].children.len);
 
+    try checkSoftDeletedPreloads(&db);
+
     execDiscard(conn, "DROP TABLE IF EXISTS schema_migrations");
     execDiscard(conn, "DROP TABLE IF EXISTS mysql_migration_users");
     var migrations = zg.drivers.mysql.migrator(&db);
@@ -472,4 +734,94 @@ test "MySQL driver connects, pings, and executes CRUD" {
     });
     defer timeout_conn.deinit();
     try std.testing.expectError(error.QueryTimeout, timeout_conn.exec("SELECT SLEEP(1)"));
+}
+
+test "MySQL returning mutates exactly the locked primary-key tuples" {
+    const port = options.mysql_port orelse return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const conn = try zg.drivers.mysql.Conn.connect(gpa, threaded.io(), .{
+        .host = options.mysql_host,
+        .port = port,
+        .user = options.mysql_user,
+        .password = options.mysql_password,
+        .database = options.mysql_database,
+        .ssl_mode = if (options.mysql_ssl) .require else .disable,
+    });
+    defer conn.deinit();
+    var db = zg.drivers.mysql.orm(conn);
+    if (options.mysql_database.len == 0) try db.exec("CREATE DATABASE zgorm_returning_test");
+    defer if (options.mysql_database.len == 0) execDiscard(conn, "DROP DATABASE zgorm_returning_test");
+    if (options.mysql_database.len == 0) try db.exec("USE zgorm_returning_test");
+
+    const Row = struct {
+        tenant: []const u8 = "",
+        id: ?i64 = null,
+        label: []const u8 = "",
+        score: i64 = 0,
+
+        pub const zgorm = .{ .table = "returning_rows", .primary_keys = .{ "tenant", "id" } };
+
+        pub fn afterFind(row: *@This(), db_: *zg.drivers.mysql.Orm) zg.drivers.Error!void {
+            // Force commit to see an ended transaction after the returned strings are allocated.
+            if (row.score == -1) try db_.exec("ROLLBACK");
+        }
+    };
+    try db.exec("CREATE TEMPORARY TABLE returning_rows (tenant VARCHAR(16), id BIGINT, label VARCHAR(16), score BIGINT, PRIMARY KEY (tenant, id)) ENGINE=InnoDB");
+    try db.exec("INSERT INTO returning_rows VALUES ('a', 1, 'first', 0), ('a', 2, 'second', 0), ('b', 1, 'third', 0), ('b', 2, 'fourth', 0)");
+
+    const updated = try db.query(Row).whereEq("score", 0).order_by("tenant, id").limit(1).offset(1)
+        .select(&.{"label"}).returning(&.{ "label", "score" }).updateReturning(.{ .score = 7 }, gpa);
+    defer zg.freeSlice(Row, updated, gpa);
+    try std.testing.expectEqual(@as(i64, 1), try db.query(Row).whereEq("score", 7).count());
+    try std.testing.expectEqual(@as(usize, 1), updated.len);
+    try std.testing.expectEqualStrings("second", updated[0].label);
+    try std.testing.expectEqual(@as(i64, 7), updated[0].score);
+    try std.testing.expectEqual(@as(?i64, null), updated[0].id);
+    try std.testing.expectEqualStrings("", updated[0].tenant);
+
+    const deleted = try db.query(Row).whereEq("score", 0).order_by("id, tenant").limit(1).offset(1)
+        .returning(&.{"label"}).deleteReturning(gpa);
+    defer zg.freeSlice(Row, deleted, gpa);
+    try std.testing.expectEqual(@as(usize, 1), deleted.len);
+    try std.testing.expectEqualStrings("third", deleted[0].label);
+    try std.testing.expectEqual(@as(?i64, null), deleted[0].id);
+    try std.testing.expectEqual(@as(i64, 3), try db.query(Row).count());
+    try std.testing.expectEqual(@as(i64, 0), try db.query(Row).whereEq("label", "third").count());
+
+    const empty_update = try db.query(Row).limit(0).updateReturning(.{ .score = 9 }, gpa);
+    defer zg.freeSlice(Row, empty_update, gpa);
+    try std.testing.expectEqual(@as(usize, 0), empty_update.len);
+    const empty_delete = try db.query(Row).order_by("id").offset(3).deleteReturning(gpa);
+    defer zg.freeSlice(Row, empty_delete, gpa);
+    try std.testing.expectEqual(@as(usize, 0), empty_delete.len);
+    try std.testing.expectEqual(@as(i64, 0), try db.query(Row).whereEq("score", 9).count());
+    try std.testing.expectEqual(@as(i64, 3), try db.query(Row).count());
+
+    // The join yields three rows for two base tuples in the opposite of primary-key order.
+    try db.exec("CREATE TEMPORARY TABLE returning_matches (id BIGINT, label VARCHAR(16), rank_ INT)");
+    try db.exec("INSERT INTO returning_matches VALUES (2, 'fourth', 1), (2, 'fourth', 2), (1, 'first', 3)");
+    var outer = try db.begin();
+    errdefer outer.rollback() catch {};
+    const joined = try db.query(Row).join("JOIN returning_matches AS m ON m.label = returning_rows.label AND m.id = returning_rows.id", .{})
+        .order_by("m.rank_").returning(&.{"label"}).updateReturning(.{ .score = 5 }, gpa);
+    defer zg.freeSlice(Row, joined, gpa);
+    try std.testing.expectEqual(@as(usize, 2), joined.len);
+    try std.testing.expectEqualStrings("fourth", joined[0].label);
+    try std.testing.expectEqualStrings("first", joined[1].label);
+    try std.testing.expectEqual(@as(i64, 2), try db.query(Row).whereEq("score", 5).count());
+    try outer.rollback();
+    try std.testing.expectEqual(@as(i64, 0), try db.query(Row).whereEq("score", 5).count());
+
+    try std.testing.expectError(error.InvalidQuery, db.query(Row).limit(1).updateReturning(.{ .id = 99 }, gpa));
+    const NoKey = struct {
+        score: i64 = 0,
+        pub const zgorm = .{ .table = "returning_rows" };
+    };
+    try std.testing.expectError(error.InvalidModel, db.query(NoKey).deleteReturning(gpa));
+    try std.testing.expectError(error.InvalidQuery, db.query(Row).group_by("tenant").deleteReturning(gpa));
+    try std.testing.expectError(error.TransactionFinished, db.query(Row).whereEq("label", "second").updateReturning(.{ .score = -1 }, gpa));
+    try std.testing.expectEqual(@as(i64, 1), try db.query(Row).whereEq("score", 7).count());
+    try std.testing.expectEqual(@as(i64, 3), try db.query(Row).count());
 }

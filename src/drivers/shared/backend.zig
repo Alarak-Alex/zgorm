@@ -1,6 +1,12 @@
 const std = @import("std");
 const types = @import("types.zig");
 
+/// Active ORM scopes belong to the connection, which can have several ORM handles.
+pub const TransactionState = struct {
+    scopes: std.ArrayList(u64) = .empty,
+    next_id: u64 = 1,
+};
+
 /// Compile-time contract consumed by the shared ORM/query/migration layers.
 pub fn assertBackend(comptime Backend: type) void {
     if (!@hasField(Backend, "gpa") or @FieldType(Backend, "gpa") != std.mem.Allocator)

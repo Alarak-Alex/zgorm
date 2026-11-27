@@ -542,7 +542,10 @@ pub const Conn = struct {
         fn finish(g: *QueryGuard) bool {
             _ = g.done.swap(true, .acq_rel);
             g.group.cancel(g.conn.io);
-            return g.expired.load(.acquire);
+            if (!g.expired.load(.acquire)) return false;
+            // A late CancelRequest must never reach a later query on this connection.
+            g.conn.broken = true;
+            return true;
         }
     };
 
@@ -934,28 +937,28 @@ pub const Conn = struct {
         return c.collectResults();
     }
 
+    fn queryTimeout(c: *const Conn, requested_ms: u64) u64 {
+        if (requested_ms == 0) return c.cfg.query_timeout_ms;
+        if (c.cfg.query_timeout_ms == 0) return requested_ms;
+        return @min(requested_ms, c.cfg.query_timeout_ms);
+    }
+
     pub fn execSimple(c: *Conn, sql: []const u8) Error!Result {
-        return c.execSimpleTimeout(sql, c.cfg.query_timeout_ms);
+        return c.execSimpleTimeout(sql, 0);
     }
 
     /// Runs a simple query and cancels it through PostgreSQL's CancelRequest
     /// protocol if the deadline expires.
     pub fn execSimpleTimeout(c: *Conn, sql: []const u8, timeout_ms: u64) Error!Result {
-        const effective = if (c.cfg.query_timeout_ms == 0) timeout_ms else if (timeout_ms == 0) c.cfg.query_timeout_ms else @min(timeout_ms, c.cfg.query_timeout_ms);
+        const effective = c.queryTimeout(timeout_ms);
         if (effective == 0) return c.execSimpleOnce(sql);
         var guard = QueryGuard{ .conn = c, .timeout_ms = effective };
         guard.start();
         const result = c.execSimpleOnce(sql) catch |err| {
-            if (guard.finish()) {
-                c.broken = true;
-                return error.QueryTimeout;
-            }
+            if (guard.finish()) return error.QueryTimeout;
             return err;
         };
         if (guard.finish()) {
-            // Retire the connection: a CancelRequest already in flight must not
-            // cancel a later query that reuses this connection from the pool.
-            c.broken = true;
             var owned = result;
             owned.deinit();
             return error.QueryTimeout;
@@ -978,26 +981,20 @@ pub const Conn = struct {
     }
 
     pub fn execParams(c: *Conn, sql: []const u8, params: []const Param) Error!Result {
-        return c.execParamsTimeout(sql, params, c.cfg.query_timeout_ms);
+        return c.execParamsTimeout(sql, params, 0);
     }
 
     /// Runs one extended-protocol query with an out-of-band cancel deadline.
     pub fn execParamsTimeout(c: *Conn, sql: []const u8, params: []const Param, timeout_ms: u64) Error!Result {
-        const effective = if (c.cfg.query_timeout_ms == 0) timeout_ms else if (timeout_ms == 0) c.cfg.query_timeout_ms else @min(timeout_ms, c.cfg.query_timeout_ms);
+        const effective = c.queryTimeout(timeout_ms);
         if (effective == 0) return c.execParamsCached(sql, params);
         var guard = QueryGuard{ .conn = c, .timeout_ms = effective };
         guard.start();
         const result = c.execParamsCached(sql, params) catch |err| {
-            if (guard.finish()) {
-                c.broken = true;
-                return error.QueryTimeout;
-            }
+            if (guard.finish()) return error.QueryTimeout;
             return err;
         };
         if (guard.finish()) {
-            // Retire the connection: a CancelRequest already in flight must not
-            // cancel a later query that reuses this connection from the pool.
-            c.broken = true;
             var owned = result;
             owned.deinit();
             return error.QueryTimeout;
@@ -1045,15 +1042,38 @@ pub const Conn = struct {
         };
     }
 
+    fn queryParamsRowsTimeout(c: *Conn, sql: []const u8, params: []const Param, result_format: u16, timeout_ms: u64) Error!*Rows {
+        const effective = c.queryTimeout(timeout_ms);
+        if (effective == 0) return c.queryParamsRowsCached(sql, params, result_format);
+
+        // The timer borrows the guard until the cursor reaches EOF or is closed.
+        const guard = try c.gpa.create(QueryGuard);
+        guard.* = .{ .conn = c, .timeout_ms = effective };
+        guard.start();
+        const rows = c.queryParamsRowsCached(sql, params, result_format) catch |err| {
+            defer c.gpa.destroy(guard);
+            return if (guard.finish()) error.QueryTimeout else err;
+        };
+        rows.query_guard = guard;
+        errdefer rows.deinit();
+        try rows.checkDeadline();
+        return rows;
+    }
+
     /// Starts an extended-protocol query whose rows are pulled one at a time.
     /// Result values use text format so they can also be exported directly.
     pub fn queryParamsStream(c: *Conn, sql: []const u8, params: []const Param) Error!*Rows {
-        return c.queryParamsRowsCached(sql, params, 0);
+        return c.queryParamsStreamTimeout(sql, params, 0);
+    }
+
+    /// Applies the shorter nonzero query or connection timeout until EOF or close.
+    pub fn queryParamsStreamTimeout(c: *Conn, sql: []const u8, params: []const Param, timeout_ms: u64) Error!*Rows {
+        return c.queryParamsRowsTimeout(sql, params, 0, timeout_ms);
     }
 
     /// Starts a cached binary-result cursor for typed ORM decoding.
     pub fn queryParamsBinary(c: *Conn, sql: []const u8, params: []const Param) Error!*Rows {
-        return c.queryParamsRowsCached(sql, params, 1);
+        return c.queryParamsRowsTimeout(sql, params, 1, 0);
     }
 
     fn writeParam(c: *Conn, p: Param) Error!void {
@@ -1274,6 +1294,7 @@ pub const Rows = struct {
     affected: i64 = 0,
     done: bool = false,
     got_error: bool = false,
+    query_guard: ?*Conn.QueryGuard = null,
 
     fn init(conn: *Conn) Error!Rows {
         const arena = conn.gpa.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
@@ -1348,9 +1369,28 @@ pub const Rows = struct {
         return r.cells.items;
     }
 
+    fn finishGuard(r: *Rows, guard: *Conn.QueryGuard) bool {
+        const expired = guard.finish();
+        r.conn.gpa.destroy(guard);
+        r.query_guard = null;
+        return expired;
+    }
+
+    fn checkDeadline(r: *Rows) Error!void {
+        const guard = r.query_guard orelse return;
+        const expired = if (r.done) r.finishGuard(guard) else guard.expired.load(.acquire);
+        if (expired) return error.QueryTimeout;
+    }
+
     /// Returns the next row, or null after ReadyForQuery. Protocol and server
     /// errors are returned from the iteration point where they are observed.
     pub fn next(r: *Rows) Error!?Result.Row {
+        const row = r.readNext();
+        try r.checkDeadline();
+        return row;
+    }
+
+    fn readNext(r: *Rows) Error!?Result.Row {
         if (r.done) return null;
         while (true) {
             const message = r.conn.readMessage() catch |err| {
@@ -1411,11 +1451,12 @@ pub const Rows = struct {
 
     pub fn deinit(r: *Rows) void {
         while (!r.done) {
-            _ = r.next() catch {
+            _ = r.readNext() catch {
                 r.conn.broken = true;
                 break;
             };
         }
+        if (r.query_guard) |guard| _ = r.finishGuard(guard);
         const gpa = r.conn.gpa;
         r.cells.deinit(gpa);
         r.arena.deinit();

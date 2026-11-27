@@ -164,10 +164,9 @@ pub const Session = struct {
         s.reportQuery(sql, params, started, wait_ns, res.affected, res.rows.len, null, "");
         return res;
     }
-    /// Executes a typed query and decodes rows into models. With logging,
-    /// observers, plugins, or deadlines enabled it retains the fully
-    /// instrumented result path; otherwise cells are decoded directly from
-    /// the PostgreSQL cursor.
+    /// Decodes directly from a cursor unless observers, plugins, a per-call
+    /// timeout or a transaction deadline require the buffered result path.
+    /// Both paths observe the connection's query timeout.
     pub fn runModels(
         s: *Session,
         comptime T: type,

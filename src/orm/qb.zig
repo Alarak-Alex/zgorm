@@ -17,7 +17,7 @@ const session_mod = @import("session.zig");
 const schema = @import("schema.zig");
 const value = @import("value.zig");
 const sqlutil = @import("sql.zig");
-const preload = @import("preload.zig");
+const preload_mod = @import("preload.zig");
 
 pub const Error = pq.Error;
 
@@ -31,10 +31,10 @@ const writeNamed = sqlutil.writeNamed;
 const DefaultSelectPrefix = sqlutil.DefaultSelectPrefix;
 
 // Preload helpers (canonical home: preload.zig).
-pub const validatePreloadPath = preload.validatePreloadPath;
-pub const applyPreloadPath = preload.applyPreloadPath;
-pub const ColumnOfT = preload.ColumnOfT;
-pub const FieldOfT = preload.FieldOfT;
+pub const validatePreloadPath = preload_mod.validatePreloadPath;
+pub const applyPreloadPath = preload_mod.applyPreloadPath;
+pub const ColumnOfT = preload_mod.ColumnOfT;
+pub const FieldOfT = preload_mod.FieldOfT;
 
 pub const DryRun = struct {
     sql: []u8,
@@ -386,24 +386,22 @@ pub fn Query(comptime T: type) type {
         }
 
         fn buildWhereOffset(q: *Self, w: *std.Io.Writer, param_offset: usize) !void {
-            var wrote_filter = false;
-            if (comptime table.softDeletable()) {
-                if (!q.unscoped_flag) {
-                    const del_col = table.columns[table.deleted_at_index.?];
-                    try w.print(" WHERE {s} IS NULL", .{sqlutil.quoted(del_col.name)});
-                    wrote_filter = true;
-                }
+            const scoped = table.softDeletable() and !q.unscoped_flag;
+            if (q.conds.items.len == 0 and !scoped) return;
+            try w.writeAll(" WHERE ");
+            if (scoped) {
+                const column = table.columns[table.deleted_at_index.?];
+                try w.print("{s} IS NULL", .{sqlutil.quoted(column.name)});
+                if (q.conds.items.len == 0) return;
+                try w.writeAll(" AND (");
             }
             for (q.conds.items, 0..) |cond, i| {
-                if (i == 0) {
-                    try w.writeAll(if (wrote_filter) " AND " else " WHERE ");
-                } else {
-                    try w.writeAll(if (cond.is_or) " OR " else " AND ");
-                }
+                if (i > 0) try w.writeAll(if (cond.is_or) " OR " else " AND ");
                 try w.writeByte('(');
                 try sqlutil.writeRenumbered(w, cond.frag, cond.args_start + param_offset);
                 try w.writeByte(')');
             }
+            if (scoped) try w.writeByte(')');
         }
 
         const SelectMode = enum { normal, count, exists, count_inner };
@@ -559,7 +557,8 @@ pub fn Query(comptime T: type) type {
         }
 
         /// Starts pull-based model decoding. The returned iterator owns the
-        /// pooled connection until EOF or `deinit`.
+        /// pooled connection until EOF or `deinit`. The shorter nonzero builder
+        /// or connection timeout covers opening, consuming and draining the cursor.
         pub fn stream(q: *Self, out_gpa: std.mem.Allocator) Error!ModelRows(T) {
             q.startTerminal() catch |err| {
                 q.deinit();
@@ -589,7 +588,8 @@ pub fn Query(comptime T: type) type {
                 q.deinit();
                 return error.ProtocolViolation;
             }
-            const rows = conn.queryParamsStream(sql, q.args.items) catch |err| {
+            const rows = conn.queryParamsStreamTimeout(sql, q.args.items, q.timeout_ms) catch |err| {
+                sess.captureError(conn);
                 sess.releaseConn(conn);
                 q.deinit();
                 return err;
@@ -742,7 +742,7 @@ pub fn Query(comptime T: type) type {
         fn applyPreloads(q: *Self, rows: []T, gpa: std.mem.Allocator) Error!void {
             if (q.preloads.items.len == 0 or rows.len == 0) return;
             for (q.preloads.items) |path| {
-                try applyPreloadPath(T, rows, path, q.sess, gpa);
+                try preload_mod.applyPreloadPathWithScope(T, rows, path, q.sess, gpa, q.unscoped_flag);
             }
         }
 
@@ -840,6 +840,7 @@ pub fn ModelRows(comptime T: type) type {
         pub fn next(r: *Self) Error!?T {
             if (r.closed) return null;
             const raw = r.rows.next() catch |err| {
+                r.sess.captureError(r.conn);
                 r.close();
                 return err;
             } orelse {
@@ -899,5 +900,5 @@ test "for update and soft delete SQL" {
 
 test {
     _ = sqlutil;
-    _ = preload;
+    _ = preload_mod;
 }

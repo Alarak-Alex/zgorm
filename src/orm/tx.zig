@@ -25,28 +25,31 @@ pub const Tx = struct {
 
     /// Starts a nested transaction (SAVEPOINT) inside this transaction.
     pub fn begin(t: *Tx) Error!Tx {
-        if (t.sess.pinned == null) return error.ProtocolViolation;
-        t.sess.savepoint_depth += 1;
-        errdefer t.sess.savepoint_depth -= 1;
+        return beginSavepoint(t.sess);
+    }
 
-        var sp = Tx{ .sess = t.sess, .is_savepoint = true };
-        const name = std.fmt.bufPrint(&sp.sp_name_buf, "zgorm_sp_{d}", .{t.sess.savepoint_depth}) catch
+    pub fn beginSavepoint(sess: *session_mod.Session) Error!Tx {
+        if (sess.pinned == null) return error.ProtocolViolation;
+        sess.savepoint_depth += 1;
+        errdefer sess.savepoint_depth -= 1;
+
+        var sp = Tx{ .sess = sess, .is_savepoint = true };
+        const name = std.fmt.bufPrint(&sp.sp_name_buf, "zgorm_sp_{d}", .{sess.savepoint_depth}) catch
             unreachable;
         sp.sp_name_len = name.len;
 
-        const sql = std.fmt.allocPrint(t.sess.gpa, "SAVEPOINT {s}", .{sp.spName()}) catch
-            return error.OutOfMemory;
-        defer t.sess.gpa.free(sql);
-        var res = try t.sess.execRaw(sql);
-        res.deinit();
+        try sp.savepointCommand("SAVEPOINT", false);
         return sp;
     }
 
-    fn releaseSavepoint(t: *Tx, comptime action: []const u8) Error!void {
-        const sql = std.fmt.allocPrint(t.sess.gpa, "{s} SAVEPOINT {s}", .{ action, t.spName() }) catch
-            return error.OutOfMemory;
-        defer t.sess.gpa.free(sql);
-        var res = try t.sess.execRaw(sql);
+    fn savepointCommand(t: *Tx, comptime command: []const u8, comptime cleanup: bool) Error!void {
+        var buf: [command.len + 1 + t.sp_name_buf.len]u8 = undefined;
+        const sql = std.fmt.bufPrint(&buf, command ++ " {s}", .{t.spName()}) catch unreachable;
+        var res = t.sess.execRaw(sql) catch |err| fallback: {
+            // A query hook can reject work, including RELEASE, but rollback must still run.
+            if (!cleanup or err != error.HookAborted) return err;
+            break :fallback try t.sess.pinned.?.execSimple(sql);
+        };
         res.deinit();
     }
 
@@ -60,31 +63,32 @@ pub const Tx = struct {
             t.rollback();
             return err;
         };
-        t.finished = true;
         if (t.is_savepoint) {
-            t.releaseSavepoint("RELEASE") catch |e| {
-                t.sess.savepoint_depth -= 1;
-                t.finish();
-                return e;
+            t.savepointCommand("RELEASE SAVEPOINT", false) catch |err| {
+                t.rollback();
+                return err;
             };
+            t.finished = true;
             t.sess.savepoint_depth -= 1;
             t.finish();
             return;
         }
+        t.finished = true;
         const conn = t.sess.pinned.?;
-        var res = conn.execSimple("COMMIT") catch |e| {
-            t.sess.captureError(conn);
+        defer {
             t.sess.transaction_deadline = null;
             t.sess.pinned = null;
             t.sess.pool.release(conn);
             t.finish();
-            return e;
+        }
+        if (conn.broken) return error.ConnectionClosed;
+        var res = conn.execSimple("COMMIT") catch |err| {
+            t.sess.captureError(conn);
+            return err;
         };
-        t.sess.transaction_deadline = null;
-        res.deinit();
-        t.sess.pinned = null;
-        t.sess.pool.release(conn);
-        t.finish();
+        defer res.deinit();
+        // PostgreSQL completes COMMIT on an aborted transaction with a ROLLBACK tag.
+        if (!std.mem.eql(u8, res.cmd_tag, "COMMIT")) return error.QueryFailed;
     }
 
     /// Rolls back. Safe to call from `defer`; safe on an already-finished tx.
@@ -92,16 +96,19 @@ pub const Tx = struct {
         if (t.finished) return;
         t.finished = true;
         if (t.is_savepoint) {
-            // Roll back to the savepoint, then release it so the name can be
-            // reused later in the same transaction.
-            t.releaseSavepoint("ROLLBACK TO") catch {
+            defer {
                 t.sess.savepoint_depth -= 1;
                 t.finish();
+            }
+            const conn = t.sess.pinned.?;
+            t.savepointCommand("ROLLBACK TO SAVEPOINT", true) catch {
+                // Dropping this connection rolls back work that could not be isolated.
+                conn.broken = true;
                 return;
             };
-            t.releaseSavepoint("RELEASE") catch {};
-            t.sess.savepoint_depth -= 1;
-            t.finish();
+            t.savepointCommand("RELEASE SAVEPOINT", true) catch {
+                conn.broken = true;
+            };
             return;
         }
         const conn = t.sess.pinned.?;

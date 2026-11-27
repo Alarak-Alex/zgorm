@@ -42,9 +42,11 @@ pub fn Association(
     const join_fk_q = QuotedIdent(assoc.join_foreign_key).value;
     const join_ak_q = QuotedIdent(assoc.join_association_key).value;
     const count_sql = "SELECT count(*) FROM " ++ join_table_q ++ " WHERE " ++ join_fk_q ++ " = ?";
-    const join_insert_head = (if (dialect == .mysql) "INSERT IGNORE INTO " else "INSERT INTO ") ++
-        join_table_q ++ " (" ++ join_fk_q ++ ", " ++ join_ak_q ++ ") VALUES ";
-    const join_insert_tail = if (dialect == .sqlite) " ON CONFLICT DO NOTHING" else "";
+    const join_insert_head = "INSERT INTO " ++ join_table_q ++ " (" ++ join_fk_q ++ ", " ++ join_ak_q ++ ") VALUES ";
+    const join_insert_tail = if (dialect == .mysql)
+        " ON DUPLICATE KEY UPDATE " ++ join_fk_q ++ " = " ++ join_fk_q
+    else
+        " ON CONFLICT DO NOTHING";
     const append_sql = join_insert_head ++ "(?, ?)" ++ join_insert_tail;
     const delete_join_sql = "DELETE FROM " ++ join_table_q ++ " WHERE " ++ join_fk_q ++ " = ?";
     const delete_join_child_sql = delete_join_sql ++ " AND " ++ join_ak_q ++ " = ?";
@@ -108,15 +110,20 @@ pub fn Association(
         }
 
         pub fn replace(a: *Self, children: []Child) types.Error!void {
+            var tx = try a.db.begin();
+            errdefer tx.rollback() catch {};
+            const Keys = value.AutoKeys(Child);
+            const keys = try Keys.capture(a.db.backend.gpa, children);
+            defer a.db.backend.gpa.free(keys);
+            errdefer Keys.restore(children, keys);
             try a.clear();
             if (assoc.kind != .many_to_many) {
                 for (children) |*child| try a.append(child);
-                return;
+                return tx.commit();
             }
             // Save children first (backfills their pks), then insert all join
             // rows in chunked multi-row statements instead of one per child.
             for (children) |*child| try a.db.save(child);
-            if (children.len == 0) return;
             var arena_state = std.heap.ArenaAllocator.init(a.db.backend.gpa);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
@@ -143,6 +150,7 @@ pub fn Association(
                 result.deinit();
                 i = end;
             }
+            try tx.commit();
         }
 
         fn deleteJoin(a: *Self, child_key: anytype) types.Error!void {

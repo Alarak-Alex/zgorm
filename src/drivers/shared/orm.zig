@@ -44,6 +44,8 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
     comptime backend_mod.assertBackend(Backend);
     return struct {
         const Self = @This();
+        const tracks_transactions = @hasDecl(Backend, "inTransaction") and @hasField(Backend, "transaction_state") and
+            @FieldType(Backend, "transaction_state") == backend_mod.TransactionState;
         backend: *Backend,
         observer: types.Observer = .{},
         plugin_registry: plugins.Registry = .{},
@@ -292,7 +294,8 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
             defer result.deinit();
             if (table.pk_index) |pk_index| {
                 const pk = table.columns[pk_index];
-                if (pk.is_auto and result.last_insert_id != 0 and isNull(value.getColumn(model, pk))) {
+                const key = value.getColumn(model, pk);
+                if (pk.is_auto and result.last_insert_id != 0 and (isNull(key) or (dialect == .mysql and key == 0))) {
                     const V = value.columnFieldType(T, pk);
                     const Child = @typeInfo(V).optional.child;
                     const id = std.math.cast(Child, result.last_insert_id) orelse return error.TypeMismatch;
@@ -317,85 +320,73 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
             const table = comptime schema.tableOf(T);
             const pkc = comptime table.pk();
 
-            // Multi-row fast path: a single auto-increment pk that every row
-            // leaves null. Mixed/manual keys fall back to per-row inserts.
-            const auto_cols = comptime blk: {
-                var n: usize = 0;
-                for (table.columns) |c| {
-                    if (c.is_auto) n += 1;
-                }
-                break :blk n;
-            };
-            var multi = comptime auto_cols == 1 and pkc != null and pkc.?.is_auto;
-            if (multi) {
-                for (list) |*m| {
-                    if (!isNull(value.getColumn(m, pkc.?))) {
-                        multi = false;
+            var tx = try db.begin();
+            errdefer tx.rollback() catch {};
+            const Keys = value.AutoKeys(T);
+            const keys = try Keys.capture(db.backend.gpa, list);
+            defer db.backend.gpa.free(keys);
+            errdefer Keys.restore(list, keys);
+
+            // Hooks can assign keys or perform writes between rows.
+            var individually = @hasDecl(T, "beforeSave") or @hasDecl(T, "beforeCreate") or
+                @hasDecl(T, "afterCreate") or @hasDecl(T, "afterSave");
+            const auto_pk = comptime pkc != null and pkc.?.is_auto;
+            var backfill = false;
+            if (comptime auto_pk) {
+                backfill = isNull(value.getColumn(&list[0], pkc.?));
+                for (list) |*model| {
+                    const key = value.getColumn(model, pkc.?);
+                    // MySQL reports only one generated id in each OK packet. Zero can
+                    // also request an id, depending on NO_AUTO_VALUE_ON_ZERO.
+                    if (isNull(key) != backfill or (dialect == .mysql and (key orelse 0) == 0)) {
+                        individually = true;
                         break;
                     }
                 }
             }
-            if (!multi) {
-                var tx = try db.begin();
-                errdefer tx.rollback() catch {};
+            if (individually) {
                 for (list) |*model| try tx.insert(model);
-                try tx.commit();
-                return;
+                return tx.commit();
             }
-            if (comptime table.columns.len < 2) return error.InvalidModel;
 
-            for (list) |*m| {
-                try callHook(T, "beforeSave", m, db);
-                try callHook(T, "beforeCreate", m, db);
-                try db.autoStamp(T, m, true);
-            }
-            var tx = try db.begin();
-            errdefer tx.rollback() catch {};
-            const col_count = comptime table.columns.len - 1;
-            const chunk_rows = @max(@as(usize, 1), dialect.maxParameters() / @max(col_count, 1));
+            const col_count = table.columns.len - @intFromBool(backfill);
+            if (col_count == 0) return error.InvalidModel;
+            const chunk_rows = @max(@as(usize, 1), dialect.maxParameters() / col_count);
             var i: usize = 0;
             while (i < list.len) {
-                const end = @min(i + chunk_rows, list.len);
+                const end = i + @min(chunk_rows, list.len - i);
                 const chunk = list[i..end];
-                const last_id = try tx.db.insertChunkMulti(T, chunk);
-                if (last_id != 0) {
-                    // Auto-increment ids are consecutive within one statement:
-                    // MySQL reports the first id, SQLite the last.
-                    const base = switch (dialect) {
-                        .mysql => last_id,
-                        .sqlite => last_id - (chunk.len - 1),
-                        .postgresql => unreachable,
-                    };
-                    const V = value.columnFieldType(T, pkc.?);
-                    const Child = @typeInfo(V).optional.child;
-                    for (chunk, 0..) |*m, r| {
-                        const id = std.math.cast(Child, base + r) orelse return error.TypeMismatch;
-                        value.setColumn(m, pkc.?, @as(V, id));
+                for (chunk) |*model| try db.autoStamp(T, model, true);
+                const last_id = try tx.db.insertChunkMulti(T, chunk, backfill, col_count);
+                if (comptime dialect == .sqlite and auto_pk) {
+                    if (backfill and last_id != 0) {
+                        const base = std.math.sub(u64, last_id, chunk.len - 1) catch return error.TypeMismatch;
+                        const V = value.columnFieldType(T, pkc.?);
+                        for (chunk, 0..) |*model, r| {
+                            const id = std.math.cast(@typeInfo(V).optional.child, base + r) orelse return error.TypeMismatch;
+                            value.setColumn(model, pkc.?, @as(V, id));
+                        }
                     }
                 }
                 i = end;
             }
             try tx.commit();
-            for (list) |*m| {
-                try callHook(T, "afterCreate", m, db);
-                try callHook(T, "afterSave", m, db);
-            }
         }
 
-        fn insertChunkMulti(db: *Self, comptime T: type, rows: []T) Error!u64 {
+        fn insertChunkMulti(db: *Self, comptime T: type, rows: []T, omit_auto: bool, col_count: usize) Error!u64 {
             const table = comptime schema.tableOf(T);
             var arena_state = std.heap.ArenaAllocator.init(db.backend.gpa);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
             var sql = SqlBuf.init(arena);
             const w = sql.writer();
-            const params = arena.alloc(types.Param, rows.len * (table.columns.len - 1)) catch return error.OutOfMemory;
+            const params = try arena.alloc(types.Param, rows.len * col_count);
             w.writeAll("INSERT INTO ") catch return error.OutOfMemory;
             writeIdent(w, table.name) catch return error.OutOfMemory;
             w.writeAll(" (") catch return error.OutOfMemory;
             var first_col = true;
             inline for (table.columns) |col| {
-                if (!col.is_auto) {
+                if (!omit_auto or !col.is_auto) {
                     if (!first_col) w.writeAll(", ") catch return error.OutOfMemory;
                     writeIdent(w, col.name) catch return error.OutOfMemory;
                     first_col = false;
@@ -408,7 +399,7 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
                 w.writeByte('(') catch return error.OutOfMemory;
                 var first = true;
                 inline for (table.columns) |col| {
-                    if (!col.is_auto) {
+                    if (!omit_auto or !col.is_auto) {
                         if (!first) w.writeAll(", ") catch return error.OutOfMemory;
                         w.writeByte('?') catch return error.OutOfMemory;
                         params[np] = try value.toParam(value.getColumn(m, col), arena);
@@ -516,8 +507,13 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
         }
 
         pub fn upsertBatch(db: *Self, models: anytype, comptime conflict: OnConflict) Error!usize {
+            if (models.len == 0) return 0;
             var tx = try db.begin();
             errdefer tx.rollback() catch {};
+            const Keys = value.AutoKeys(@TypeOf(models[0]));
+            const keys = try Keys.capture(db.backend.gpa, models);
+            defer db.backend.gpa.free(keys);
+            errdefer Keys.restore(models, keys);
             var changed: usize = 0;
             for (models) |*model| if (try tx.db.upsert(model, conflict)) {
                 changed += 1;
@@ -751,8 +747,18 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
         }
 
         pub fn begin(db: *Self) Error!Transaction {
-            try db.backend.beginTransaction();
-            return .{ .db = db };
+            if (comptime !tracks_transactions) {
+                try db.backend.beginTransaction();
+                return .{ .db = db };
+            }
+            const nested = try db.backend.inTransaction();
+            const state = &db.backend.transaction_state;
+            try state.scopes.ensureUnusedCapacity(db.backend.gpa, 1);
+            const tx = Transaction{ .db = db, .id = state.next_id, .depth = state.scopes.items.len, .is_savepoint = nested };
+            if (nested) try tx.savepointCommand("SAVEPOINT") else try db.backend.beginTransaction();
+            state.scopes.appendAssumeCapacity(tx.id);
+            state.next_id +%= 1;
+            return tx;
         }
 
         /// Explicitly retries a complete transaction; ordinary writes are never replayed.
@@ -771,14 +777,12 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
                     continue;
                 };
                 body(context, &tx) catch |err| {
-                    tx.rollback() catch {};
-                    if (attempt + 1 >= attempts or !retryableTransactionError(err, options)) return err;
+                    if (!tx.rollbackForRetry() or attempt + 1 >= attempts or !retryableTransactionError(err, options)) return err;
                     db.retryDelay(options, attempt);
                     continue;
                 };
                 tx.commit() catch |err| {
-                    tx.rollback() catch {};
-                    if (attempt + 1 >= attempts or !retryableTransactionError(err, options)) return err;
+                    if (!tx.rollbackForRetry() or attempt + 1 >= attempts or !retryableTransactionError(err, options)) return err;
                     db.retryDelay(options, attempt);
                     continue;
                 };
@@ -789,62 +793,111 @@ pub fn Orm(comptime Backend: type, comptime dialect: Dialect) type {
 
         pub const Transaction = struct {
             db: *Self,
+            id: u64 = 0,
+            depth: usize = 0,
+            is_savepoint: bool = false,
             finished: bool = false,
 
-            pub fn commit(tx: *Transaction) Error!void {
+            fn ensureActive(tx: *const Transaction) Error!void {
                 if (tx.finished) return error.TransactionFinished;
-                try tx.db.backend.commit();
+                if (comptime !tracks_transactions) return;
+                if (!try tx.db.backend.inTransaction()) return error.TransactionFinished;
+                const scopes = tx.db.backend.transaction_state.scopes.items;
+                if (scopes.len <= tx.depth or scopes[tx.depth] != tx.id) return error.TransactionFinished;
+            }
+
+            fn savepointCommand(tx: *const Transaction, comptime command: []const u8) Error!void {
+                var buf: [64]u8 = undefined;
+                const sql = std.fmt.bufPrint(&buf, command ++ " zgorm_sp_{d}", .{tx.id}) catch unreachable;
+                var result = try tx.db.backend.exec(sql);
+                result.deinit();
+            }
+
+            pub fn begin(tx: *Transaction) Error!Transaction {
+                try tx.ensureActive();
+                return tx.db.begin();
+            }
+
+            pub fn commit(tx: *Transaction) Error!void {
+                try tx.ensureActive();
+                if (tracks_transactions and tx.db.backend.transaction_state.scopes.items.len != tx.depth + 1)
+                    return error.InvalidQuery;
+                if (tracks_transactions and tx.is_savepoint) {
+                    try tx.savepointCommand("RELEASE SAVEPOINT");
+                } else try tx.db.backend.commit();
+                if (comptime tracks_transactions) tx.db.backend.transaction_state.scopes.shrinkRetainingCapacity(tx.depth);
                 tx.finished = true;
             }
 
             pub fn rollback(tx: *Transaction) Error!void {
-                if (tx.finished) return error.TransactionFinished;
-                try tx.db.backend.rollback();
+                try tx.ensureActive();
+                if (tracks_transactions and tx.is_savepoint) {
+                    try tx.savepointCommand("ROLLBACK TO SAVEPOINT");
+                    const scopes = &tx.db.backend.transaction_state.scopes;
+                    scopes.shrinkRetainingCapacity(tx.depth + 1);
+                    try tx.savepointCommand("RELEASE SAVEPOINT");
+                } else try tx.db.backend.rollback();
+                if (comptime tracks_transactions) tx.db.backend.transaction_state.scopes.shrinkRetainingCapacity(tx.depth);
                 tx.finished = true;
             }
 
+            fn rollbackForRetry(tx: *Transaction) bool {
+                tx.rollback() catch |err| return err == error.TransactionFinished and !tx.is_savepoint;
+                return true;
+            }
+
             pub fn insert(tx: *Transaction, model: anytype) Error!void {
-                if (tx.finished) return error.TransactionFinished;
+                try tx.ensureActive();
                 try tx.db.insert(model);
             }
 
+            pub fn insertBatch(tx: *Transaction, models: anytype) Error!void {
+                try tx.ensureActive();
+                return tx.db.insertBatch(models);
+            }
+
+            pub fn upsertBatch(tx: *Transaction, models: anytype, comptime conflict: OnConflict) Error!usize {
+                try tx.ensureActive();
+                return tx.db.upsertBatch(models, conflict);
+            }
+
             pub fn upsert(tx: *Transaction, model: anytype, comptime conflict: OnConflict) Error!bool {
-                if (tx.finished) return error.TransactionFinished;
+                try tx.ensureActive();
                 return tx.db.upsert(model, conflict);
             }
 
             pub fn save(tx: *Transaction, model: anytype) Error!void {
-                if (tx.finished) return error.TransactionFinished;
+                try tx.ensureActive();
                 try tx.db.save(model);
             }
 
             pub fn update(tx: *Transaction, model: anytype) Error!void {
-                if (tx.finished) return error.TransactionFinished;
+                try tx.ensureActive();
                 try tx.db.update(model);
             }
 
             pub fn delete(tx: *Transaction, model: anytype) Error!void {
-                if (tx.finished) return error.TransactionFinished;
+                try tx.ensureActive();
                 try tx.db.delete(model);
             }
 
             pub fn deleteHard(tx: *Transaction, model: anytype) Error!i64 {
-                if (tx.finished) return error.TransactionFinished;
+                try tx.ensureActive();
                 return tx.db.deleteHard(model);
             }
 
             pub fn restore(tx: *Transaction, model: anytype) Error!i64 {
-                if (tx.finished) return error.TransactionFinished;
+                try tx.ensureActive();
                 return tx.db.restore(model);
             }
 
             pub fn find(tx: *Transaction, comptime T: type, key: anytype, gpa: std.mem.Allocator) Error!?T {
-                if (tx.finished) return error.TransactionFinished;
+                try tx.ensureActive();
                 return tx.db.find(T, key, gpa);
             }
 
             pub fn execArgs(tx: *Transaction, sql: []const u8, args: anytype) Error!types.Result {
-                if (tx.finished) return error.TransactionFinished;
+                try tx.ensureActive();
                 return tx.db.execArgs(sql, args);
             }
         };

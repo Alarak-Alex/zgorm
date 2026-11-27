@@ -75,7 +75,7 @@ zig build benchmark-build
 - `src/drivers/shared/dialect.zig`: 方言能力、参数上限、标识符和 DDL 差异。
 - `build.zig`: 构建步骤、测试目标、示例、benchmark 和自定义选项。
 - `build.zig.zon`: 包名、版本、最低 Zig 版本和依赖。
-- `.github/workflows/ci.yml`: CI（PG service + 全部测试目标 + ReleaseSafe + 集成测试执行断言）。
+- `.github/workflows/ci.yml`: CI 使用独立的 PostgreSQL、MySQL 和内存 SQLite，运行测试、ReleaseSafe 构建和 arena 示例。
 
 ## Runtime/Tooling Preferences
 
@@ -91,6 +91,6 @@ zig build benchmark-build
 - `zig build test` 运行 `src/root.zig` 及其导入模块中的单元测试。
 - `zig build test-drivers` 运行 `tests/drivers.zig`；SQLite 测试通常使用 `:memory:`，MySQL 未配置端口时会跳过。
 - `zig build test-integration -Ddsn=...` 运行 `tests/integration.zig` 的 PostgreSQL 集成覆盖，包括协议、CRUD、关联、迁移、事务、连接池、流式结果、插件和观测。
-- 无 DSN 时部分集成测试会静默 skip；CI/助手必须确认日志确实连接并执行了测试。
+- 本地无 DSN 时集成测试报告为跳过。CI 缺少 DSN 时直接失败，带 DSN 的集成测试每次执行并输出 Zig 测试摘要。
 - benchmark 是性能观测，不是正确性测试；默认 PostgreSQL DSN 为 `127.0.0.1:5433`，初始化会删除并重建 benchmark 表，禁止使用共享或生产数据库。
 - 行为变更至少运行相关测试目标和 `zig build -Doptimize=ReleaseSafe`；不要把 benchmark 当作回归测试替代品。

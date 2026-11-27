@@ -47,13 +47,24 @@ pub fn applyPreloadPath(
     s: *session_mod.Session,
     gpa: std.mem.Allocator,
 ) Error!void {
+    return applyPreloadPathWithScope(M, rows, path, s, gpa, false);
+}
+
+pub fn applyPreloadPathWithScope(
+    comptime M: type,
+    rows: []M,
+    path: []const u8,
+    s: *session_mod.Session,
+    gpa: std.mem.Allocator,
+    unscoped: bool,
+) Error!void {
     const tbl = comptime schema.tableOf(M);
     const dot = std.mem.indexOfScalar(u8, path, '.');
     const seg = if (dot) |d| path[0..d] else path;
     const nested: []const u8 = if (dot) |d| path[d + 1 ..] else "";
     inline for (tbl.assocs) |assoc| {
         if (std.mem.eql(u8, assoc.field_name, seg)) {
-            try loadAssoc(M, rows, assoc, nested, s, gpa);
+            try loadAssoc(M, rows, assoc, nested, s, gpa, unscoped);
         }
     }
 }
@@ -65,15 +76,16 @@ fn loadAssoc(
     nested: []const u8,
     s: *session_mod.Session,
     gpa: std.mem.Allocator,
+    unscoped: bool,
 ) Error!void {
     if (assoc.primary_keys.len != assoc.foreign_keys.len)
         @compileError("zgorm: association primary_keys and foreign_keys must have equal length");
     if (assoc.primary_keys.len > 1)
-        return loadCompositeAssoc(M, rows, assoc, nested, s, gpa);
+        return loadCompositeAssoc(M, rows, assoc, nested, s, gpa, unscoped);
 
     switch (assoc.kind) {
-        .many_to_many => return loadManyToMany(M, rows, assoc, nested, s, gpa),
-        .belongs_to, .has_one, .has_many => return loadSingleAssoc(M, rows, assoc, nested, s, gpa),
+        .many_to_many => return loadManyToMany(M, rows, assoc, nested, s, gpa, unscoped),
+        .belongs_to, .has_one, .has_many => return loadSingleAssoc(M, rows, assoc, nested, s, gpa, unscoped),
     }
 }
 
@@ -84,6 +96,7 @@ fn loadSingleAssoc(
     nested: []const u8,
     s: *session_mod.Session,
     gpa: std.mem.Allocator,
+    unscoped: bool,
 ) Error!void {
     const Child = assoc.model;
     const child_table = comptime schema.tableOf(Child);
@@ -136,9 +149,10 @@ fn loadSingleAssoc(
         assoc.polymorphic_value,
         s,
         arena,
+        unscoped,
     );
     defer children.deinit(arena);
-    if (nested.len > 0) try applyPreloadPath(Child, children.items, nested, s, arena);
+    if (nested.len > 0) try applyPreloadPathWithScope(Child, children.items, nested, s, arena, unscoped);
 
     switch (assoc.kind) {
         .has_many => {
@@ -251,6 +265,7 @@ fn loadManyToMany(
     nested: []const u8,
     s: *session_mod.Session,
     gpa: std.mem.Allocator,
+    unscoped: bool,
 ) Error!void {
     const Child = assoc.model;
     const child_table = comptime schema.tableOf(Child);
@@ -279,12 +294,13 @@ fn loadManyToMany(
         keys.items,
         s,
         arena,
+        unscoped,
     );
     defer joined.deinit(arena);
 
     const child_rows = arena.alloc(Child, joined.items.len) catch return error.OutOfMemory;
     for (joined.items, 0..) |item, i| child_rows[i] = item.child;
-    if (nested.len > 0) try applyPreloadPath(Child, child_rows, nested, s, arena);
+    if (nested.len > 0) try applyPreloadPathWithScope(Child, child_rows, nested, s, arena, unscoped);
     for (joined.items, 0..) |*item, i| item.child = child_rows[i];
 
     const slices = gpa.alloc(@TypeOf(@field(@as(M, undefined), assoc.field_name)), rows.len) catch
@@ -351,6 +367,7 @@ fn loadCompositeAssoc(
     nested: []const u8,
     s: *session_mod.Session,
     gpa: std.mem.Allocator,
+    unscoped: bool,
 ) Error!void {
     const Child = assoc.model;
     if (assoc.kind == .has_one or assoc.kind == .many_to_many)
@@ -361,9 +378,9 @@ fn loadCompositeAssoc(
     const arena = arena_state.allocator();
     const child_keys = if (assoc.kind == .belongs_to) assoc.primary_keys else assoc.foreign_keys;
     const parent_keys = if (assoc.kind == .belongs_to) assoc.foreign_keys else assoc.primary_keys;
-    var children = try queryCompositeChildren(M, Child, rows, child_keys, parent_keys, s, arena);
+    var children = try queryCompositeChildren(M, Child, rows, child_keys, parent_keys, s, arena, unscoped);
     defer children.deinit(arena);
-    if (nested.len > 0) try applyPreloadPath(Child, children.items, nested, s, arena);
+    if (nested.len > 0) try applyPreloadPathWithScope(Child, children.items, nested, s, arena, unscoped);
 
     if (assoc.kind == .has_many) {
         const slices = gpa.alloc(@TypeOf(@field(@as(M, undefined), assoc.field_name)), rows.len) catch
@@ -593,6 +610,14 @@ fn JoinedChild(comptime Child: type, comptime ParentKey: type) type {
     };
 }
 
+fn appendSoftDeleteScope(w: *std.Io.Writer, comptime table: schema.Table, unscoped: bool) Error!void {
+    if (table.deleted_at_index) |index| {
+        if (!unscoped) try w.print(" AND {s}.{s} IS NULL", .{
+            sqlutil.quoted(table.name), sqlutil.quoted(table.columns[index].name),
+        });
+    }
+}
+
 fn queryChildrenForKeys(
     comptime Child: type,
     comptime child_table: schema.Table,
@@ -602,6 +627,7 @@ fn queryChildrenForKeys(
     extra_value: []const u8,
     s: *session_mod.Session,
     arena: std.mem.Allocator,
+    unscoped: bool,
 ) Error!std.ArrayList(Child) {
     if (keys.len == 0) return .empty;
     var aw: std.Io.Writer.Allocating = .init(arena);
@@ -626,6 +652,7 @@ fn queryChildrenForKeys(
         }) catch return error.OutOfMemory;
         params[keys.len] = try value.toParam(extra_value, arena);
     }
+    try appendSoftDeleteScope(w, child_table, unscoped);
     return queryChildrenSql(Child, child_table, w.buffered(), params, s, arena);
 }
 
@@ -660,6 +687,7 @@ fn queryJoinedChildren(
     keys: anytype,
     s: *session_mod.Session,
     arena: std.mem.Allocator,
+    unscoped: bool,
 ) Error!std.ArrayList(JoinedChild(Child, FieldOfT(Parent, assoc.primary_key))) {
     const ParentKey = FieldOfT(Parent, assoc.primary_key);
     const Joined = JoinedChild(Child, ParentKey);
@@ -690,6 +718,7 @@ fn queryJoinedChildren(
         w.print("${d}", .{i + 1}) catch return error.OutOfMemory;
     }
     w.writeByte(')') catch return error.OutOfMemory;
+    try appendSoftDeleteScope(w, child_table, unscoped);
 
     const params = arena.alloc(pq.Param, keys.len) catch return error.OutOfMemory;
     for (keys, 0..) |key, i| params[i] = try value.toParam(key, arena);
@@ -733,11 +762,13 @@ fn queryCompositeChildren(
     comptime parent_keys: []const []const u8,
     s: *session_mod.Session,
     arena: std.mem.Allocator,
+    unscoped: bool,
 ) Error!std.ArrayList(Child) {
     if (rows.len == 0) return .empty;
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
-    w.print("SELECT * FROM {s} WHERE ", .{sqlutil.quoted(schema.tableOf(Child).name)}) catch
+    const child_table = comptime schema.tableOf(Child);
+    w.print("SELECT * FROM {s} WHERE (", .{sqlutil.quoted(child_table.name)}) catch
         return error.OutOfMemory;
     const params = arena.alloc(pq.Param, rows.len * child_keys.len) catch return error.OutOfMemory;
     var param_index: usize = 0;
@@ -753,7 +784,9 @@ fn queryCompositeChildren(
         }
         w.writeByte(')') catch return error.OutOfMemory;
     }
-    return queryChildrenSql(Child, schema.tableOf(Child), w.buffered(), params, s, arena);
+    try w.writeByte(')');
+    try appendSoftDeleteScope(w, child_table, unscoped);
+    return queryChildrenSql(Child, child_table, w.buffered(), params, s, arena);
 }
 
 fn asI64(comptime FT: type, v: FT) ?i64 {

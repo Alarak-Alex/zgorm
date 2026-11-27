@@ -312,23 +312,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
                 try w.writeByte(' ');
                 try appendFragment(w, &params, q.allocator(), fragment_value);
             }
-            var wrote_where = false;
-            for (q.conditions.items) |fragment_value| {
-                try w.writeAll(if (!wrote_where)
-                    " WHERE ("
-                else if (fragment_value.or_with_previous)
-                    " OR ("
-                else
-                    " AND (");
-                try appendFragment(w, &params, q.allocator(), fragment_value);
-                try w.writeByte(')');
-                wrote_where = true;
-            }
-            if (!q.unscoped_flag) if (table.deleted_at_index) |index| {
-                try w.writeAll(if (wrote_where) " AND " else " WHERE ");
-                try writeIdent(w, table.columns[index].name);
-                try w.writeAll(" IS NULL");
-            };
+            try q.appendWhere(w, &params, true);
             if (q.groups.items.len > 0) {
                 try w.writeAll(" GROUP BY ");
                 for (q.groups.items, 0..) |group, i| {
@@ -353,7 +337,11 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
                 }
             }
             if (!count_only) {
-                if (q.limit_value) |limit_value| try w.print(" LIMIT {d}", .{limit_value});
+                if (q.limit_value) |limit_value| {
+                    try w.print(" LIMIT {d}", .{limit_value});
+                } else if (dialect == .mysql and q.offset_value != null) {
+                    try w.writeAll(" LIMIT 18446744073709551615");
+                }
                 if (q.offset_value) |offset_value| try w.print(" OFFSET {d}", .{offset_value});
                 if (q.for_update_flag) try w.writeAll(" FOR UPDATE");
             }
@@ -361,23 +349,22 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
         }
 
         fn appendWhere(q: *Self, w: *std.Io.Writer, params: *std.ArrayList(types.Param), include_scope: bool) Error!void {
-            var wrote_where = false;
-            for (q.conditions.items) |fragment_value| {
-                try w.writeAll(if (!wrote_where)
-                    " WHERE ("
-                else if (fragment_value.or_with_previous)
-                    " OR ("
-                else
-                    " AND (");
+            const scoped = include_scope and !q.unscoped_flag and table.softDeletable();
+            if (q.conditions.items.len == 0 and !scoped) return;
+            try w.writeAll(" WHERE ");
+            if (scoped) {
+                try writeIdent(w, table.columns[table.deleted_at_index.?].name);
+                try w.writeAll(" IS NULL");
+                if (q.conditions.items.len == 0) return;
+                try w.writeAll(" AND (");
+            }
+            for (q.conditions.items, 0..) |fragment_value, i| {
+                if (i > 0) try w.writeAll(if (fragment_value.or_with_previous) " OR " else " AND ");
+                try w.writeByte('(');
                 try appendFragment(w, params, q.allocator(), fragment_value);
                 try w.writeByte(')');
-                wrote_where = true;
             }
-            if (include_scope and !q.unscoped_flag) if (table.deleted_at_index) |index| {
-                try w.writeAll(if (wrote_where) " AND " else " WHERE ");
-                try writeIdent(w, table.columns[index].name);
-                try w.writeAll(" IS NULL");
-            };
+            if (scoped) try w.writeByte(')');
         }
 
         fn appendReturning(q: *Self, w: *std.Io.Writer) Error!void {
@@ -555,6 +542,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
             defer arena_state.deinit();
             const arena = arena_state.allocator();
             var child_query = q.db.query(Child).whereIn(child_key, keys.items);
+            if (q.unscoped_flag) _ = child_query.unscoped();
             if (assoc.polymorphic_type.len > 0)
                 child_query = child_query.whereEq(assoc.polymorphic_type, assoc.polymorphic_value);
             const children = try child_query.all(arena);
@@ -703,11 +691,18 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
             w.writeAll(" WHERE ") catch return error.OutOfMemory;
             try writeQualifiedIdent(w, assoc.join_table, assoc.join_foreign_key);
             w.writeAll(" IN (") catch return error.OutOfMemory;
-            for (keys, 0..) |_, i| {
+            for (keys.items, 0..) |_, i| {
                 if (i > 0) w.writeAll(", ") catch return error.OutOfMemory;
                 w.writeByte('?') catch return error.OutOfMemory;
             }
-            w.writeByte(')') catch return error.OutOfMemory;
+            try w.writeByte(')');
+            if (child_table.deleted_at_index) |index| {
+                if (!q.unscoped_flag) {
+                    try w.writeAll(" AND ");
+                    try writeQualifiedIdent(w, child_table.name, child_table.columns[index].name);
+                    try w.writeAll(" IS NULL");
+                }
+            }
             const params = arena.alloc(types.Param, keys.items.len) catch return error.OutOfMemory;
             for (keys.items, 0..) |key, i| params[i] = try value.toParam(key, arena);
             var result = try q.db.runParams(w.buffered(), params, q.timeout_ms);
@@ -789,31 +784,190 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
             }
         }
 
-        fn buildPkSelect(q: *Self, models: []const T) Error!struct { sql: []const u8, params: []const types.Param } {
+        const Key = [table.pk_indexes.len][]const u8;
+        const KeyContext = struct {
+            pub fn hash(_: @This(), key: Key) u32 {
+                var hasher = std.hash.Wyhash.init(0);
+                std.hash.autoHashStrat(&hasher, key, .Deep);
+                return @truncate(hasher.final());
+            }
+
+            pub fn eql(_: @This(), left: Key, right: Key, _: usize) bool {
+                for (left, right) |a, b| if (!std.mem.eql(u8, a, b)) return false;
+                return true;
+            }
+        };
+        // Insertion order preserves the locking SELECT's order, including across write chunks.
+        const KeySet = std.ArrayHashMapUnmanaged(Key, bool, KeyContext, true);
+        const Mutation = enum { update, delete };
+        const model_columns = blk: {
+            var names: [table.columns.len][]const u8 = undefined;
+            for (table.columns, 0..) |column, i| names[i] = column.name;
+            break :blk names;
+        };
+        const key_columns = blk: {
+            var names: [table.pk_indexes.len][]const u8 = undefined;
+            for (table.pk_indexes, 0..) |column_index, i| names[i] = table.columns[column_index].name;
+            break :blk names;
+        };
+
+        // Both reads append the real primary-key columns after any projected fields.
+        fn rowKey(row: types.Result.Row) Error!Key {
+            var key: Key = undefined;
+            if (row.len < key.len) return error.InvalidModel;
+            for (&key, row[row.len - key.len ..]) |*part, cell| part.* = cell orelse return error.InvalidModel;
+            return key;
+        }
+
+        fn lockedKeyFilter(q: *Self, keys: []const Key) Error!Fragment {
             var aw: std.Io.Writer.Allocating = .init(q.allocator());
             const w = &aw.writer;
-            var params: std.ArrayList(types.Param) = .empty;
-            try w.writeAll("SELECT ");
-            inline for (table.columns, 0..) |column, i| {
+            const params = try q.allocator().alloc(types.Param, keys.len * key_columns.len);
+            try w.writeByte('(');
+            for (key_columns, 0..) |column, i| {
                 if (i != 0) try w.writeAll(", ");
-                try writeIdent(w, column.name);
+                try writeIdent(w, column);
             }
-            try w.writeAll(" FROM ");
-            try writeIdent(w, table.name);
-            try w.writeAll(" WHERE ");
-            for (models, 0..) |*model, model_index| {
-                if (model_index != 0) try w.writeAll(" OR ");
+            try w.writeAll(") IN (");
+            for (keys, 0..) |key, row_index| {
+                if (row_index != 0) try w.writeAll(", ");
                 try w.writeByte('(');
-                inline for (table.pk_indexes, 0..) |column_index, key_index| {
-                    if (key_index != 0) try w.writeAll(" AND ");
-                    const column = table.columns[column_index];
-                    try writeIdent(w, column.name);
-                    try w.writeAll(" = ?");
-                    try params.append(q.allocator(), try value.toParam(value.getColumn(model, column), q.allocator()));
+                inline for (table.pk_indexes, 0..) |column_index, i| {
+                    if (i != 0) try w.writeAll(", ");
+                    try w.writeByte('?');
+                    // Bind the text-protocol value directly so a model codec or hook cannot change the key.
+                    params[row_index * key.len + i] = .{ .data = key[i], .kind = switch (table.columns[column_index].kind) {
+                        .integer, .boolean => .signed,
+                        .unsigned => .unsigned,
+                        .float => .float,
+                        .bytes => .bytes,
+                        else => .text,
+                    } };
                 }
                 try w.writeByte(')');
             }
-            return .{ .sql = w.buffered(), .params = params.items };
+            try w.writeByte(')');
+            return .{ .sql = w.buffered(), .params = params };
+        }
+
+        fn lockReturningRows(q: *Self, required: []const []const u8) Error!types.Result {
+            // Preserve the original select list for positional ORDER BY expressions.
+            const leading = if (q.columns.len == 0 and q.orders.items.len != 0) &model_columns else q.columns;
+            q.columns = try std.mem.concat(q.allocator(), []const u8, &.{ leading, required });
+            if (q.joins.items.len != 0) {
+                const expressions = try q.allocator().alloc([]const u8, q.columns.len);
+                for (q.columns, 0..) |column, i| {
+                    var aw: std.Io.Writer.Allocating = .init(q.allocator());
+                    if (i >= leading.len or table.hasColumn(column)) {
+                        try writeQualifiedIdent(&aw.writer, table.name, column);
+                    } else try writeIdent(&aw.writer, column);
+                    expressions[i] = aw.writer.buffered();
+                }
+                q.raw_columns = expressions;
+            }
+            q.for_update_flag = true;
+            const selection = try q.buildSelect(false);
+            return q.db.runParams(selection.sql, selection.params, q.timeout_ms);
+        }
+
+        fn mysqlReturning(q: *Self, comptime operation: Mutation, sets: anytype, gpa: std.mem.Allocator) Error![]T {
+            if (q.build_error) |err| return err;
+            if (key_columns.len == 0) return error.InvalidModel;
+            // Aggregates, unions and a CTE shadowing the target can produce rows outside the locked base table.
+            if (q.raw_columns.len != 0 or q.is_distinct or q.ctes.items.len != 0 or q.groups.items.len != 0 or
+                q.having_fragments.items.len != 0 or q.unions.items.len != 0) return error.InvalidQuery;
+            const set_count = @typeInfo(@TypeOf(sets)).@"struct".field_names.len;
+            if (operation == .update) {
+                if (set_count == 0) return error.InvalidQuery;
+                inline for (key_columns) |column| if (@hasField(@TypeOf(sets), column)) return error.InvalidQuery;
+            }
+            if (set_count + key_columns.len > dialect.maxParameters()) return error.InvalidQuery;
+            const chunk_size = (dialect.maxParameters() - set_count) / key_columns.len;
+            const projection = if (q.returning_columns.len != 0) q.returning_columns else &model_columns;
+            const output_columns = try std.mem.concat(q.allocator(), []const u8, &.{ projection, &key_columns });
+            var tx = try q.db.begin();
+            errdefer tx.rollback() catch {};
+            var locked = try q.lockReturningRows(if (operation == .delete) output_columns else &key_columns);
+            defer locked.deinit();
+            var keys: KeySet = .empty;
+            for (locked.rows) |row| {
+                const entry = try keys.getOrPut(q.allocator(), try rowKey(row));
+                if (entry.found_existing) {
+                    if (q.joins.items.len == 0) return error.InvalidModel;
+                    continue;
+                }
+                entry.value_ptr.* = false;
+                locked.rows[entry.index] = row;
+            }
+            locked.rows = locked.rows[0..keys.count()];
+            q.raw_columns = &.{};
+            q.joins.clearRetainingCapacity();
+            q.orders.clearRetainingCapacity();
+            q.limit_value = null;
+            q.offset_value = null;
+            q.columns = output_columns;
+
+            const output = if (operation == .delete) deleted: {
+                const start = locked.columns.len - output_columns.len;
+                locked.columns = locked.columns[start..][0..projection.len];
+                for (locked.rows) |*row| row.* = row.*[start..][0..projection.len];
+                const rows = try q.decodeRows(&locked, gpa);
+                errdefer value.freeSlice(T, rows, gpa);
+                _ = try q.mutateLockedKeys(operation, sets, keys.keys(), chunk_size);
+                break :deleted rows;
+            } else updated: {
+                const filters = try q.mutateLockedKeys(operation, sets, keys.keys(), chunk_size);
+                break :updated try q.readUpdatedRows(&locked, &keys, filters, projection.len, gpa);
+            };
+            errdefer value.freeSlice(T, output, gpa);
+            try tx.commit();
+            return output;
+        }
+
+        fn mutateLockedKeys(q: *Self, comptime operation: Mutation, sets: anytype, keys: []const Key, chunk_size: usize) Error![]const Fragment {
+            var filters: std.ArrayList(Fragment) = .empty;
+            var chunks = std.mem.window(Key, keys, chunk_size, chunk_size);
+            while (chunks.next()) |chunk| {
+                const filter = try q.lockedKeyFilter(chunk);
+                if (operation == .update) try filters.append(q.allocator(), filter);
+                q.conditions.clearRetainingCapacity();
+                try q.conditions.append(q.allocator(), filter);
+                const mutation = if (operation == .delete) try q.buildDelete(false) else try q.buildUpdate(sets, false);
+                var write = try q.db.runParams(mutation.sql, mutation.params, q.timeout_ms);
+                defer write.deinit();
+                if (write.affected > chunk.len or (operation == .delete and write.affected != chunk.len)) return error.InvalidModel;
+            }
+            return filters.items;
+        }
+
+        fn readUpdatedRows(q: *Self, locked: *types.Result, keys: *KeySet, filters: []const Fragment, projection_len: usize, gpa: std.mem.Allocator) Error![]T {
+            if (filters.len == 0) return gpa.alloc(T, 0);
+            var results = try std.ArrayList(types.Result).initCapacity(q.allocator(), filters.len);
+            defer for (results.items) |*result| result.deinit();
+            {
+                // A user can update deleted_at, so the readback must include every captured key.
+                const original_scope = q.unscoped_flag;
+                q.unscoped_flag = true;
+                defer q.unscoped_flag = original_scope;
+                var start: usize = 0;
+                for (filters) |filter| {
+                    q.conditions.items[0] = filter;
+                    const select_sql = try q.buildSelect(false);
+                    const result = try q.db.runParams(select_sql.sql, select_sql.params, q.timeout_ms);
+                    results.appendAssumeCapacity(result);
+                    const end = start + filter.params.len / key_columns.len;
+                    if (result.rows.len != end - start) return error.InvalidModel;
+                    for (result.rows) |row| {
+                        const pos = keys.getIndex(try rowKey(row)) orelse return error.InvalidModel;
+                        if (pos < start or pos >= end or keys.values()[pos]) return error.InvalidModel;
+                        keys.values()[pos] = true;
+                        locked.rows[pos] = row;
+                    }
+                    start = end;
+                }
+            }
+            locked.columns = results.items[0].columns[0..projection_len];
+            return q.decodeRows(locked, gpa);
         }
 
         pub fn all(q: *Self, gpa: std.mem.Allocator) Error![]T {
@@ -859,21 +1013,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
 
         pub fn deleteReturning(q: *Self, gpa: std.mem.Allocator) Error![]T {
             defer q.deinit();
-            if (comptime dialect == .mysql) {
-                try q.db.backend.beginTransaction();
-                errdefer q.db.backend.rollback() catch {};
-                q.for_update_flag = true;
-                const selected = try q.buildSelect(false);
-                var selected_result = try q.db.runParams(selected.sql, selected.params, q.timeout_ms);
-                defer selected_result.deinit();
-                const output = try q.decodeRows(&selected_result, gpa);
-                errdefer value.freeSlice(T, output, gpa);
-                const mutation = try q.buildDelete(false);
-                var mutation_result = try q.db.runParams(mutation.sql, mutation.params, q.timeout_ms);
-                mutation_result.deinit();
-                try q.db.backend.commit();
-                return output;
-            }
+            if (comptime dialect == .mysql) return q.mysqlReturning(.delete, .{}, gpa);
             const built = try q.buildDelete(true);
             var result = try q.db.runParams(built.sql, built.params, q.timeout_ms);
             defer result.deinit();
@@ -890,30 +1030,7 @@ pub fn Query(comptime Db: type, comptime dialect: dialect_mod.Dialect, comptime 
 
         pub fn updateReturning(q: *Self, sets: anytype, gpa: std.mem.Allocator) Error![]T {
             defer q.deinit();
-            if (comptime dialect == .mysql) {
-                try q.db.backend.beginTransaction();
-                errdefer q.db.backend.rollback() catch {};
-                q.for_update_flag = true;
-                const selected = try q.buildSelect(false);
-                var selected_result = try q.db.runParams(selected.sql, selected.params, q.timeout_ms);
-                defer selected_result.deinit();
-                const before = try q.decodeRows(&selected_result, gpa);
-                errdefer value.freeSlice(T, before, gpa);
-                const mutation = try q.buildUpdate(sets, false);
-                var mutation_result = try q.db.runParams(mutation.sql, mutation.params, q.timeout_ms);
-                mutation_result.deinit();
-                if (before.len == 0) {
-                    try q.db.backend.commit();
-                    return before;
-                }
-                const selected_after = try q.buildPkSelect(before);
-                var after_result = try q.db.runParams(selected_after.sql, selected_after.params, q.timeout_ms);
-                defer after_result.deinit();
-                const after = try q.decodeRows(&after_result, gpa);
-                value.freeSlice(T, before, gpa);
-                try q.db.backend.commit();
-                return after;
-            }
+            if (comptime dialect == .mysql) return q.mysqlReturning(.update, sets, gpa);
             const built = try q.buildUpdate(sets, true);
             var result = try q.db.runParams(built.sql, built.params, q.timeout_ms);
             defer result.deinit();

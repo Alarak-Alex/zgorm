@@ -46,17 +46,15 @@ pub fn main(init: std.process.Init) !void {
 
     // ---- the whole request/task runs on one arena -------------------------
     var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit(); // the only release point
+    defer arena_state.deinit(); // Reclaim decoded models together.
     const arena = arena_state.allocator();
 
     // Writes need no release: insert stamps ids/timestamps into your structs.
-    var author = Author{
-        .name = "Ada",
-        .posts = @constCast(&[_]Post{
-            .{ .title = "hello arena" },
-            .{ .title = "one deinit to free them all" },
-        }),
+    var posts = [_]Post{
+        .{ .title = "hello arena" },
+        .{ .title = "one deinit to free them all" },
     };
+    var author = Author{ .name = "Ada", .posts = &posts };
     try db.insert(&author); // saves the posts association too
 
     // all(arena): rows, strings and preloaded children all live in the arena.
@@ -79,6 +77,12 @@ pub fn main(init: std.process.Init) !void {
         one.name,
         if (first_post) |p| p.title else "<none>",
     });
+
+    {
+        var rows = try s.query(Post).order_by("id").stream(arena);
+        defer rows.deinit(); // Return the connection even when only one row is read.
+        if (try rows.next()) |post| std.debug.print("stream: {s}\n", .{post.title});
+    }
 
     // Raw exec still returns an owning Result; deinit it as usual.
     // (::text keeps the cell readable — exec cells default to binary format.)

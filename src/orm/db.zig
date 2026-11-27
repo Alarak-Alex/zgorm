@@ -92,16 +92,7 @@ pub const Db = struct {
     /// are owned by the returned Db and live until `deinit` — the caller's
     /// DSN buffer may be freed immediately after this call.
     pub fn connectDsn(gpa: std.mem.Allocator, io: std.Io, dsn: []const u8, max_connections: usize) Error!*Db {
-        const arena = try gpa.create(std.heap.ArenaAllocator);
-        errdefer gpa.destroy(arena);
-        arena.* = std.heap.ArenaAllocator.init(gpa);
-        errdefer arena.deinit();
-
-        const cfg = try pq.parseDsn(arena.allocator(), dsn);
-        const d = try connect(gpa, io, cfg, max_connections);
-        // connect succeeded: hand the arena over to the Db.
-        d.cfg_arena = arena;
-        return d;
+        return connectDsnWithOptions(gpa, io, dsn, .{ .max_connections = max_connections });
     }
 
     pub fn connectDsnWithOptions(gpa: std.mem.Allocator, io: std.Io, dsn: []const u8, options: pool_mod.Options) Error!*Db {
@@ -110,7 +101,9 @@ pub const Db = struct {
         arena.* = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
 
-        const cfg = try pq.parseDsn(arena.allocator(), dsn);
+        // Unescaped configuration strings are slices of the parser input.
+        const owned_dsn = try arena.allocator().dupe(u8, dsn);
+        const cfg = try pq.parseDsn(arena.allocator(), owned_dsn);
         const d = try connectWithOptions(gpa, io, cfg, options);
         d.cfg_arena = arena;
         return d;

@@ -42,7 +42,7 @@ fn poolPing(db: *Db) Error!void {
 }
 
 fn poolHealthy(db: *Db) bool {
-    _ = db;
+    if (db.inTransaction() catch return false) db.rollback() catch return false;
     return true;
 }
 
@@ -56,6 +56,7 @@ pub const Result = types.Result;
 pub const Db = struct {
     gpa: std.mem.Allocator,
     handle: *c.sqlite3,
+    transaction_state: @import("../shared/backend.zig").TransactionState = .{},
     last_error: ?types.ServerError = null,
     err_arena: std.heap.ArenaAllocator,
     io: ?std.Io = null,
@@ -109,6 +110,7 @@ pub const Db = struct {
     }
 
     pub fn deinit(db: *Db) void {
+        db.transaction_state.scopes.deinit(db.gpa);
         var it = db.stmt_cache.valueIterator();
         while (it.next()) |entry| {
             _ = c.sqlite3_finalize(entry.stmt);
@@ -127,6 +129,7 @@ pub const Db = struct {
 
     pub fn execParams(db: *Db, sql: []const u8, params: []const Param) Error!Result {
         const stmt = try db.acquireStmt(sql);
+        defer if (c.sqlite3_get_autocommit(db.handle) != 0) db.transaction_state.scopes.clearRetainingCapacity();
         // Reset on every exit so the cached statement is reusable; bindings
         // and any partial step state are cleared before the next acquire.
         defer _ = c.sqlite3_reset(stmt);
@@ -284,6 +287,10 @@ pub const Db = struct {
             c.SQLITE_MISMATCH => error.TypeMismatch,
             else => error.QueryFailed,
         };
+    }
+
+    pub fn inTransaction(db: *Db) Error!bool {
+        return c.sqlite3_get_autocommit(db.handle) == 0;
     }
 
     pub fn beginTransaction(db: *Db) Error!void {

@@ -80,10 +80,10 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("inserted id={?d}\n", .{u.base.id});
 
     const found = (try db.find(User, u.base.id.?)).?;
+    defer zg.free(User, found, gpa);
     std.debug.print("found: {s} {s} age={d} active={} balance={d}\n", .{
         found.name, found.email.?, found.age, found.active, found.balance,
     });
-    defer zg.free(User, found, gpa);
 
     var upd = found;
     upd.age = 31;
@@ -135,6 +135,7 @@ pub fn main(init: std.process.Init) !void {
 
     var one = try zg.query(User, db).whereEq("name", "Bob").first();
     if (one) |*b| {
+        defer zg.free(User, b.*, gpa);
         _ = try db.delete(b);
         std.debug.print("deleted Bob\n", .{});
     }
@@ -161,8 +162,8 @@ pub fn main(init: std.process.Init) !void {
 
     const preloaded = try zg.query(Post, db).preload("author").whereEq("title", "rich post").first();
     if (preloaded) |p| {
+        defer zg.free(Post, p, gpa);
         std.debug.print("preloaded post author: {s}\n", .{p.author.?.name});
-        zg.free(Post, p, gpa);
     }
 
     const total = try zg.query(User, db).count();
@@ -171,6 +172,5 @@ pub fn main(init: std.process.Init) !void {
         plugin_metrics.queries.load(.monotonic),
         plugin_metrics.mutations.load(.monotonic),
     });
-    zg.free(User, one.?, gpa);
     std.debug.print("smoke OK\n", .{});
 }

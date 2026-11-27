@@ -1,10 +1,14 @@
 //! Integration tests against a real PostgreSQL server.
 //! Run with:  ZORM_DSN="postgres://user:pass@host:5432/db" zig build test-integration
-//! Without ZORM_DSN the tests are skipped.
+//! A local run skips database tests without a DSN. CI requires one.
 
 const std = @import("std");
 const zg = @import("zgorm");
-const test_options = @import("test_options");
+const pg_config = @import("postgres_config.zig");
+
+test {
+    _ = @import("postgres_write_regressions.zig");
+}
 
 const User = struct {
     id: ?i64 = null,
@@ -80,6 +84,7 @@ const CompositeRow = struct {
 
 const CompositeChild = struct {
     id: ?i64 = null,
+    deleted_at: ?zg.Time = null,
     tenant_id: i64,
     parent_code: []const u8,
     body: []const u8 = "",
@@ -121,6 +126,7 @@ const AssocNote = struct {
 
 const AssocTag = struct {
     id: ?i64 = null,
+    deleted_at: ?zg.Time = null,
     name: []const u8 = "",
     pub const zgorm = .{ .table = "zgorm_assoc_tags" };
 };
@@ -204,13 +210,23 @@ fn backendPid(db: *zg.Db) !i64 {
     return try std.fmt.parseInt(i64, result.rows[0][0].?, 10);
 }
 
-fn makeDb(gpa: std.mem.Allocator, io: std.Io) !?*zg.Db {
-    const dsn = test_options.dsn orelse {
-        std.debug.print("no DSN given; skipping integration tests\n", .{});
-        std.debug.print("run: zig build test-integration -Ddsn='postgres://user:pass@host:5432/db'\n", .{});
-        return null;
-    };
-    return try zg.Db.connectDsn(gpa, io, dsn, 4);
+fn makeDb(gpa: std.mem.Allocator, io: std.Io) !*zg.Db {
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
+    return zg.Db.connectDsn(gpa, io, dsn, 4);
+}
+
+test "pool can reconnect after the caller overwrites its DSN buffer" {
+    const gpa = std.testing.allocator;
+    const dsn = try pg_config.dsn();
+    defer gpa.free(dsn);
+    const db = try zg.Db.connectDsnWithOptions(gpa, std.testing.io, dsn, .{
+        .max_connections = 1,
+        .max_idle_connections = 0,
+    });
+    defer db.deinit();
+    @memset(dsn, 0);
+    try db.ping();
 }
 
 test "full orm lifecycle" {
@@ -222,7 +238,7 @@ test "full orm lifecycle" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const db = (try makeDb(gpa, io)) orelse return;
+    const db = try makeDb(gpa, io);
     defer db.deinit();
 
     drop(try db.execRaw("DROP TABLE IF EXISTS \"user\" CASCADE"));
@@ -405,6 +421,7 @@ const Matrix = struct {
 
 const Comment = struct {
     id: ?i64 = null,
+    deleted_at: ?zg.Time = null,
     post_id: ?i64 = null,
     text: []const u8 = "",
 
@@ -466,7 +483,7 @@ test "v2: binary params, arrays, jsonb, bytea round trip" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    const db = try makeDb(gpa, threaded.io());
     defer db.deinit();
 
     drop(try db.execRaw("DROP TABLE IF EXISTS v2_posts CASCADE"));
@@ -524,7 +541,7 @@ test "v2: associations and preloading" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    const db = try makeDb(gpa, threaded.io());
     defer db.deinit();
 
     drop(try db.execRaw("DROP TABLE IF EXISTS v2_posts CASCADE"));
@@ -579,7 +596,7 @@ test "v2: model hooks" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    const db = try makeDb(gpa, threaded.io());
     defer db.deinit();
 
     drop(try db.execRaw("DROP TABLE IF EXISTS v2_hooked CASCADE"));
@@ -633,7 +650,7 @@ test "v2: savepoints and nested transactions" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    const db = try makeDb(gpa, threaded.io());
     defer db.deinit();
 
     drop(try db.execRaw("DROP TABLE IF EXISTS v2_hooked CASCADE"));
@@ -691,7 +708,7 @@ test "v2: nested preloading and 2-D arrays" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    const db = try makeDb(gpa, threaded.io());
     defer db.deinit();
 
     drop(try db.execRaw("DROP TABLE IF EXISTS v2_comments CASCADE"));
@@ -712,6 +729,7 @@ test "v2: nested preloading and 2-D arrays" {
         .{ .post_id = posts[0].id, .text = "nice" },
         .{ .post_id = posts[0].id, .text = "again" },
         .{ .post_id = posts[1].id, .text = "meh" },
+        .{ .post_id = posts[0].id, .text = "archived", .deleted_at = zg.Time.now(threaded.io()) },
     };
     try db.insertBatch(&comments);
 
@@ -725,6 +743,13 @@ test "v2: nested preloading and 2-D arrays" {
     try std.testing.expectEqualStrings("again", authors[0].posts[0].comments[1].text);
     try std.testing.expectEqual(@as(usize, 1), authors[0].posts[1].comments.len);
     try std.testing.expectEqualStrings("meh", authors[0].posts[1].comments[0].text);
+
+    const unscoped = (try zg.query(BlogAuthor, db).unscoped().whereEq("id", alice.id)
+        .preload("posts.comments").first()).?;
+    defer zg.free(BlogAuthor, unscoped, gpa);
+    for (unscoped.posts) |post| {
+        if (post.id == posts[0].id) try std.testing.expectEqual(@as(usize, 3), post.comments.len);
+    }
 
     // 2-D array column (bigint[] holding {{1,2},{3,4}})
     var m = Matrix{ .name = "m1", .cells = &.{ &.{ 1, 2 }, &.{ 3, 4 } } };
@@ -747,7 +772,7 @@ test "v2: migration versioning" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    const db = try makeDb(gpa, threaded.io());
     defer db.deinit();
 
     drop(try db.execRaw("DROP TABLE IF EXISTS m_demo CASCADE"));
@@ -802,7 +827,7 @@ test "v5: migration schema operations, diffs, checksums, and dirty state" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    const db = try makeDb(gpa, threaded.io());
     defer db.deinit();
 
     drop(try db.execRaw("DROP TABLE IF EXISTS v5_migration_child CASCADE"));
@@ -907,7 +932,7 @@ test "v3: embedded zgorm.Model round trip and soft delete" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    const db = try makeDb(gpa, threaded.io());
     defer db.deinit();
 
     drop(try db.execRaw("DROP TABLE IF EXISTS v3_embedded_users CASCADE"));
@@ -992,7 +1017,7 @@ test "v4: default logger traces queries and can be replaced" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    const db = try makeDb(gpa, threaded.io());
     defer db.deinit();
 
     // Default logger: warn level, must stay silent for a successful fast query.
@@ -1027,7 +1052,7 @@ test "query builder logs every terminal operation" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    const db = try makeDb(gpa, threaded.io());
     defer db.deinit();
 
     drop(try db.execRaw("DROP TABLE IF EXISTS query_log_entry CASCADE"));
@@ -1100,7 +1125,8 @@ test "v3: issue fixes regression" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const dsn = test_options.dsn orelse return error.SkipZigTest;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
 
     // Issue #5: a failed connect (wrong password) must not leak conn state.
     // The DebugAllocator above reports leaks on deinit, so this test failing
@@ -1197,7 +1223,7 @@ test "v4: soft delete semantics" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    const db = try makeDb(gpa, threaded.io());
     defer db.deinit();
 
     drop(try db.execRaw("DROP TABLE IF EXISTS v4_soft CASCADE"));
@@ -1218,6 +1244,16 @@ test "v4: soft delete semantics" {
     try std.testing.expect((try db.find(SoftPost, b.id.?)) == null);
     try std.testing.expectEqual(@as(i64, 0), try zg.query(SoftPost, db).whereEq("title", "doomed").count());
     try std.testing.expectEqual(@as(i64, 2), try zg.query(SoftPost, db).count());
+
+    const either = zg.query(SoftPost, db).whereEq("id", a.id).orWhere("id = $1", .{b.id});
+    try std.testing.expectEqual(@as(i64, 1), try either.count());
+    const changed = try zg.query(SoftPost, db).whereEq("id", a.id).orWhere("id = $1", .{b.id})
+        .updateReturning(.{ .title = "alive" }, gpa);
+    defer zg.freeSlice(SoftPost, changed, gpa);
+    try std.testing.expectEqual(@as(usize, 1), changed.len);
+    try std.testing.expectEqual(a.id, changed[0].id);
+    try std.testing.expectEqual(@as(i64, 0), try zg.query(SoftPost, db)
+        .whereEq("title", "missing").orWhere("id = $1", .{b.id}).delete());
 
     // Update does not touch soft-deleted rows.
     _ = try db.updateWhere(SoftPost, .{ .title = "x" }, "title = $1", .{"doomed"});
@@ -1271,7 +1307,8 @@ test "v4: soft delete semantics" {
 }
 
 test "prepared statement cache keys by SQL and OIDs and evicts LRU" {
-    const dsn = test_options.dsn orelse return;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -1307,7 +1344,8 @@ test "prepared statement cache keys by SQL and OIDs and evicts LRU" {
 }
 
 test "prepared statement cache reparses an invalidated PostgreSQL plan" {
-    const dsn = test_options.dsn orelse return;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -1339,7 +1377,7 @@ test "prepared statement cache reparses an invalidated PostgreSQL plan" {
 }
 
 test "query deadline sends CancelRequest and leaves connection reusable" {
-    const db = (try makeDb(std.testing.allocator, std.testing.io)) orelse return;
+    const db = try makeDb(std.testing.allocator, std.testing.io);
     defer db.deinit();
     db.setLogger(zg.Logger.discard);
 
@@ -1348,7 +1386,8 @@ test "query deadline sends CancelRequest and leaves connection reusable" {
 }
 
 test "explicit PostgreSQL CancelRequest reports QueryCanceled" {
-    const dsn = test_options.dsn orelse return;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
@@ -1377,7 +1416,8 @@ test "explicit PostgreSQL CancelRequest reports QueryCanceled" {
 }
 
 test "network read timeout retires and rebuilds the connection" {
-    const dsn = test_options.dsn orelse return;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
@@ -1394,7 +1434,8 @@ test "network read timeout retires and rebuilds the connection" {
 }
 
 test "pool acquire and transaction deadlines return distinct errors" {
-    const dsn = test_options.dsn orelse return;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
@@ -1418,7 +1459,8 @@ test "pool acquire and transaction deadlines return distinct errors" {
 }
 
 test "pool hands connections to waiters in FIFO order without barging" {
-    const dsn = test_options.dsn orelse return;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
@@ -1477,7 +1519,8 @@ test "pool hands connections to waiters in FIFO order without barging" {
 }
 
 test "pool bounds concurrent connection establishment" {
-    const dsn = test_options.dsn orelse return;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
@@ -1529,7 +1572,8 @@ test "pool bounds concurrent connection establishment" {
 }
 
 test "pool prewarms minimum idle and enforces maximum idle" {
-    const dsn = test_options.dsn orelse return;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
@@ -1570,7 +1614,8 @@ test "pool prewarms minimum idle and enforces maximum idle" {
 }
 
 test "pool background maintenance replaces lifetime and idle expirations" {
-    const dsn = test_options.dsn orelse return;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
@@ -1603,7 +1648,8 @@ test "pool background maintenance replaces lifetime and idle expirations" {
 }
 
 test "pool health check rebuilds a terminated connection" {
-    const dsn = test_options.dsn orelse return;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
@@ -1634,7 +1680,7 @@ test "pool health check rebuilds a terminated connection" {
 }
 
 test "streaming model rows support early close, CSV, and iterator errors" {
-    const db = (try makeDb(std.testing.allocator, std.testing.io)) orelse return;
+    const db = try makeDb(std.testing.allocator, std.testing.io);
     defer db.deinit();
     db.setLogger(zg.Logger.discard);
     drop(try db.execRaw("DROP TABLE IF EXISTS zgorm_stream_rows"));
@@ -1701,7 +1747,8 @@ test "streaming model rows support early close, CSV, and iterator errors" {
 }
 
 test "structured events, spans, metrics, slow SQL, and Prometheus output" {
-    const dsn = test_options.dsn orelse return;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const cfg = try zg.pq.parseDsn(arena_state.allocator(), dsn);
@@ -1786,7 +1833,8 @@ test "optimistic locking detects conflicts and batches roll back atomically" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const dsn = test_options.dsn orelse return error.SkipZigTest;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     const db = try zg.Db.connectDsn(gpa, threaded.io(), dsn, 4);
     defer db.deinit();
 
@@ -1856,7 +1904,8 @@ test "upsert supports conflict policies, excluded updates, batches, and returnin
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const dsn = test_options.dsn orelse return error.SkipZigTest;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     const db = try zg.Db.connectDsn(gpa, threaded.io(), dsn, 4);
     defer db.deinit();
 
@@ -1895,7 +1944,8 @@ test "RETURNING supports insert projections, batches, update, and delete" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const dsn = test_options.dsn orelse return error.SkipZigTest;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     const db = try zg.Db.connectDsn(gpa, threaded.io(), dsn, 4);
     defer db.deinit();
 
@@ -1950,7 +2000,8 @@ test "query builder supports advanced PostgreSQL composition" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const dsn = test_options.dsn orelse return error.SkipZigTest;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     const db = try zg.Db.connectDsn(gpa, threaded.io(), dsn, 4);
     defer db.deinit();
 
@@ -2028,7 +2079,8 @@ test "composite primary keys migrate and drive find update delete and upsert" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const dsn = test_options.dsn orelse return error.SkipZigTest;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     const db = try zg.Db.connectDsn(gpa, threaded.io(), dsn, 4);
     defer db.deinit();
 
@@ -2065,9 +2117,12 @@ test "composite primary keys migrate and drive find update delete and upsert" {
     try db.autoMigrateAll(.{ CompositeParent, CompositeChild });
     var parent = CompositeParent{ .tenant_id = 7, .code = "parent", .name = "p" };
     try db.insert(&parent);
+    var second = CompositeParent{ .tenant_id = 8, .code = "parent", .name = "q" };
+    try db.insert(&second);
     var children = [_]CompositeChild{
         .{ .tenant_id = 7, .parent_code = "parent", .body = "match" },
         .{ .tenant_id = 8, .parent_code = "parent", .body = "other tenant" },
+        .{ .tenant_id = 7, .parent_code = "parent", .body = "hidden", .deleted_at = zg.Time.now(threaded.io()) },
     };
     try db.insertBatch(&children);
     const loaded = (try zg.query(CompositeParent, db)
@@ -2077,6 +2132,10 @@ test "composite primary keys migrate and drive find update delete and upsert" {
     defer zg.free(CompositeParent, loaded, gpa);
     try std.testing.expectEqual(@as(usize, 1), loaded.children.len);
     try std.testing.expectEqualStrings("match", loaded.children[0].body);
+    const both = try zg.query(CompositeParent, db).order_by("tenant_id").preload("children").all(gpa);
+    defer zg.freeSlice(CompositeParent, both, gpa);
+    try std.testing.expectEqual(@as(usize, 2), both.len);
+    for (both) |item| try std.testing.expectEqual(@as(usize, 1), item.children.len);
 
     try std.testing.expectEqual(@as(i64, 1), try db.delete(&replacement));
     try std.testing.expect((try db.find(CompositeRow, .{ @as(i64, 7), "alpha" })) == null);
@@ -2088,7 +2147,8 @@ test "association mode covers singular many-to-many polymorphic and cascades" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const dsn = test_options.dsn orelse return error.SkipZigTest;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     const db = try zg.Db.connectDsn(gpa, threaded.io(), dsn, 4);
     defer db.deinit();
 
@@ -2125,6 +2185,14 @@ test "association mode covers singular many-to-many polymorphic and cascades" {
     try std.testing.expectEqual(@as(usize, 1), loaded.notes.len);
     try std.testing.expectEqual(@as(usize, 1), loaded.tags.len);
 
+    _ = try db.delete(&tags[0]);
+    const scoped = (try zg.query(AssocOwner, db).whereEq("id", owner.id).preload("tags").first()).?;
+    defer zg.free(AssocOwner, scoped, gpa);
+    try std.testing.expectEqual(@as(usize, 0), scoped.tags.len);
+    const unscoped = (try zg.query(AssocOwner, db).unscoped().whereEq("id", owner.id).preload("tags").first()).?;
+    defer zg.free(AssocOwner, unscoped, gpa);
+    try std.testing.expectEqual(@as(usize, 1), unscoped.tags.len);
+
     var tag_assoc = db.association(&owner, "tags");
     try std.testing.expectEqual(@as(i64, 1), try tag_assoc.count());
     var extra = AssocTag{ .name = "extra" };
@@ -2149,7 +2217,8 @@ test "custom codecs cover PostgreSQL scalar and user-defined formats" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const dsn = test_options.dsn orelse return error.SkipZigTest;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     var cfg_arena = std.heap.ArenaAllocator.init(gpa);
     defer cfg_arena.deinit();
     var cfg = try zg.pq.parseDsn(cfg_arena.allocator(), dsn);
@@ -2191,17 +2260,18 @@ test "custom codecs cover PostgreSQL scalar and user-defined formats" {
 }
 
 test "v5: primary replica tenant and shard routing" {
-    const dsn = test_options.dsn orelse return;
+    const dsn = try pg_config.dsn();
+    defer std.testing.allocator.free(dsn);
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const primary = (try makeDb(gpa, threaded.io())) orelse return;
+    const primary = try makeDb(gpa, threaded.io());
     defer primary.deinit();
-    const replica_a = (try makeDb(gpa, threaded.io())) orelse return;
+    const replica_a = try makeDb(gpa, threaded.io());
     defer replica_a.deinit();
-    const replica_b = (try makeDb(gpa, threaded.io())) orelse return;
+    const replica_b = try makeDb(gpa, threaded.io());
     defer replica_b.deinit();
 
     var router = zg.Router.init(gpa, primary, &.{ replica_a, replica_b });
@@ -2289,7 +2359,7 @@ test "v5: global callbacks and production plugins" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    const db = try makeDb(gpa, threaded.io());
     defer db.deinit();
     drop(try db.execRaw("DROP TABLE IF EXISTS v5_plugin_rows"));
     try db.autoMigrate(PluginRow);
@@ -2358,7 +2428,7 @@ test "v5: explicit transaction retries are bounded and selective" {
     const gpa = gpa_state.allocator();
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const db = (try makeDb(gpa, threaded.io())) orelse return;
+    const db = try makeDb(gpa, threaded.io());
     defer db.deinit();
     drop(try db.execRaw("DROP TABLE IF EXISTS v5_retry_log"));
     drop(try db.execRaw("CREATE TABLE v5_retry_log (attempts bigint)"));

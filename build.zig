@@ -70,10 +70,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    // Integration tests against a real PostgreSQL. Skipped unless a DSN is
-    // provided:  zig build test-integration -Ddsn='postgres://...'
-    const test_options = b.addOptions();
-    test_options.addOption(?[]const u8, "dsn", dsn_opt);
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/integration.zig"),
@@ -81,14 +77,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zgorm", .module = mod },
-                .{ .name = "test_options", .module = test_options.createModule() },
             },
         }),
     });
-    // The test binary inherits the invoking environment, so ZORM_DSN set on
-    // the `zig build` command line is visible to it.
     const run_integration = b.addRunArtifact(integration_tests);
-    const integration_step = b.step("test-integration", "Run integration tests (requires ZORM_DSN)");
+    if (dsn_opt) |dsn| run_integration.setEnvironmentVariable("ZORM_DSN", dsn);
+    run_integration.has_side_effects = true;
+    const integration_step = b.step("test-integration", "Run integration tests against PostgreSQL (-Ddsn or ZORM_DSN)");
     integration_step.dependOn(&run_integration.step);
 
     const driver_options = b.addOptions();
@@ -111,6 +106,7 @@ pub fn build(b: *std.Build) void {
     });
     driver_tests.root_module.linkSystemLibrary("sqlite3", .{});
     const run_driver_tests = b.addRunArtifact(driver_tests);
+    run_driver_tests.has_side_effects = mysql_port != null;
     const driver_step = b.step("test-drivers", "Run SQLite and optional MySQL driver tests");
     driver_step.dependOn(&run_driver_tests.step);
 

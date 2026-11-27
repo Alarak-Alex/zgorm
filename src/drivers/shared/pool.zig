@@ -141,8 +141,10 @@ pub fn Pool(
         }
 
         fn release(pool: *Self, backend: Backend) void {
+            // Resetting an open transaction can perform I/O.
+            const reusable = healthyFn(backend);
             pool.mutex.lockUncancelable(pool.io);
-            if (pool.closed or !healthyFn(backend)) {
+            if (pool.closed or !reusable) {
                 pool.total -= 1;
                 pool.condition.signal(pool.io);
                 pool.mutex.unlock(pool.io);

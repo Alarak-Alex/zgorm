@@ -44,7 +44,12 @@ fn poolPing(conn: *Conn) Error!void {
 }
 
 fn poolHealthy(conn: *Conn) bool {
-    return !conn.broken;
+    if (conn.inTransaction() catch return false) {
+        conn.rollback() catch return false;
+        if (conn.status_flags & Conn.status_autocommit == 0)
+            conn.execControl("SET SESSION autocommit = DEFAULT") catch return false;
+    }
+    return true;
 }
 
 pub const Pool = pool_mod.Pool(*Conn, PoolContext, poolCreate, poolDestroy, poolPing, poolHealthy);
@@ -75,9 +80,15 @@ pub const Conn = struct {
 
     query_timeout_ms: u64 = 0,
     broken: bool = false,
+    transaction_state: @import("../shared/backend.zig").TransactionState = .{},
+    status_flags: u16 = 0,
+    status_known: bool = false,
     prepared_cache_size: usize = 64,
     prepared_next_id: u64 = 1,
     prepared: std.StringHashMapUnmanaged(PreparedEntry) = .empty,
+
+    const status_in_trans: u16 = 0x0001;
+    const status_autocommit: u16 = 0x0002;
 
     const PreparedEntry = struct {
         sql: []u8,
@@ -153,6 +164,7 @@ pub const Conn = struct {
     }
 
     pub fn deinit(conn: *Conn) void {
+        conn.transaction_state.scopes.deinit(conn.gpa);
         conn.writePacket(0, &.{0x01}) catch {};
         conn.deinitTls();
         conn.stream.close(conn.io);
@@ -474,6 +486,19 @@ pub const Conn = struct {
         try conn.writePacket(0, &.{0x0e});
         const response = try conn.readPacket();
         if (response.len == 0 or response[0] != 0x00) return error.QueryFailed;
+        var at: usize = 1;
+        _ = try readLenInt(response, &at);
+        _ = try readLenInt(response, &at);
+        try conn.readTransactionStatus(response, at);
+    }
+
+    fn readTransactionStatus(conn: *Conn, packet: []const u8, offset: usize) Error!void {
+        var at = offset;
+        const flags = try takeInt(u16, packet, &at);
+        if (flags & status_in_trans == 0 and (flags & status_autocommit != 0 or conn.status_flags & status_in_trans != 0))
+            conn.transaction_state.scopes.clearRetainingCapacity();
+        conn.status_flags = flags;
+        conn.status_known = true;
     }
 
     fn execOnce(conn: *Conn, sql: []const u8) Error!Result {
@@ -482,7 +507,6 @@ pub const Conn = struct {
         defer payload.deinit(conn.gpa);
         payload.append(conn.gpa, 0x03) catch return error.OutOfMemory;
         payload.appendSlice(conn.gpa, sql) catch return error.OutOfMemory;
-        try conn.writePacket(0, payload.items);
 
         const arena_state = conn.gpa.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
         arena_state.* = std.heap.ArenaAllocator.init(conn.gpa);
@@ -491,6 +515,7 @@ pub const Conn = struct {
             conn.gpa.destroy(arena_state);
         }
         const arena = arena_state.allocator();
+        try conn.writePacket(0, payload.items);
         const first = try conn.readPacket();
         if (first.len == 0) return error.ProtocolViolation;
         if (first[0] == 0xff) return conn.serverError(first);
@@ -498,6 +523,7 @@ pub const Conn = struct {
             var at: usize = 1;
             const affected = std.math.cast(i64, try readLenInt(first, &at)) orelse return error.TypeMismatch;
             const last_insert_id = try readLenInt(first, &at);
+            try conn.readTransactionStatus(first, at);
             return .{
                 .arena = arena_state,
                 .affected = affected,
@@ -531,7 +557,10 @@ pub const Conn = struct {
             if (packet.len == 0) return error.ProtocolViolation;
             // Result sets end with EOF (0xfe, short) or ERR (0xff). A leading
             // 0x00 is a valid row byte (empty first column), not a terminator.
-            if (packet[0] == 0xfe and packet.len < 9) break;
+            if (packet[0] == 0xfe and packet.len < 9) {
+                try conn.readTransactionStatus(packet, 3);
+                break;
+            }
             if (packet[0] == 0xff) return conn.serverError(packet);
             const row = arena.alloc(?[]const u8, column_count) catch return error.OutOfMemory;
             @memset(row, null);
@@ -572,13 +601,22 @@ pub const Conn = struct {
         var arena_state = std.heap.ArenaAllocator.init(conn.gpa);
         defer arena_state.deinit();
         var set_sql: std.Io.Writer.Allocating = .init(arena_state.allocator());
-        set_sql.writer.writeAll("SET ") catch return error.OutOfMemory;
-        for (params, 0..) |param, index| {
-            if (index != 0) set_sql.writer.writeAll(", ") catch return error.OutOfMemory;
-            set_sql.writer.print("@zgorm_p{d} = ", .{index}) catch return error.OutOfMemory;
-            try writeParam(&set_sql.writer, param);
+        // MySQL's SET parser uses thread stack space per assignment. Split bindings
+        // for large prepared statements while retaining the same EXECUTE and cache key.
+        const assignments_per_set = 256;
+        var start: usize = 0;
+        while (start < params.len) {
+            const end = start + @min(assignments_per_set, params.len - start);
+            set_sql.writer.end = 0;
+            set_sql.writer.writeAll("SET ") catch return error.OutOfMemory;
+            for (params[start..end], start..) |param, index| {
+                if (index != start) set_sql.writer.writeAll(", ") catch return error.OutOfMemory;
+                set_sql.writer.print("@zgorm_p{d} = ", .{index}) catch return error.OutOfMemory;
+                try writeParam(&set_sql.writer, param);
+            }
+            try conn.execControl(set_sql.writer.buffered());
+            start = end;
         }
-        try conn.execControl(set_sql.writer.buffered());
         var execute_sql: std.Io.Writer.Allocating = .init(arena_state.allocator());
         execute_sql.writer.print("EXECUTE {s} USING ", .{name}) catch return error.OutOfMemory;
         for (params, 0..) |_, index| {
@@ -668,6 +706,8 @@ pub const Conn = struct {
 
     fn serverError(conn: *Conn, packet: []const u8) Error {
         if (packet.len < 3 or packet[0] != 0xff) return error.ProtocolViolation;
+        // ERR packets omit the status flags. A deadlock can roll back the whole transaction.
+        conn.status_known = false;
         const number = std.mem.readInt(u16, packet[1..3], .little);
         var message_at: usize = 3;
         var state: []const u8 = "";
@@ -702,16 +742,26 @@ pub const Conn = struct {
         };
     }
 
+    pub fn inTransaction(conn: *Conn) Error!bool {
+        if (conn.broken) return error.ConnectionClosed;
+        if (!conn.status_known) try conn.ping();
+        // With autocommit off a SAVEPOINT is valid even before the first table access.
+        return conn.status_flags & status_in_trans != 0 or conn.status_flags & status_autocommit == 0;
+    }
+
     pub fn beginTransaction(conn: *Conn) Error!void {
         try conn.execControl("START TRANSACTION");
+        conn.transaction_state.scopes.clearRetainingCapacity();
     }
 
     pub fn commit(conn: *Conn) Error!void {
         try conn.execControl("COMMIT");
+        conn.transaction_state.scopes.clearRetainingCapacity();
     }
 
     pub fn rollback(conn: *Conn) Error!void {
         try conn.execControl("ROLLBACK");
+        conn.transaction_state.scopes.clearRetainingCapacity();
     }
 
     fn execControl(conn: *Conn, sql: []const u8) Error!void {

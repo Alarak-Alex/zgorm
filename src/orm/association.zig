@@ -4,6 +4,7 @@
 const std = @import("std");
 const pq = @import("../drivers/postgres/root.zig");
 const session_mod = @import("session.zig");
+const Tx = @import("tx.zig").Tx;
 const qb_mod = @import("qb.zig");
 const schema = @import("schema.zig");
 const value = @import("value.zig");
@@ -95,6 +96,17 @@ pub fn Association(comptime M: type, comptime field_name: []const u8) type {
         }
 
         pub fn replace(a: *@This(), children: []Child) Error!void {
+            var tx = if (a.sess.pinned != null) try Tx.beginSavepoint(&a.sess) else try a.sess.begin();
+            defer tx.rollback();
+            const Keys = value.AutoKeys(Child);
+            const keys = try Keys.capture(a.sess.gpa, children);
+            defer a.sess.gpa.free(keys);
+            errdefer Keys.restore(children, keys);
+            try a.replaceChildren(children);
+            try tx.commit();
+        }
+
+        fn replaceChildren(a: *@This(), children: []Child) Error!void {
             try a.clear();
             if (assoc.kind != .many_to_many) {
                 for (children) |*child| try a.append(child);
